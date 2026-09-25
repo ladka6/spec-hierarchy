@@ -6,6 +6,8 @@ mkdir -p results
 pip install -q torchao
 
 echo "== forward latency: target vs middle models =="
+python tests/test_cpu.py 2>&1 | tail -3
+
 python scripts/bench_forward.py --mids bnb4:Qwen/Qwen3-8B ao4:Qwen/Qwen3-8B ao8:Qwen/Qwen3-8B \
   2>&1 | tee results/bench_forward.log
 

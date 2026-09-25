@@ -63,6 +63,25 @@ def main():
     stops = [V - 2]
     max_new = 80
     failures = 0
+
+    # drafter input must not depend on stale tokens after the anchor (regression test)
+    from dflash.model import _make_cache, extract_context_feature
+    from hspec.pipeline import propose
+
+    ids = torch.randint(0, V - 3, (1, 12))
+    out = target(ids, output_hidden_states=True)
+    ctx = extract_context_feature(out.hidden_states, draft.target_layer_ids)
+    pos = torch.arange(64).unsqueeze(0)
+    masked = torch.full((1, 8), V - 1)
+    masked[0, 0] = 5
+    stale = torch.randint(0, V - 3, (1, 8))
+    stale[0, 0] = 5
+    p1 = propose(draft, target, ctx, masked, pos, 12, _make_cache(draft.config))
+    p2 = propose(draft, target, ctx, stale, pos, 12, _make_cache(draft.config))
+    ok = torch.equal(p1, p2)
+    failures += not ok
+    print(f"propose ignores stale block content: {ok}")
+
     for trial in range(4):
         ids = torch.randint(0, V - 3, (1, 7 + 3 * trial))
         ref = ar_generate(target, ids, max_new, stops).generated

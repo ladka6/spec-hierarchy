@@ -82,6 +82,10 @@ def propose(draft, head_src, ctx, block, position_ids, start, dcache) -> torch.T
     filled by the drafter's greedy proposal. Leaves the drafter cache holding [0, start).
     """
     vs = block.shape[1]
+    # Positions after the anchor must be mask tokens. In the three-stage loop they can hold
+    # stale tokens from a path the target rejected, which would corrupt the drafter input.
+    block = block.clone()
+    block[:, 1:] = draft.mask_token_id
     noise = _raw_input_embeddings(
         head_src, block, float(_draft_value(draft.config, "input_embedding_scale", 1.0))
     )
