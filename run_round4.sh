@@ -40,7 +40,7 @@ echo "== cost model =="
 [[ -f results/bench_forward.json ]] || echo '{"rows": [], "draft_ms": 8.4}' > results/bench_forward.json
 python scripts/cost_model.py --exp3 results/exp3_pipeline_r4.json --bench results/bench_forward.json \
   --latencies-ms 0 5 10 20 50 100 > results/cost_model_r4_full.log 2>&1
-grep -A40 "best per family" results/cost_model_r4_full.log | tee results/cost_model_r4.log
+sed -n "/best per family/,\$p" results/cost_model_r4_full.log | tee results/cost_model_r4.log
 
 tar czf results.tgz results
 echo "done: send results.tgz"
