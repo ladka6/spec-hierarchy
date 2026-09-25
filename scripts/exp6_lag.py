@@ -60,6 +60,7 @@ def accepted(logits, truth):
     return int(m.cumprod(0).sum())
 
 
+@torch.inference_mode()
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", default="Qwen/Qwen3-8B")

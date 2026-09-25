@@ -19,6 +19,8 @@ import json
 import sys
 from pathlib import Path
 
+import torch
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hspec.async3 import Costs, async_three_stage_generate  # noqa: E402
@@ -49,6 +51,7 @@ def parse_cfg(name: str):
     return mode == "sync", int(parts[0]), tree
 
 
+@torch.inference_mode()
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
