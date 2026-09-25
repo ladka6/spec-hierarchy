@@ -52,6 +52,10 @@ def main():
     ap.add_argument("--mid-ratios", nargs="*", type=float, default=[0.25, 0.5],
                     help="also evaluate hypothetical middle models costing ratio x target")
     ap.add_argument("--draft-ms", type=float, default=None, help="override drafter cost")
+    ap.add_argument("--vllm", default="results/bench_vllm.json", help="bench_vllm.py output, if present")
+    ap.add_argument("--vllm-target", default="Qwen/Qwen3-8B")
+    ap.add_argument("--manual", nargs="*", default=[],
+                    help="extra scenarios label:target_ms:mid_ms (flat in q)")
     args = ap.parse_args()
 
     exp3 = json.loads(Path(args.exp3).read_text())
@@ -91,6 +95,22 @@ def main():
         for ratio in args.mid_ratios:
             scen.append((f"{mode}:mid={ratio}xT", t_tab, ratio * interp(t_tab, 17)))
 
+    # vLLM (CUDA graphs) decode latencies; assumed flat in q (memory-bound for q <= ~129)
+    vpath = Path(args.vllm)
+    if vpath.exists():
+        vrows = {r["model"]: r["decode_ms"] for r in json.loads(vpath.read_text())["rows"]}
+        if args.vllm_target in vrows:
+            t_ms = vrows[args.vllm_target]
+            flat = {1: t_ms, 129: t_ms}
+            for name, m_ms in vrows.items():
+                if name != args.vllm_target:
+                    scen.append((f"vllm:{name}", flat, m_ms))
+            for ratio in args.mid_ratios:
+                scen.append((f"vllm:mid={ratio}xT", flat, ratio * t_ms))
+    for spec in args.manual:
+        label, t_ms, m_ms = spec.split(":")
+        scen.append((f"manual:{label}", {1: float(t_ms), 129: float(t_ms)}, float(m_ms)))
+
     out = []
     for label, t_tab, c_m in scen:
         for lat in args.latencies_ms:
@@ -102,7 +122,7 @@ def main():
             for (d, cfg), tps in per.items():
                 out.append({"costs": label, "lat_ms": lat, "dataset": d, "config": cfg,
                             "pred_tok/s": tps, "x_dflash": tps / per[(d, "dflash")],
-                            "meas_tok/s": counts[(d, cfg)]["meas"] if lat == 0 else float("nan")})
+                            "meas_tok/s": counts[(d, cfg)]["meas"] if lat == 0 and label.startswith("eager") else float("nan")})
 
     for label, *_ in scen:
         rows = sorted((r for r in out if r["costs"] == label),

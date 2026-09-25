@@ -138,7 +138,7 @@ def main():
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
     ap.add_argument("--draft", default="z-lab/Qwen3-8B-DFlash-b16")
     ap.add_argument("--mids", nargs="+", default=["bnb4:Qwen/Qwen3-8B", "ao4:Qwen/Qwen3-8B"])
-    ap.add_argument("--mode", nargs="+", default=["eager", "compiled"], choices=["eager", "compiled"])
+    ap.add_argument("--mode", nargs="+", default=["eager"], choices=["eager", "compiled"])
     ap.add_argument("--ctx", type=int, default=512)
     ap.add_argument("--qs", nargs="+", type=int, default=[1, 17, 33, 65, 129])
     ap.add_argument("--reps", type=int, default=20)
