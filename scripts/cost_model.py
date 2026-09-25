@@ -126,8 +126,16 @@ def main():
     if vpath.exists():
         vtab = {}
         for r in json.loads(vpath.read_text())["rows"]:
-            vtab[r["model"]] = ({int(k): v for k, v in r["q_ms"].items()} if r.get("q_ms")
-                                else {1: r["decode_ms"], 129: r["decode_ms"]})
+            tab = ({int(k): v for k, v in r["q_ms"].items()} if r.get("q_ms")
+                   else {1: r["decode_ms"], 129: r["decode_ms"]})
+            # a q-token forward can not be cheaper than a 1-token decode step, nor cheaper than a
+            # shorter one; the difference-of-timings estimate is noisy at small q (AWQ gave
+            # 2.6 ms at q=17 vs 5.8 ms decode), so clamp to a monotone table
+            run = r["decode_ms"]
+            for q in sorted(tab):
+                run = max(run, tab[q])
+                tab[q] = run
+            vtab[r["model"]] = tab
         if args.vllm_target in vtab:
             t_tab = vtab[args.vllm_target]
             for name, m_tab in vtab.items():
