@@ -1,0 +1,6 @@
+transformers==5.15.0
+accelerate
+bitsandbytes
+datasets
+tqdm
+requests
