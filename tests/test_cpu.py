@@ -146,6 +146,15 @@ def main():
                 branch_hits += s.get("branch_hit_rate", 0) * len(r.checks)
                 print(f"  3s+branch {name:11s} P={w:3d} k={k} L={bl} lossless={ok}  "
                       f"target_calls={r.target_calls:3d} hit_rate={s.get('branch_hit_rate', 0):.2f}")
+            for w, B, k in ((1, 8, 0), (16, 32, 0), (64, 16, 4), (8, 64, 2)):
+                r = three_stage_generate(draft, target, mid, ids, max_new, stops,
+                                         WindowPolicy("fixed", window=w), mid_tree=B,
+                                         branch_k=k, branch_margin=1.0)
+                ok = torch.equal(r.generated, ref)
+                failures += not ok
+                s = r.summary()
+                print(f"  3s+midtree {name:11s} P={w:3d} B={B:3d} k={k} lossless={ok}  "
+                      f"mid_calls={r.mid_calls:3d} tau={s['mean_round_len']:.2f} mid_q={s['mean_mid_q']:.1f}")
         for budget, bsz in ((1, None), (8, None), (32, None), (64, 16)):
             r = ddtree_generate(draft, target, ids, max_new, stops, budget=budget, block_size=bsz)
             ok = torch.equal(r.generated, ref)

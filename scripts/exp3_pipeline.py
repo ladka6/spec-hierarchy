@@ -9,6 +9,7 @@ Configs per prompt (all greedy):
   dflash-bK   DFlash with block size K, for each K in --dflash-blocks other than the default
   ddtree-B    DDTree (best-first draft tree of B nodes verified by the target), --ddtree-budgets
   3s-P+brK    three-stage with top-2 branching at up to K low-margin positions, --branch-k
+  3s-P+mtB    three-stage where mid verifies a DDTree of B nodes per round, --mid-trees
 
 Reports tokens/s, speedup over ar and dflash, target calls per token, tokens accepted per
 target check, and whether the output is identical to dflash (it must be, up to numerical
@@ -54,6 +55,7 @@ def main():
     ap.add_argument("--windows", nargs="+", type=int, default=[1, 8, 16, 32, 64, 128])
     ap.add_argument("--latencies-ms", nargs="+", type=float, default=[0.0],
                     help="simulated delay added to every target forward (remote target)")
+    ap.add_argument("--no-adapt", action="store_true", help="skip the adaptive-window config")
     ap.add_argument("--no-ar", action="store_true", help="skip the slow autoregressive baseline")
     ap.add_argument("--block-size", type=int, default=None)
     ap.add_argument("--dflash-blocks", nargs="+", type=int, default=[],
@@ -63,6 +65,8 @@ def main():
     ap.add_argument("--branch-k", nargs="+", type=int, default=[0],
                     help="three-stage variants with top-2 branching at up to K positions (0 = off)")
     ap.add_argument("--branch-len", type=int, default=8)
+    ap.add_argument("--mid-trees", nargs="+", type=int, default=[0],
+                    help="three-stage variants where mid verifies a DDTree of B nodes (0 = chain)")
     ap.add_argument("--branch-margin", type=float, default=0.5)
     ap.add_argument("--tag", default="", help="suffix for the results file name")
     args = ap.parse_args()
@@ -117,16 +121,18 @@ def main():
         for lat in args.latencies_ms:
             delay.ms = lat
             policies = [(f"3s-{p}", lambda p=p: WindowPolicy("fixed", window=p)) for p in args.windows]
-            policies.append(("3s-adapt", lambda: WindowPolicy("adaptive", window=32)))
-            runs = [(name + (f"+br{k}" if k else ""), mk, k) for k in args.branch_k for name, mk in policies]
-            for name, make_policy, k in runs:
+            if not args.no_adapt:
+                policies.append(("3s-adapt", lambda: WindowPolicy("adaptive", window=32)))
+            runs = [(name + (f"+mt{B}" if B else "") + (f"+br{k}" if k else ""), mk, k, B)
+                    for B in args.mid_trees for k in args.branch_k for name, mk in policies]
+            for name, make_policy, k, B in runs:
                 policy = make_policy()   # adaptive state is shared across prompts of one run
                 for d in args.datasets:
                     for i, p in enumerate(prompts[d]):
                         r = three_stage_generate(draft, target, mid, encode(tok, p), args.max_new,
                                                  stops, policy, bs, branch_k=k,
                                                  branch_len=args.branch_len,
-                                                 branch_margin=args.branch_margin)
+                                                 branch_margin=args.branch_margin, mid_tree=B)
                         records.append({"lat": lat, "config": name, "mid": spec, "dataset": d, "i": i,
                                         **r.summary(), "match": match(r.generated.cpu(), ref[(d, i)]),
                                         "final_window": policy.current_window(), "eps": policy.eps()})
@@ -151,6 +157,7 @@ def main():
                      "acc/check": mean(r.get("mean_accepted_per_check", float("nan")) for r in rs),
                      "full_acc": mean(r.get("full_accept_rate", float("nan")) for r in rs),
                      "mean_q": mean(r.get("mean_target_q", 1.0) for r in rs),
+                     "mid_q": mean(r.get("mean_mid_q", 0.0) for r in rs),
                      "br_hit": mean(r.get("branch_hit_rate", float("nan")) for r in rs),
                      "match": mean(r["match"] for r in rs)})
     for row in rows:
@@ -162,7 +169,7 @@ def main():
             row["x_ar0"] = row["tok/s"] / ar0[0]
 
     print_table(rows, ["lat_ms", "dataset", "config", "mid", "tok/s", "x_ar0", "x_dflash",
-                       "tgt_calls/tok", "mid_calls/tok", "mean_q", "tau", "acc/check", "full_acc", "br_hit", "match"],
+                       "tgt_calls/tok", "mid_calls/tok", "mean_q", "mid_q", "tau", "acc/check", "full_acc", "br_hit", "match"],
                 "three-stage pipeline (x_ar0: vs autoregressive at 0 ms)")
     print(f"peak GPU memory: {gpu_mem_gb():.1f} GB")
     name = "exp3_pipeline" + (f"_{args.tag}" if args.tag else "")

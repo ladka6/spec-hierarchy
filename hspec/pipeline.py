@@ -131,6 +131,7 @@ class GenResult:
     feature_calls: int = 0
     checks: list[dict] = field(default_factory=list)          # three-stage: per target check
     tq: list[int] = field(default_factory=list)               # query tokens per decode-time target forward
+    mq: list[int] = field(default_factory=list)               # query tokens per mid forward
 
     @property
     def generated(self) -> torch.Tensor:
@@ -157,6 +158,7 @@ class GenResult:
             "target_calls": self.target_calls,
             "mid_calls": self.mid_calls,
             "mean_target_q": sum(self.tq) / len(self.tq) if self.tq else 1.0,
+            "mean_mid_q": sum(self.mq) / len(self.mq) if self.mq else 0.0,
         }
         if self.checks:
             d["mean_pending_per_check"] = sum(c["pending"] for c in self.checks) / len(self.checks)
@@ -292,12 +294,11 @@ def ddtree_generate(
 ) -> GenResult:
     """Greedy DDTree. Each round the drafter gives per-position logits, a best-first tree
     of ``budget`` nodes is built from them and the target verifies the whole tree in one
-    forward. The accepted path is re-run once on a cropped cache to get a clean cache and
-    drafter features (implementation shortcut, not counted as a target call; it inflates
-    measured wall time, so use the cost model for speed)."""
+    forward. The KV cache is then compacted to the accepted path, and the path's hidden
+    states become the drafter's next context."""
     if isinstance(draft, DFlash2DraftModel):
         raise ValueError("ddtree_generate needs a DFlash (v1) drafter")
-    from hspec.tree import build_ddtree, greedy_walk, verify_tree
+    from hspec.tree import build_ddtree, compact, greedy_walk, verify_tree
 
     device = input_ids.device
     bs = draft.block_size if block_size is None else block_size
@@ -326,7 +327,7 @@ def ddtree_generate(
         logits = draft_logits(draft, target, ctx, block, position_ids, start, dcache)
         res.draft_calls += 1
         tree = build_ddtree(logits, budget, top_k=top_k)
-        tout = verify_tree(target, tcache, output_ids[0, start], tree, start)
+        tout = verify_tree(target, tcache, output_ids[0, start], tree, start, hidden=True)
         res.target_calls += 1
         res.tq.append(1 + len(tree))
         path, bonus = greedy_walk(tree, tout.logits)
@@ -339,13 +340,10 @@ def ddtree_generate(
         hit = _first_stop(output_ids[0, start + 1 : start + produced + 1], stop)
         if hit is not None:
             produced, stopped = hit + 1, True
-        # rebuild: clean cache + target features for [start, start + produced)
-        crop(tcache, start)
-        rout = target(output_ids[:, start : start + produced],
-                      position_ids=position_ids[:, start : start + produced],
-                      past_key_values=tcache, use_cache=True, logits_to_keep=1,
-                      output_hidden_states=True)
-        ctx = extract_context_feature(rout.hidden_states, draft.target_layer_ids)
+        rows = ([0] + [nd + 1 for nd in path])[:produced]   # positions [start, start + produced)
+        compact(tcache, start, rows)
+        feats = extract_context_feature(tout.hidden_states, draft.target_layer_ids)
+        ctx = feats[:, rows]
         start += produced
         res.rounds.append(produced)
 
@@ -412,6 +410,7 @@ def three_stage_generate(
     branch_k: int = 0,
     branch_len: int = 8,
     branch_margin: float = 0.5,
+    mid_tree: int = 0,
 ) -> GenResult:
     """Drafter proposes blocks, ``mid`` verifies them (standard greedy DFlash rounds, the
     drafter is conditioned on mid's hidden states), and the target checks all pending
@@ -424,8 +423,12 @@ def three_stage_generate(
     top-1 / top-2 probability margin is below ``branch_margin`` get a sibling branch: mid's
     top-2 token followed by a copy of the next ``branch_len`` pending tokens. The target
     verifies the chain plus branches as one tree, so a disagreement at a low-margin
-    position can still be recovered in the same check."""
-    from hspec.tree import Tree, greedy_walk, verify_tree
+    position can still be recovered in the same check.
+
+    Mid tree (mid_tree = B > 0): instead of a single greedy block, the drafter's per-position
+    logits give a DDTree of B nodes, and mid verifies the whole tree in one forward. Tokens
+    mid has not processed yet (after a target correction) are prepended as a chain."""
+    from hspec.tree import Tree, build_ddtree, compact, greedy_walk, verify_tree
     device = input_ids.device
     bs = draft.block_size if block_size is None else block_size
     n = input_ids.shape[1]
@@ -465,26 +468,57 @@ def three_stage_generate(
         # ---------------- stage 1+2: draft a block, mid verifies it ----------------
         tl0 = _sync_time() if timing else 0.0
         vs = min(bs, max_len - start)
-        block = output_ids[:, start : start + vs].clone()
-        if vs > 1:
-            block = propose(draft, target, ctx, block, position_ids, start, dcache)
+        offset = start - mlen            # tokens mid has not processed yet before the anchor
+        if mid_tree > 0 and vs > 1:
+            logits = draft_logits(draft, target, ctx, output_ids[:, start : start + vs],
+                                  position_ids, start, dcache)
             dlen = start
             res.draft_calls += 1
-        offset = start - mlen            # tokens mid has not processed yet before the anchor
-        mid_in = torch.cat([output_ids[:, mlen:start], block], dim=1)
-        mout = mid(mid_in, position_ids=position_ids[:, mlen : start + vs], past_key_values=mcache,
-                   use_cache=True, output_hidden_states=True)
-        res.mid_calls += 1
-        a, bonus = _greedy_accept(block, mout.logits[:, offset:])
-        output_ids[:, start : start + a + 1] = block[:, : a + 1]
-        output_ids[0, start + a + 1] = bonus
-        produced = min(a + 1, max_len - start - 1)
+            dtree = build_ddtree(logits, mid_tree)
+            # rows: 0 = token at mlen, 1..offset = tokens up to the anchor, then the draft tree
+            tree = Tree()
+            for i, tok in enumerate(output_ids[0, mlen + 1 : start + 1].tolist()):
+                tree.add(tok, i - 1)
+            anchor_node = offset - 1
+            base = len(tree)
+            for tok, par in zip(dtree.tokens, dtree.parents):
+                tree.add(tok, anchor_node if par < 0 else base + par)
+            mout = verify_tree(mid, mcache, output_ids[0, mlen], tree, mlen, hidden=True)
+            res.mid_calls += 1
+            res.mq.append(1 + len(tree))
+            path, bonus = greedy_walk(tree, mout.logits, start=anchor_node)
+            a = len(path)
+            if a:
+                output_ids[0, start + 1 : start + 1 + a] = torch.tensor(
+                    [tree.tokens[nd] for nd in path], device=device)
+            output_ids[0, start + a + 1] = bonus
+            produced = min(a + 1, max_len - start - 1)
+            rows = ([offset] + [nd + 1 for nd in path])[:produced]   # positions start .. start+produced-1
+            compact(mcache, mlen, list(range(offset)) + rows)
+            logit_rows = mout.logits[0, rows]
+            feats = extract_context_feature(mout.hidden_states, draft.target_layer_ids)[:, rows]
+        else:
+            block = output_ids[:, start : start + vs].clone()
+            if vs > 1:
+                block = propose(draft, target, ctx, block, position_ids, start, dcache)
+                dlen = start
+                res.draft_calls += 1
+            mid_in = torch.cat([output_ids[:, mlen:start], block], dim=1)
+            mout = mid(mid_in, position_ids=position_ids[:, mlen : start + vs], past_key_values=mcache,
+                       use_cache=True, output_hidden_states=True)
+            res.mid_calls += 1
+            res.mq.append(offset + vs)
+            a, bonus = _greedy_accept(block, mout.logits[:, offset:])
+            output_ids[:, start : start + a + 1] = block[:, : a + 1]
+            output_ids[0, start + a + 1] = bonus
+            produced = min(a + 1, max_len - start - 1)
+            logit_rows = mout.logits[0, offset : offset + produced]
+            feats = extract_context_feature(mout.hidden_states, draft.target_layer_ids)
+            feats = feats[:, offset : offset + produced]
         if branch_k > 0:
-            top = torch.softmax(mout.logits[0, offset : offset + produced].float(), dim=-1).topk(2, dim=-1)
+            top = torch.softmax(logit_rows.float(), dim=-1).topk(2, dim=-1)
             margin_buf[start + 1 : start + 1 + produced] = top.values[:, 0] - top.values[:, 1]
             alt_buf[start + 1 : start + 1 + produced] = top.indices[:, 1]
-        feats = extract_context_feature(mout.hidden_states, draft.target_layer_ids)
-        feats = feats[:, offset : offset + produced]
         ctx = feats if vs > 1 else torch.cat([ctx, feats], dim=1)
         mlen = start + produced
         crop(mcache, mlen)
@@ -533,7 +567,7 @@ def three_stage_generate(
                 node = tree.add(alt, i - 1)
                 for j in range(i + 1, min(i + 1 + branch_len, pending)):
                     node = tree.add(main[j], node)
-            tout = verify_tree(target, tcache, output_ids[0, tf], tree, tf)
+            tout = verify_tree(target, tcache, output_ids[0, tf], tree, tf, hidden=True)
             res.tq.append(1 + len(tree))
             path, t_bonus = greedy_walk(tree, tout.logits)
             a_t = len(path)
@@ -543,6 +577,9 @@ def three_stage_generate(
                 output_ids[0, tf + 1 : tf + 1 + a_t] = torch.tensor(
                     [tree.tokens[nd] for nd in path], device=device)
             rec.update(branches=len(tree) - pending, branch_hit=int(div is not None))
+            rows = [0] + [nd + 1 for nd in path]   # positions [tf, new_anchor)
+            compact(tcache, tf, rows)
+            tfeats = extract_context_feature(tout.hidden_states, draft.target_layer_ids)[:, rows]
         res.target_calls += 1
         new_anchor = tf + a_t + 1
         output_ids[0, new_anchor] = t_bonus
@@ -551,13 +588,6 @@ def three_stage_generate(
         policy.checked += min(a_main + 1, pending)
         policy.rejects += int(a_main < pending)
 
-        if branch_pos:
-            # clean target cache + features for [tf, new_anchor); not counted as a call
-            crop(tcache, tf)
-            rout = target(output_ids[:, tf:new_anchor], position_ids=position_ids[:, tf:new_anchor],
-                          past_key_values=tcache, use_cache=True, logits_to_keep=1,
-                          output_hidden_states=True)
-            tfeats = extract_context_feature(rout.hidden_states, draft.target_layer_ids)
         keep = new_anchor if div is None else div   # prefix that is unchanged for mid / drafter
 
         # drafter context: target features for [d_keep, new_anchor)

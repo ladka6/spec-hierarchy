@@ -96,6 +96,10 @@ def main():
             w = r["target_calls_per_token"] * n
             a["qw"] += r["mean_target_q"] * w
             a["qn"] += w
+        if r.get("mean_mid_q"):
+            w = r["mid_calls_per_token"] * n
+            a["mqw"] += r["mean_mid_q"] * w
+            a["mqn"] += w
     counts = {}
     for (d, cfg), v in agg.items():
         c = {k: v[k] / v["tok"] for k in ("T", "M", "D", "pend")} | {"meas": v["tok"] / v["time"]}
@@ -103,9 +107,10 @@ def main():
             c["q"] = v["qw"] / v["qn"]
         else:   # older exp3 files without mean_target_q
             c["q"] = 1 if cfg == "ar" else (17 if cfg == "dflash" else c["pend"] + 1)
+        c["mq"] = v["mqw"] / v["mqn"] if v["mqn"] > 0 else 17.0
         counts[(d, cfg)] = c
 
-    # cost scenarios: (label, target table, mid cost at q=17)
+    # cost scenarios: (label, target table, mid cost as a function of the mid query length)
     rows_b = bench["rows"]
     scen = []
     for mode in ("eager", "compiled"):
@@ -117,9 +122,9 @@ def main():
         if args.mid:
             mids = [r for r in mids if r["model"] == args.mid]
         for m in mids:
-            scen.append((f"{mode}:{m['model']}", t_tab, interp(row_table(m), 17)))
+            scen.append((f"{mode}:{m['model']}", t_tab, lambda q, tab=row_table(m): interp(tab, q)))
         for ratio in args.mid_ratios:
-            scen.append((f"{mode}:mid={ratio}xT", t_tab, ratio * interp(t_tab, 17)))
+            scen.append((f"{mode}:mid={ratio}xT", t_tab, lambda q, tab=t_tab, x=ratio: x * interp(tab, q)))
 
     # vLLM (CUDA graphs): per-q verification cost if measured, else flat in q
     vpath = Path(args.vllm)
@@ -140,20 +145,20 @@ def main():
             t_tab = vtab[args.vllm_target]
             for name, m_tab in vtab.items():
                 if name != args.vllm_target:
-                    scen.append((f"vllm:{name}", t_tab, interp(m_tab, 17)))
+                    scen.append((f"vllm:{name}", t_tab, lambda q, tab=m_tab: interp(tab, q)))
             for ratio in args.mid_ratios:
-                scen.append((f"vllm:mid={ratio}xT", t_tab, ratio * interp(t_tab, 17)))
+                scen.append((f"vllm:mid={ratio}xT", t_tab, lambda q, tab=t_tab, x=ratio: x * interp(tab, q)))
             print("vLLM target cost by q (ms): " + ", ".join(f"{q}:{v:.2f}" for q, v in sorted(t_tab.items())))
     for spec in args.manual:
         label, t_ms, m_ms = spec.split(":")
-        scen.append((f"manual:{label}", {1: float(t_ms), 129: float(t_ms)}, float(m_ms)))
+        scen.append((f"manual:{label}", {1: float(t_ms), 129: float(t_ms)}, lambda q, v=float(m_ms): v))
 
     out = []
     for label, t_tab, c_m in scen:
         for lat in args.latencies_ms:
             per = {}
             for (d, cfg), c in counts.items():
-                t = c["T"] * (interp(t_tab, c["q"]) + lat) + c["M"] * c_m + c["D"] * draft_cost(cfg)
+                t = c["T"] * (interp(t_tab, c["q"]) + lat) + c["M"] * c_m(c["mq"]) + c["D"] * draft_cost(cfg)
                 per[(d, cfg)] = 1000.0 / t
             for (d, cfg), tps in per.items():
                 out.append({"costs": label, "lat_ms": lat, "dataset": d, "config": cfg, "q": counts[(d, cfg)]["q"],
@@ -165,6 +170,25 @@ def main():
                       key=lambda r: (r["dataset"], r["lat_ms"], r["config"]))
         print_table(rows, ["dataset", "lat_ms", "config", "q", "pred_tok/s", "x_dflash", "meas_tok/s"],
                     f"predicted speed, costs = {label}, drafter {c_d:.2f} ms (bs16)")
+    # compact view: best config of each family, speedup over dflash, per latency
+    def family(cfg):
+        if not cfg.startswith("3s"):
+            return cfg.split("-")[0] if cfg.startswith("ddtree") else cfg
+        return "3s" + "".join("+" + part.rstrip("0123456789") for part in cfg.split("+")[1:])
+    lats = args.latencies_ms
+    for label, *_ in scen:
+        rs = [r for r in out if r["costs"] == label]
+        table = []
+        for d in sorted({r["dataset"] for r in rs}):
+            for fam in sorted({family(r["config"]) for r in rs if r["dataset"] == d}):
+                row = {"dataset": d, "family": fam}
+                for lat in lats:
+                    cand = [r for r in rs if r["dataset"] == d and r["lat_ms"] == lat and family(r["config"]) == fam]
+                    b = max(cand, key=lambda r: r["pred_tok/s"])
+                    row[f"{lat:g}ms"] = f"{b['x_dflash']:.2f} {b['config'].split('+')[0]}"
+                table.append(row)
+        print_table(table, ["dataset", "family"] + [f"{lat:g}ms" for lat in lats],
+                    f"best per family, x over dflash, costs = {label}")
     save_json("cost_model", {"args": vars(args), "counts": {f"{k[0]}|{k[1]}": v for k, v in counts.items()},
                              "rows": out})
 

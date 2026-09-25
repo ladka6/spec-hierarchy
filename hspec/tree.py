@@ -5,10 +5,8 @@ Nodes are listed so that every parent comes before its children. The target proc
 [root, node_0, node_1, ...] in one forward pass: node positions are anchor_pos + depth and
 each node attends to the cached prefix, the root, its ancestors and itself.
 
-After the greedy walk, the accepted path is re-run once on a cache cropped back to the
-anchor ("rebuild"), which restores a clean KV cache and yields hidden states for the
-accepted tokens. Real systems compact the KV cache instead; the rebuild is an
-implementation shortcut and is not counted as a target call.
+After the greedy walk the KV cache is compacted: the rows of the accepted path are kept
+and the rest dropped. A node's keys/values depend only on its ancestors, so this is exact.
 """
 
 from __future__ import annotations
@@ -86,12 +84,25 @@ def verify_tree(model, cache, root_token, tree: Tree, anchor_pos: int, *, hidden
                  use_cache=True, output_hidden_states=hidden)
 
 
-def greedy_walk(tree: Tree, logits: torch.Tensor) -> tuple[list[int], int]:
-    """logits: [1, 1 + len(tree), V]. Returns (accepted node indices, bonus token)."""
+def compact(cache, keep: int, rows) -> None:
+    """Cache holds [0, keep) followed by the rows of a tree forward. Keep [0, keep) plus the
+    given tree rows (0 = root), in that order."""
+    rows = list(rows)
+    for layer in cache.layers:
+        if not getattr(layer, "is_initialized", True) or layer.keys.numel() == 0:
+            continue
+        idx = torch.tensor(list(range(keep)) + [keep + r for r in rows], device=layer.keys.device)
+        layer.keys = layer.keys.index_select(-2, idx)
+        layer.values = layer.values.index_select(-2, idx)
+
+
+def greedy_walk(tree: Tree, logits: torch.Tensor, start: int = -1) -> tuple[list[int], int]:
+    """logits: [1, 1 + len(tree), V]. Walks from node ``start`` (-1 = root).
+    Returns (accepted node indices below start, bonus token)."""
     ch = tree.children()
     pred = logits[0].argmax(dim=-1).tolist()
     path: list[int] = []
-    cur, row = -1, 0
+    cur, row = start, start + 1
     while True:
         t = pred[row]
         nxt = ch.get(cur, {}).get(t)
