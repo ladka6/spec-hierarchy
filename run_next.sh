@@ -23,10 +23,11 @@ echo "== vLLM decode latency (separate env) =="
 if [[ ! -x /content/vllm_env/bin/python ]]; then
   pip install -q uv
   uv venv -q -p 3.12 /content/vllm_env
-  uv pip install -q -p /content/vllm_env/bin/python vllm
+  uv pip install -q -p /content/vllm_env/bin/python vllm ninja
 fi
+uv pip install -q -p /content/vllm_env/bin/python ninja
 for m in Qwen/Qwen3-8B Qwen/Qwen3-8B-AWQ; do
-  /content/vllm_env/bin/python scripts/bench_vllm.py --model "$m" 2>&1 | grep -E "ms per decode|Error|error" | tee -a results/bench_vllm.log || true
+  PATH=/content/vllm_env/bin:$PATH /content/vllm_env/bin/python scripts/bench_vllm.py --model "$m" 2>&1 | grep -E "ms per decode|Error|error" | tee -a results/bench_vllm.log || true
 done
 
 echo "== cost model =="
