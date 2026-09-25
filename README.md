@@ -60,6 +60,17 @@ Note: bitsandbytes 4-bit kernels are slow at batch size 1, so exp3 speed numbers
 understate what a proper W4 kernel (AWQ/Marlin) would give. exp1/exp2 are
 kernel-independent.
 
+## Round 2 (after the pilot)
+
+```bash
+git pull && bash run_next.sh
+```
+
+- `scripts/bench_forward.py`: median forward latency of the bf16 target and the middle
+  models (bnb4, torchao int4/int8) at the shapes the pipeline uses. Gives r = c_T / c.
+- `scripts/exp3_pipeline.py --latencies-ms 0 20 50 100`: adds a serial delay to every
+  target forward (remote target on a server), for DFlash and three-stage alike.
+
 ## Layout
 
 ```
