@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dflash.model import DFlashDraftModel  # noqa: E402
 
 from hspec.async3 import Costs, async_three_stage_generate  # noqa: E402
+from hspec.hier import HierConfig, hier_generate  # noqa: E402
 from hspec.pipeline import (  # noqa: E402
     WindowPolicy, ar_generate, ddtree_generate, three_stage_generate, two_stage_generate,
 )
@@ -109,6 +110,7 @@ def main():
     failures += not ok
     print(f"tree attention matches causal paths: {ok}")
     branch_hits = 0
+    hier_caught = 0
 
     for trial in range(4):
         ids = torch.randint(0, V - 3, (1, 7 + 3 * trial))
@@ -168,6 +170,28 @@ def main():
                 print(f"  async {name:11s} block={blocking!s:5} P={w:2d} L={lat:3d} B={B:2d} lossless={ok}  "
                       f"tgt={r.target_calls:3d} mid={r.mid_calls:3d} rollbacks={s['rollbacks']} "
                       f"t={r.decode_time * 1000:.0f}ms")
+            for kw in (dict(blocking=True, window=16), dict(window=8, mid_tree=16),
+                       dict(check_rule="conf", tau=0.9, min_window=2, window=32),
+                       dict(window=8, max_branches=2, fork_thr=1.01),
+                       dict(window=16, blocking=True, max_branches=3, fork_thr=1.01, mid_tree=8),
+                       dict(check_rule="conf", tau=0.5, window=32, max_branches=2, fork_thr=0.9, mid_tree=16)):
+                for lat in (0, 50):
+                    c = Costs(target={1: 10.0, 65: 14.0}, mid={1: 4.0, 65: 6.0}, draft_ms=2.0, latency_ms=lat)
+                    r = hier_generate(draft, target, mid, ids, max_new, stops, c, HierConfig(**kw))
+                    ok = torch.equal(r.generated, ref)
+                    failures += not ok
+                    hier_caught += r.async_stats["caught"]
+                    s = r.async_stats
+                    print(f"  hier {name:11s} L={lat:2d} {kw} lossless={ok} tgt={r.target_calls} "
+                          f"forks={s['forks']} caught={s['caught']} rollbacks={s['rollbacks']}")
+        for kw in (dict(pearl=True, blocking=True, window=8), dict(pearl=True, window=8),
+                   dict(pearl=True, pearl_len=4, window=4)):
+            for lat in (0, 50):
+                c = Costs(target={1: 10.0, 65: 14.0}, mid={1: 4.0, 65: 6.0}, draft_ms=2.0, latency_ms=lat)
+                r = hier_generate(draft, target, None, ids, max_new, stops, c, HierConfig(**kw))
+                ok = torch.equal(r.generated, ref)
+                failures += not ok
+                print(f"  pearl L={lat:2d} {kw} lossless={ok} tgt={r.target_calls}")
         for budget, bsz in ((1, None), (8, None), (32, None), (64, 16)):
             r = ddtree_generate(draft, target, ids, max_new, stops, budget=budget, block_size=bsz)
             ok = torch.equal(r.generated, ref)
@@ -178,6 +202,9 @@ def main():
         ok = torch.equal(r.generated, ref)
         failures += not ok
         print(f"  two-stage block 16     lossless={ok}")
+    if hier_caught == 0:
+        failures += 1
+        print("hedging never switched to a branch: branch-switch path untested")
     if branch_hits == 0:
         failures += 1
         print("branching never recovered a rejection: branch path untested")
