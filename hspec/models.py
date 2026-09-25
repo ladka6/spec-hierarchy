@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import gc
+import warnings
 
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+# bitsandbytes 8-bit prints this on every matmul; it floods the logs
+warnings.filterwarnings("ignore", message=".*MatMul8bitLt.*")
 
 
 def load_target(model_id: str, device: str = "cuda"):
