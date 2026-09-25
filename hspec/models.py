@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import time
 import warnings
 
 import torch
@@ -27,8 +28,10 @@ def load_mid(spec: str, device: str = "cuda"):
     """Load a middle verifier from a spec string "kind:model_id".
 
     kinds:
-      bnb4  4-bit NF4 (bitsandbytes), bf16 compute
-      bnb8  8-bit LLM.int8 (bitsandbytes)
+      bnb4  4-bit NF4 (bitsandbytes), bf16 compute. Accurate but slow at batch 1.
+      bnb8  8-bit LLM.int8 (bitsandbytes). Very slow at batch 1.
+      ao4   4-bit weight-only (torchao, group 128). Fast small-batch kernel.
+      ao8   8-bit weight-only (torchao).
       hf    plain bf16 checkpoint (e.g. a smaller model of the same family,
             or a pre-quantized AWQ/GPTQ checkpoint whose kernels are installed)
     """
@@ -48,6 +51,27 @@ def load_mid(spec: str, device: str = "cuda"):
         kwargs["device_map"] = device
         kwargs["dtype"] = torch.bfloat16
     elif kind == "hf":
+        kwargs["dtype"] = torch.bfloat16
+        kwargs["device_map"] = device
+    elif kind in ("ao4", "ao8"):
+        # torchao weight-only quantization: fast small-batch kernels (tinygemm int4 on A100)
+        from transformers import TorchAoConfig
+
+        if kind == "ao4":
+            try:
+                from torchao.quantization import Int4WeightOnlyConfig
+
+                quant = Int4WeightOnlyConfig(group_size=128)
+            except ImportError:
+                quant = "int4_weight_only"
+        else:
+            try:
+                from torchao.quantization import Int8WeightOnlyConfig
+
+                quant = Int8WeightOnlyConfig()
+            except ImportError:
+                quant = "int8_weight_only"
+        kwargs["quantization_config"] = TorchAoConfig(quant_type=quant)
         kwargs["dtype"] = torch.bfloat16
         kwargs["device_map"] = device
     else:
@@ -76,6 +100,26 @@ def free(*models):
         del m
     gc.collect()
     torch.cuda.empty_cache()
+
+
+class Latency:
+    """Adds a fixed delay after every forward of a model (simulated network round trip).
+
+    The delay starts after the GPU work finishes, so it adds serially like a real RTT.
+    Change ``.ms`` at any time; 0 disables it."""
+
+    def __init__(self, model, ms: float = 0.0):
+        self.ms = ms
+        self.handle = model.register_forward_hook(self._hook)
+
+    def _hook(self, module, args, output):
+        if self.ms > 0:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            time.sleep(self.ms / 1000.0)
+
+    def remove(self):
+        self.handle.remove()
 
 
 def gpu_mem_gb() -> float:

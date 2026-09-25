@@ -26,7 +26,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hspec.data import encode, load_prompts, stop_ids  # noqa: E402
-from hspec.models import free, gpu_mem_gb, load_draft, load_mid, load_target, load_tokenizer, same_hidden_space  # noqa: E402
+from hspec.models import Latency, free, gpu_mem_gb, load_draft, load_mid, load_target, load_tokenizer, same_hidden_space  # noqa: E402
 from hspec.pipeline import WindowPolicy, ar_generate, three_stage_generate, two_stage_generate  # noqa: E402
 from hspec.utils import mean, print_table, save_json  # noqa: E402
 
@@ -49,13 +49,17 @@ def main():
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--max-new", type=int, default=512)
     ap.add_argument("--windows", nargs="+", type=int, default=[1, 8, 16, 32, 64, 128])
+    ap.add_argument("--latencies-ms", nargs="+", type=float, default=[0.0],
+                    help="simulated delay added to every target forward (remote target)")
     ap.add_argument("--no-ar", action="store_true", help="skip the slow autoregressive baseline")
     ap.add_argument("--block-size", type=int, default=None)
+    ap.add_argument("--tag", default="", help="suffix for the results file name")
     args = ap.parse_args()
 
     tok = load_tokenizer(args.target)
     target = load_target(args.target)
     draft = load_draft(args.draft)
+    delay = Latency(target, 0.0)
     stops = stop_ids(target, tok)
     prompts = {d: load_prompts(d, args.n) for d in args.datasets}
     bs = args.block_size
@@ -66,67 +70,79 @@ def main():
 
     records = []
     ref = {}
-    for d in args.datasets:
-        for i, p in enumerate(prompts[d]):
-            ids = encode(tok, p)
-            r = two_stage_generate(draft, target, target, target, ids, args.max_new, stops, bs)
-            ref[(d, i)] = r.generated.cpu()
-            records.append({"config": "dflash", "mid": "-", "dataset": d, "i": i, **r.summary(),
-                            "match": 1.0})
-            if not args.no_ar:
-                a = ar_generate(target, ids, args.max_new, stops)
-                records.append({"config": "ar", "mid": "-", "dataset": d, "i": i, **a.summary(),
-                                "match": match(a.generated.cpu(), ref[(d, i)])})
-        print(f"[baselines | {d}] done", flush=True)
+    for lat in args.latencies_ms:
+        delay.ms = lat
+        for d in args.datasets:
+            for i, p in enumerate(prompts[d]):
+                ids = encode(tok, p)
+                r = two_stage_generate(draft, target, target, target, ids, args.max_new, stops, bs)
+                ref.setdefault((d, i), r.generated.cpu())
+                records.append({"lat": lat, "config": "dflash", "mid": "-", "dataset": d, "i": i,
+                                **r.summary(), "match": match(r.generated.cpu(), ref[(d, i)])})
+                # AR pays the delay on every token; only run it without delay
+                if not args.no_ar and lat == 0:
+                    a = ar_generate(target, ids, args.max_new, stops)
+                    records.append({"lat": lat, "config": "ar", "mid": "-", "dataset": d, "i": i,
+                                    **a.summary(), "match": match(a.generated.cpu(), ref[(d, i)])})
+            print(f"[baselines | {d} | {lat} ms] done", flush=True)
+    delay.ms = 0.0
 
     for spec in args.mids:
         mid = load_mid(spec)
         if not same_hidden_space(target, mid):
             print(f"skip {spec}: the drafter needs features in the target's hidden space")
-            free(mid)
+            del mid
+            free()
             continue
-        policies = [(f"3s-{p}", lambda p=p: WindowPolicy("fixed", window=p)) for p in args.windows]
-        policies.append(("3s-adapt", lambda: WindowPolicy("adaptive", window=32)))
         three_stage_generate(draft, target, mid, w, 64, stops, WindowPolicy("fixed", window=16), bs)
-        for name, make_policy in policies:
-            policy = make_policy()   # adaptive state is shared across prompts of one run
-            for d in args.datasets:
-                for i, p in enumerate(prompts[d]):
-                    r = three_stage_generate(draft, target, mid, encode(tok, p), args.max_new,
-                                             stops, policy, bs)
-                    records.append({"config": name, "mid": spec, "dataset": d, "i": i, **r.summary(),
-                                    "match": match(r.generated.cpu(), ref[(d, i)]),
-                                    "final_window": policy.current_window(), "eps": policy.eps()})
-            print(f"[{name} | {spec}] done  window_now={policy.current_window()}", flush=True)
-        free(mid)
+        for lat in args.latencies_ms:
+            delay.ms = lat
+            policies = [(f"3s-{p}", lambda p=p: WindowPolicy("fixed", window=p)) for p in args.windows]
+            policies.append(("3s-adapt", lambda: WindowPolicy("adaptive", window=32)))
+            for name, make_policy in policies:
+                policy = make_policy()   # adaptive state is shared across prompts of one run
+                for d in args.datasets:
+                    for i, p in enumerate(prompts[d]):
+                        r = three_stage_generate(draft, target, mid, encode(tok, p), args.max_new,
+                                                 stops, policy, bs)
+                        records.append({"lat": lat, "config": name, "mid": spec, "dataset": d, "i": i,
+                                        **r.summary(), "match": match(r.generated.cpu(), ref[(d, i)]),
+                                        "final_window": policy.current_window(), "eps": policy.eps()})
+                print(f"[{name} | {spec} | {lat} ms] done  window_now={policy.current_window()}",
+                      flush=True)
+        delay.ms = 0.0
+        del mid
+        free()
 
     # aggregate
     rows = []
-    keys = sorted({(r["config"], r["mid"], r["dataset"]) for r in records},
-                  key=lambda k: (k[2], k[1], k[0]))
-    for cfg, mid, d in keys:
-        rs = [r for r in records if (r["config"], r["mid"], r["dataset"]) == (cfg, mid, d)]
+    group = lambda r: (r["lat"], r["dataset"], r["mid"], r["config"])  # noqa: E731
+    for key in sorted({group(r) for r in records}):
+        lat, d, mid, cfg = key
+        rs = [r for r in records if group(r) == key]
         tot_tok = sum(r["num_output_tokens"] for r in rs)
         tot_t = sum(r["decode_time"] for r in rs)
-        row = {"dataset": d, "config": cfg, "mid": mid, "tok/s": tot_tok / tot_t,
-               "tgt_calls/tok": mean(r["target_calls_per_token"] for r in rs),
-               "mid_calls/tok": mean(r["mid_calls_per_token"] for r in rs),
-               "tau": mean(r["mean_round_len"] for r in rs),
-               "acc/check": mean(r.get("mean_accepted_per_check", float("nan")) for r in rs),
-               "full_acc": mean(r.get("full_accept_rate", float("nan")) for r in rs),
-               "match": mean(r["match"] for r in rs)}
-        rows.append(row)
+        rows.append({"lat_ms": lat, "dataset": d, "config": cfg, "mid": mid, "tok/s": tot_tok / tot_t,
+                     "tgt_calls/tok": mean(r["target_calls_per_token"] for r in rs),
+                     "mid_calls/tok": mean(r["mid_calls_per_token"] for r in rs),
+                     "tau": mean(r["mean_round_len"] for r in rs),
+                     "acc/check": mean(r.get("mean_accepted_per_check", float("nan")) for r in rs),
+                     "full_acc": mean(r.get("full_accept_rate", float("nan")) for r in rs),
+                     "match": mean(r["match"] for r in rs)})
     for row in rows:
-        base = {r["config"]: r["tok/s"] for r in rows if r["dataset"] == row["dataset"]}
+        same = [r for r in rows if r["dataset"] == row["dataset"] and r["lat_ms"] == row["lat_ms"]]
+        base = {r["config"]: r["tok/s"] for r in same if r["mid"] == "-"}
         row["x_dflash"] = row["tok/s"] / base["dflash"]
-        if "ar" in base:
-            row["x_ar"] = row["tok/s"] / base["ar"]
+        ar0 = [r["tok/s"] for r in rows if r["dataset"] == row["dataset"] and r["config"] == "ar"]
+        if ar0:
+            row["x_ar0"] = row["tok/s"] / ar0[0]
 
-    print_table(rows, ["dataset", "config", "mid", "tok/s", "x_ar", "x_dflash", "tgt_calls/tok",
-                       "mid_calls/tok", "tau", "acc/check", "full_acc", "match"],
-                "three-stage pipeline")
+    print_table(rows, ["lat_ms", "dataset", "config", "mid", "tok/s", "x_ar0", "x_dflash",
+                       "tgt_calls/tok", "mid_calls/tok", "tau", "acc/check", "full_acc", "match"],
+                "three-stage pipeline (x_ar0: vs autoregressive at 0 ms)")
     print(f"peak GPU memory: {gpu_mem_gb():.1f} GB")
-    save_json("exp3_pipeline", {"args": vars(args), "rows": rows, "records": records})
+    name = "exp3_pipeline" + (f"_{args.tag}" if args.tag else "")
+    save_json(name, {"args": vars(args), "rows": rows, "records": records})
 
 
 if __name__ == "__main__":

@@ -77,7 +77,8 @@ def main():
         mid = load_mid(spec)
         if not same_hidden_space(target, mid):
             print(f"skip {spec}: hidden space differs from target, drafter cannot use its features")
-            free(mid)
+            del mid
+            free()
             continue
         for d in args.datasets:
             for name, feat, ver in (("M>T", mid, target), ("M/M", mid, mid)):
@@ -96,7 +97,8 @@ def main():
                              "tok/s": mean(tps), "same_output_as_T/T": mean(match)})
                 print(f"[{name} | {spec} | {d}] tau={mean(taus):.3f} "
                       f"same-output={mean(match):.2f}", flush=True)
-        free(mid)
+        del mid
+        free()
 
     print_table(rows, ["mid", "config", "dataset", "tau", "tok/s", "same_output_as_T/T"],
                 "drafter acceptance (tau = tokens per round incl. bonus)")

@@ -96,7 +96,8 @@ def main():
     draft = load_draft(args.draft)
 
     trajs = {d: get_trajectories(args, target, draft, tok, d) for d in args.datasets}
-    free(draft)
+    del draft
+    free()
 
     # target predictions (teacher forced), plus sanity: does it reproduce the trajectory?
     tgt_pred = {}
@@ -136,7 +137,8 @@ def main():
             rows.append(row)
             print(f"[{spec} | {d}] beta={beta:.4f} top5={row['top5']:.4f} "
                   f"E[acc|32]={row['E[acc|32]']:.2f} E[acc|64]={row['E[acc|64]']:.2f}", flush=True)
-        free(mid)
+        del mid
+        free()
 
     print_table(rows, ["mid", "dataset", "beta", "top5", "E[acc|16]", "iid[acc|16]",
                        "E[acc|64]", "iid[acc|64]", "P*(r=30)", "P*(r=100)"],
