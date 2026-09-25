@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dflash.model import DFlashDraftModel  # noqa: E402
 
+from hspec.async3 import Costs, async_three_stage_generate  # noqa: E402
 from hspec.pipeline import (  # noqa: E402
     WindowPolicy, ar_generate, ddtree_generate, three_stage_generate, two_stage_generate,
 )
@@ -155,6 +156,18 @@ def main():
                 s = r.summary()
                 print(f"  3s+midtree {name:11s} P={w:3d} B={B:3d} k={k} lossless={ok}  "
                       f"mid_calls={r.mid_calls:3d} tau={s['mean_round_len']:.2f} mid_q={s['mean_mid_q']:.1f}")
+            for blocking, w, lat, B in ((True, 16, 0, 0), (False, 4, 0, 0), (False, 16, 20, 16),
+                                        (False, 8, 100, 0), (False, 1, 50, 16)):
+                costs = Costs(target={1: 10.0, 65: 14.0}, mid={1: 4.0, 65: 6.0}, draft_ms=2.0,
+                              latency_ms=lat)
+                r = async_three_stage_generate(draft, target, mid, ids, max_new, stops, costs,
+                                               window=w, blocking=blocking, mid_tree=B)
+                ok = torch.equal(r.generated, ref)
+                failures += not ok
+                s = r.async_stats
+                print(f"  async {name:11s} block={blocking!s:5} P={w:2d} L={lat:3d} B={B:2d} lossless={ok}  "
+                      f"tgt={r.target_calls:3d} mid={r.mid_calls:3d} rollbacks={s['rollbacks']} "
+                      f"t={r.decode_time * 1000:.0f}ms")
         for budget, bsz in ((1, None), (8, None), (32, None), (64, 16)):
             r = ddtree_generate(draft, target, ids, max_new, stops, budget=budget, block_size=bsz)
             ok = torch.equal(r.generated, ref)
