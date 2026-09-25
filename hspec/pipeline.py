@@ -46,8 +46,9 @@ def _cache_len(cache) -> int:
 
 def crop(cache, length: int) -> None:
     """Keep positions [0, length). No-op if the cache is already that short."""
-    if _cache_len(cache) > length:
-        cache.crop(length)
+    remove = _cache_len(cache) - length
+    if remove > 0:
+        cache.crop(-remove)   # negative = drop that many tokens (positive is deprecated in transformers 5.18)
 
 
 def _sync_time() -> float:
