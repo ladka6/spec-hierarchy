@@ -9,12 +9,13 @@ import statistics
 import time
 from pathlib import Path
 
-import torch
 
 RESULTS = Path(os.environ.get("HSPEC_RESULTS", "results"))
 
 
 def env_info() -> dict:
+    import torch
+
     info = {
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "python": platform.python_version(),
@@ -34,7 +35,10 @@ def env_info() -> dict:
 def save_json(name: str, payload: dict) -> Path:
     RESULTS.mkdir(parents=True, exist_ok=True)
     path = RESULTS / f"{name}.json"
-    payload = {"env": env_info(), **payload}
+    try:
+        payload = {"env": env_info(), **payload}
+    except ImportError:
+        pass
     path.write_text(json.dumps(payload, indent=2, default=float))
     print(f"\nsaved {path}")
     return path
