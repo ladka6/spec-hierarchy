@@ -6,6 +6,9 @@ Configs per prompt (all greedy):
   3s-P        drafter -> mid (+ mid features for the drafter) -> target checks every >= P
               pending tokens, for each P in --windows
   3s-adapt    same, window chosen online from P* = ln(1 + eps c_T/c) / eps
+  dflash-bK   DFlash with block size K, for each K in --dflash-blocks other than the default
+  ddtree-B    DDTree (best-first draft tree of B nodes verified by the target), --ddtree-budgets
+  3s-P+brK    three-stage with top-2 branching at up to K low-margin positions, --branch-k
 
 Reports tokens/s, speedup over ar and dflash, target calls per token, tokens accepted per
 target check, and whether the output is identical to dflash (it must be, up to numerical
@@ -27,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hspec.data import encode, load_prompts, stop_ids  # noqa: E402
 from hspec.models import Latency, free, gpu_mem_gb, load_draft, load_mid, load_target, load_tokenizer, same_hidden_space  # noqa: E402
-from hspec.pipeline import WindowPolicy, ar_generate, three_stage_generate, two_stage_generate  # noqa: E402
+from hspec.pipeline import WindowPolicy, ar_generate, ddtree_generate, three_stage_generate, two_stage_generate  # noqa: E402
 from hspec.utils import mean, print_table, save_json  # noqa: E402
 
 
@@ -53,6 +56,14 @@ def main():
                     help="simulated delay added to every target forward (remote target)")
     ap.add_argument("--no-ar", action="store_true", help="skip the slow autoregressive baseline")
     ap.add_argument("--block-size", type=int, default=None)
+    ap.add_argument("--dflash-blocks", nargs="+", type=int, default=[],
+                    help="extra DFlash baselines with these block sizes (e.g. 32)")
+    ap.add_argument("--ddtree-budgets", nargs="+", type=int, default=[],
+                    help="DDTree baselines with these node budgets (e.g. 32 64 128)")
+    ap.add_argument("--branch-k", nargs="+", type=int, default=[0],
+                    help="three-stage variants with top-2 branching at up to K positions (0 = off)")
+    ap.add_argument("--branch-len", type=int, default=8)
+    ap.add_argument("--branch-margin", type=float, default=0.5)
     ap.add_argument("--tag", default="", help="suffix for the results file name")
     args = ap.parse_args()
 
@@ -84,6 +95,14 @@ def main():
                     a = ar_generate(target, ids, args.max_new, stops)
                     records.append({"lat": lat, "config": "ar", "mid": "-", "dataset": d, "i": i,
                                     **a.summary(), "match": match(a.generated.cpu(), ref[(d, i)])})
+                for b in args.dflash_blocks:
+                    r = two_stage_generate(draft, target, target, target, ids, args.max_new, stops, b)
+                    records.append({"lat": lat, "config": f"dflash-b{b}", "mid": "-", "dataset": d, "i": i,
+                                    **r.summary(), "match": match(r.generated.cpu(), ref[(d, i)])})
+                for B in args.ddtree_budgets:
+                    r = ddtree_generate(draft, target, ids, args.max_new, stops, budget=B, block_size=bs)
+                    records.append({"lat": lat, "config": f"ddtree-{B}", "mid": "-", "dataset": d, "i": i,
+                                    **r.summary(), "match": match(r.generated.cpu(), ref[(d, i)])})
             print(f"[baselines | {d} | {lat} ms] done", flush=True)
     delay.ms = 0.0
 
@@ -99,12 +118,15 @@ def main():
             delay.ms = lat
             policies = [(f"3s-{p}", lambda p=p: WindowPolicy("fixed", window=p)) for p in args.windows]
             policies.append(("3s-adapt", lambda: WindowPolicy("adaptive", window=32)))
-            for name, make_policy in policies:
+            runs = [(name + (f"+br{k}" if k else ""), mk, k) for k in args.branch_k for name, mk in policies]
+            for name, make_policy, k in runs:
                 policy = make_policy()   # adaptive state is shared across prompts of one run
                 for d in args.datasets:
                     for i, p in enumerate(prompts[d]):
                         r = three_stage_generate(draft, target, mid, encode(tok, p), args.max_new,
-                                                 stops, policy, bs)
+                                                 stops, policy, bs, branch_k=k,
+                                                 branch_len=args.branch_len,
+                                                 branch_margin=args.branch_margin)
                         records.append({"lat": lat, "config": name, "mid": spec, "dataset": d, "i": i,
                                         **r.summary(), "match": match(r.generated.cpu(), ref[(d, i)]),
                                         "final_window": policy.current_window(), "eps": policy.eps()})
@@ -128,6 +150,8 @@ def main():
                      "tau": mean(r["mean_round_len"] for r in rs),
                      "acc/check": mean(r.get("mean_accepted_per_check", float("nan")) for r in rs),
                      "full_acc": mean(r.get("full_accept_rate", float("nan")) for r in rs),
+                     "mean_q": mean(r.get("mean_target_q", 1.0) for r in rs),
+                     "br_hit": mean(r.get("branch_hit_rate", float("nan")) for r in rs),
                      "match": mean(r["match"] for r in rs)})
     for row in rows:
         same = [r for r in rows if r["dataset"] == row["dataset"] and r["lat_ms"] == row["lat_ms"]]
@@ -138,7 +162,7 @@ def main():
             row["x_ar0"] = row["tok/s"] / ar0[0]
 
     print_table(rows, ["lat_ms", "dataset", "config", "mid", "tok/s", "x_ar0", "x_dflash",
-                       "tgt_calls/tok", "mid_calls/tok", "tau", "acc/check", "full_acc", "match"],
+                       "tgt_calls/tok", "mid_calls/tok", "mean_q", "tau", "acc/check", "full_acc", "br_hit", "match"],
                 "three-stage pipeline (x_ar0: vs autoregressive at 0 ms)")
     print(f"peak GPU memory: {gpu_mem_gb():.1f} GB")
     name = "exp3_pipeline" + (f"_{args.tag}" if args.tag else "")
