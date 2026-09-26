@@ -22,6 +22,19 @@ fi
 OUT=${HSPEC_OUT:-$REPO/results/r9_$(date +%Y%m%d_%H%M%S)_$$}
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
+COMMIT=$(git rev-parse HEAD)
+if ! git diff --quiet HEAD --; then
+  echo "Commit tracked changes before submitting: jobs run a snapshot of HEAD." >&2
+  exit 2
+fi
+if ! git cat-file -e "$COMMIT:scripts/exp9_reserve.py" 2>/dev/null; then
+  echo "This commit has no reserve experiment. Switch to codex/feature-ready-reserve first." >&2
+  exit 2
+fi
+SOURCE=$(mktemp -d "$OUT/source_${COMMIT:0:12}_XXXXXX")
+git archive "$COMMIT" | tar -x -C "$SOURCE"
+printf '%s\n' "$COMMIT" > "$SOURCE/.hspec_commit"
+echo "Source snapshot: $SOURCE ($COMMIT)"
 for GPUS in "${PLACEMENTS[@]}"; do
   # gpu_a100 allocates 18 CPU cores per GPU; all stages stay on the same node.
   CMD=(sbatch --parsable --export=ALL --partition=gpu_a100 --nodes=1 --ntasks=1
@@ -31,7 +44,7 @@ for GPUS in "${PLACEMENTS[@]}"; do
   if [[ -n ${HSPEC_ACCOUNT:-} ]]; then
     CMD+=(--account="$HSPEC_ACCOUNT")
   fi
-  CMD+=("$REPO/snellius/job_r9.sbatch" "$REPO" "$OUT" "$GPUS")
+  CMD+=("$SOURCE/snellius/job_r9.sbatch" "$SOURCE" "$OUT" "$GPUS")
   if [[ ${DRY_RUN:-0} == 1 ]]; then
     printf '%q ' "${CMD[@]}"
     printf '\n'

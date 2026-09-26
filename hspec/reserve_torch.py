@@ -49,7 +49,7 @@ def _clone(cache, length):
 
 class TorchReserveBackend:
     def __init__(self, draft, target, mid, *, max_length, reserve_size=2,
-                 fork_threshold=0.6, block_size=None):
+                 fork_threshold=0.6, block_size=None, target_verification="block"):
         self.draft_model, self.target, self.mid = draft, target, mid
         self.devices = {name: next(model.parameters()).device for name, model in
                         (("draft", draft), ("middle", mid), ("target", target))}
@@ -65,6 +65,10 @@ class TorchReserveBackend:
             raise ValueError("invalid reserve size or fork threshold")
         self.resources = {name: str(device) for name, device in self.devices.items()}
         self.max_length, self.reserve_size = max_length, reserve_size
+        if target_verification not in ("block", "serial"):
+            raise ValueError("target_verification must be block or serial")
+        self.target_verification = target_verification
+        self.verification_history = []
         self.fork_threshold = fork_threshold
         self.bs = draft.block_size if block_size is None else block_size
         if self.bs < 2:
@@ -85,6 +89,7 @@ class TorchReserveBackend:
 
     @torch.inference_mode()
     def prefill(self, prompt: tuple[int, ...]) -> ReadyState:
+        self.verification_history = []
         self.tcache = _make_cache(self.target.config)
         out = self.target(self._ids(prompt, "target"), past_key_values=self.tcache,
                           use_cache=True, logits_to_keep=1)
@@ -170,6 +175,10 @@ class TorchReserveBackend:
         if committed != self.target_prefix or proposal[:len(committed)] != committed:
             raise ValueError("target received a stale or incompatible prefix")
         anchor = len(committed) - 1
+        if self.tcache.get_seq_length() != anchor:
+            raise RuntimeError("target cache length does not match the committed prefix")
+        if self.target_verification == "serial":
+            return self._verify_serial(committed, proposal)
         block = self._ids(proposal[anchor:], "target")
         pos = torch.arange(anchor, len(proposal), device=self.devices["target"])[None]
         out = self.target(block, position_ids=pos, past_key_values=self.tcache, use_cache=True)
@@ -178,6 +187,34 @@ class TorchReserveBackend:
         prefix = (committed + proposal[len(committed):len(committed) + accepted]
                   + (int(bonus),))[:self.max_length]
         crop(self.tcache, len(prefix) - 1)
+        self.target_prefix = prefix
+        self.verification_history.append(dict(anchor=anchor,
+            query_tokens=list(proposal[anchor:]), accepted=accepted,
+            emitted_tokens=list(prefix[len(committed):])))
+        self._sync("target")
+        return TargetResult(prefix, accepted, pending, accepted < pending)
+
+    def _verify_serial(self, committed, proposal):
+        """Diagnostic control: target forward shapes match ordinary AR (q=1).
+
+        This intentionally removes parallel target verification and is not a speedup
+        configuration. It isolates the scheduler from block-shaped target execution.
+        """
+        prefix = committed
+        pending = len(proposal) - len(committed)
+        accepted = 0
+        while len(prefix) < self.max_length:
+            anchor = len(prefix) - 1
+            block = self._ids((prefix[-1],), "target")
+            pos = self._ids((anchor,), "target")
+            out = self.target(block, position_ids=pos, past_key_values=self.tcache, use_cache=True)
+            token = int(out.logits[0, -1].argmax())
+            self.verification_history.append(dict(anchor=anchor, query_tokens=[prefix[-1]],
+                                                  accepted=0, emitted_tokens=[token]))
+            prefix += (token,)
+            if accepted == pending or token != proposal[len(committed) + accepted]:
+                break
+            accepted += 1
         self.target_prefix = prefix
         self._sync("target")
         return TargetResult(prefix, accepted, pending, accepted < pending)
@@ -223,16 +260,18 @@ def reserve_generate(draft, target, mid, input_ids, max_new_tokens, stop_token_i
     result = reserve_decode(backend, initial, n + max_new_tokens, stop_token_ids, cfg)
     ids = torch.tensor([result.prefix], device=input_ids.device)
     r = GenResult(ids, n, result.decode_time)
-    r.target_calls = 1 + result.metrics["stages"]["target"]["calls"]
+    r.target_calls = 1 + len(backend.verification_history)
     r.mid_calls = result.metrics["stages"]["middle"]["calls"]
     r.draft_calls = result.metrics["stages"]["draft"]["calls"]
     for e in result.trace:
         if e["stage"] == "target" and "accepted" in e:
             r.checks.append(dict(pending=e["pending"], accepted=e["accepted"]))
-            r.tq.append(e["pending"] + 1)
+    r.tq = [len(e["query_tokens"]) for e in backend.verification_history]
     result.metrics.update(setup_seconds=setup, prefill_seconds=prefill,
                           placement=backend.resources,
                           timing="wall_clock_including_drain",
+                          target_verification=backend.target_verification,
+                          target_forward_calls=len(backend.verification_history),
                           head_copy=backend.head is not target)
     r.reserve_stats, r.reserve_trace = result.metrics, result.trace
     return r

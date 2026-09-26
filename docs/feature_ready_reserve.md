@@ -119,10 +119,35 @@ It reuses `setup.sh`'s Python modules, `$HSPEC_VENV` (default `~/venvs/hspec`), 
 `$HF_HOME` (default `/scratch-shared/$USER/hf`), and runs offline on compute nodes.
 It does not install packages or download checkpoints in the batch job.
 
+The launcher archives the committed source into the results directory **before submitting**.
+The job runs that snapshot, so changing branches in the original checkout no longer changes
+queued or running jobs. Commit tracked edits before submitting; untracked files are not
+part of the snapshot. The environment log records the snapshot path and its commit.
+
 Set `HSPEC_ACCOUNT` if your allocation needs an explicit SLURM account, `HSPEC_TIME`
 to override the eight-hour limit, or `HSPEC_OUT` to choose the output parent directory.
 `DRY_RUN=1 bash snellius/submit_r9.sh both` prints submission commands without submitting.
 `squeue -u "$USER"` shows the queued/running jobs.
+
+### Investigating an exact-match failure
+
+A failed match still aborts the job. It now also writes `fallback_mismatch.json` (or
+`wait_mismatch.json`) with token IDs, the first divergence, and the target query history.
+An untimed replay compares the AR-shaped decision with the recorded block-shaped decision
+and reports top logits/margins. If replay itself fails, the raw evidence remains saved.
+BF16/kernel-shape differences are one possible cause; a close margin is not proof of that
+cause, and diagnostics never reclassify a failed run as correct.
+
+Run a short isolated experiment first:
+
+```bash
+HSPEC_N=1 HSPEC_MAX_NEW=64 HSPEC_REPEATS=1 bash snellius/submit_r9.sh 3
+```
+
+For a control that keeps the scheduler but forces target forwards to have AR's one-token
+query shape, use `HSPEC_TARGET_VERIFICATION=serial` with the same short-run settings.
+This is a diagnostic, **not** a performance configuration: it removes parallel target
+verification. Actual target-forward counts are recorded separately from worker-job counts.
 
 ## Metrics and interpretation
 

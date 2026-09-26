@@ -26,11 +26,12 @@ source "${HSPEC_VENV:-$HOME/venvs/hspec}/bin/activate"
 export HF_HOME=${HF_HOME:-/scratch-shared/$USER/hf}
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+export PYTHONDONTWRITEBYTECODE=1
 
 {
   echo "job=$SLURM_JOB_ID placement=${GPUS}gpu host=$(hostname)"
-  echo "commit=$(git rev-parse HEAD)"
-  git status --short
+  echo "source_snapshot=$REPO"
+  echo "commit=$(cat .hspec_commit)"
   module list 2>&1
   nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
 } | tee "$RUN_DIR/environment.log"
@@ -45,7 +46,8 @@ COMMON=(--target-device cuda:0 --mid-device cuda:1 --draft-device "$DRAFT_DEVICE
         --repeats "${HSPEC_REPEATS:-3}" --seed "${HSPEC_SEED:-0}"
         --fork-threshold "${HSPEC_FORK_THRESHOLD:-0.6}"
         --max-ahead "${HSPEC_MAX_AHEAD:-64}"
-        --target-window "${HSPEC_TARGET_WINDOW:-32}" --trace)
+        --target-window "${HSPEC_TARGET_WINDOW:-32}"
+        --target-verification "${HSPEC_TARGET_VERIFICATION:-block}" --trace)
 for POLICY in fallback wait; do
   if [[ $POLICY == fallback ]]; then
     POLICY_ARG=--target-fallback

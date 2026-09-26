@@ -69,6 +69,36 @@ class TorchReserveTests(unittest.TestCase):
         r = reserve_generate(draft, target, mid, prompt, 0, [])
         self.assertTrue(torch.equal(r.output_ids, prompt))
 
+    def test_serial_target_control_and_mismatch_replay(self):
+        from hspec.mismatch import diagnose_mismatch
+        draft, target, mid = tiny_models()
+        ids = torch.tensor([[1, 2, 3]])
+        ref = ar_generate(target, ids, 17, []).output_ids
+        for verification in ("block", "serial"):
+            b = TorchReserveBackend(draft, target, mid, max_length=20,
+                                    target_verification=verification)
+            r = reserve_generate(draft, target, mid, ids, 17, [], backend=b)
+            self.assertTrue(torch.equal(r.output_ids, ref))
+            self.assertEqual(r.target_calls, len(b.verification_history) + 1)
+            if verification == "serial":
+                self.assertTrue(all(q == 1 for q in r.tq))
+            # Inject a mismatch to check that diagnostics locate and replay the decision.
+            modified = r.output_ids.clone()
+            modified[0, 8] = (modified[0, 8] + 1) % 48
+            evidence = diagnose_mismatch(target, ids, ref, modified, b.verification_history)
+            self.assertEqual(evidence["generated_index"], 5)
+            self.assertEqual(evidence["ar_replay"]["tokens"][0], int(ref[0, 8]))
+            self.assertEqual(evidence["query_replay"]["tokens"][0], int(ref[0, 8]))
+            self.assertEqual(evidence["replay_different_checks"], [])
+
+    def test_target_cache_length_guard(self):
+        draft, target, mid = tiny_models()
+        b = TorchReserveBackend(draft, target, mid, max_length=20)
+        state = b.prefill((1, 2, 3))
+        b.tcache.crop(-1)
+        with self.assertRaisesRegex(RuntimeError, "cache length"):
+            b.verify(state.prefix, state.prefix)
+
     def test_snapshots_are_not_mutated_and_alternative_features_are_valid(self):
         draft, target, mid = tiny_models()
         b = TorchReserveBackend(draft, target, mid, max_length=24,

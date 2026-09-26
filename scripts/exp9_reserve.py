@@ -26,6 +26,7 @@ from hspec.models import load_draft, load_mid, load_target, load_tokenizer
 from hspec.pipeline import ar_generate
 from hspec.reserve import ReserveConfig
 from hspec.reserve_torch import TorchReserveBackend, reserve_generate
+from hspec.mismatch import diagnose_mismatch
 
 
 def parser():
@@ -40,6 +41,8 @@ def parser():
     ap.add_argument("--fork-threshold", type=float, default=0.6)
     ap.add_argument("--max-ahead", type=int, default=64)
     ap.add_argument("--target-window", type=int, default=32)
+    ap.add_argument("--target-verification", choices=["block", "serial"], default="block",
+                    help="serial is an AR-shaped diagnostic control, not a speed benchmark")
     ap.add_argument("--target-fallback", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--skip-sync", action="store_true")
     ap.add_argument("--datasets", nargs="+", default=["gsm8k"])
@@ -75,7 +78,8 @@ def main():
     prompts = ({"literal": args.prompt} if args.prompt else
                {d: load_prompts(d, args.n, args.seed) for d in args.datasets})
     backend = TorchReserveBackend(draft, target, mid, max_length=1,
-                                  reserve_size=max(args.reserves), fork_threshold=args.fork_threshold)
+                                  reserve_size=max(args.reserves), fork_threshold=args.fork_threshold,
+                                  target_verification=args.target_verification)
     cuda_devices = sorted({str(d) for d in backend.devices.values() if d.type == "cuda"})
     first = encode(tokenizer, next(iter(prompts.values()))[0], args.target_device)
     for _, cfg in configs:
@@ -128,6 +132,24 @@ def main():
                     print(f"{dataset}/{i} repeat={repeat} {name}: "
                           f"{record['confirmed_tok_s']:.2f} tok/s match={match}", flush=True)
                     if not match:
+                        # Save basic evidence first, even if target-only replay subsequently fails.
+                        diagnostic_path = args.output.with_name(args.output.stem + "_mismatch.json")
+                        evidence = dict(config=name, dataset=dataset, i=i, repeat=repeat,
+                                        input_ids=ids[0].tolist(),
+                                        reference_ids=ref.output_ids[0].tolist(),
+                                        actual_ids=r.output_ids[0].tolist(),
+                                        target_history=backend.verification_history)
+                        diagnostic_path.write_text(json.dumps(evidence, indent=2))
+                        try:
+                            evidence.update(diagnose_mismatch(target, ids, ref.output_ids,
+                                                            r.output_ids, backend.verification_history))
+                        except Exception as error:
+                            evidence["diagnostic_error"] = repr(error)
+                        diagnostic_path.write_text(json.dumps(evidence, indent=2))
+                        print("Mismatch diagnostics: " + str(diagnostic_path), flush=True)
+                        print(json.dumps({k: v for k, v in evidence.items() if k not in
+                                          ("input_ids", "reference_ids", "actual_ids", "target_history")}),
+                              flush=True)
                         raise RuntimeError(f"greedy mismatch in {name}; results saved to {args.output}")
 
 
