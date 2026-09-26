@@ -101,9 +101,68 @@ def _draft_lagged(draft, head_src, feat, ctx_end, anchor, anchor_tok, bs):
     return draft.compute_logits(hidden, _output_head(head_src))[0]
 
 
+class SimTarget:
+    """Target on a simulated clock: forwards run locally, results take effect at their
+    virtual arrival time (see module docstring)."""
+
+    has_feats = True
+
+    def __init__(self, target, costs: Costs, draft_layer_ids):
+        self.target, self.costs, self.layer_ids = target, costs, draft_layer_ids
+        self.inflight: list[_Check] = []
+
+    def prefill(self, input_ids, position_ids, want_hidden):
+        self.cache = _make_cache(self.target.config)
+        self._now, self.busy = 0.0, 0.0
+        self.inflight = []
+        out = self.target(input_ids, position_ids=position_ids, past_key_values=self.cache, use_cache=True,
+                          logits_to_keep=1, output_hidden_states=want_hidden)
+        return int(out.logits[0, -1].argmax()), (out.hidden_states if want_hidden else None)
+
+    def now(self):
+        return self._now
+
+    def spend(self, ms):
+        self._now += ms
+
+    def submit(self, toks, c0, c1, position_ids):
+        L = self.costs.latency_ms
+        tout = self.target(toks, position_ids=position_ids[:, c0 : c1 + 1], past_key_values=self.cache,
+                           use_cache=True, output_hidden_states=True)
+        q = c1 - c0 + 1
+        start_t = max(self._now + L / 2, self.busy)
+        end_t = start_t + self.costs.t(q)
+        self.busy = end_t
+        self.inflight.append(_Check(c0, c1, tout.logits[0].argmax(-1),
+                                    extract_context_feature(tout.hidden_states, self.layer_ids),
+                                    start_t, end_t, end_t + L / 2))
+
+    def pop_ready(self):
+        if self.inflight and self.inflight[0].done_t <= self._now:
+            return self.inflight.pop(0)
+        return None
+
+    def wait_first(self):
+        wait = max(self.inflight[0].done_t - self._now, 0.0)
+        self._now += wait
+        return wait
+
+    def drop(self, p, t_learn):
+        started = [c.end_t for c in self.inflight if c.start_t <= t_learn]
+        n = len(self.inflight)
+        self.inflight.clear()
+        self.busy = max(started + [min(self.busy, t_learn)])
+        crop(self.cache, p)
+        return n
+
+
 @torch.inference_mode()
 def hier_generate(draft, target, mid, input_ids, max_new_tokens, stop_token_ids,
-                  costs: Costs, cfg: HierConfig, block_size: int | None = None) -> GenResult:
+                  costs: Costs, cfg: HierConfig, block_size: int | None = None, backend=None,
+                  use_target_feats: bool = True) -> GenResult:
+    """backend: SimTarget (default, simulated clock) or a real target process
+    (hspec.real2gpu.ProcTarget). `target` is always needed locally for the drafter's
+    embeddings / LM head."""
     device = input_ids.device
     bs = draft.block_size if block_size is None else block_size
     n = input_ids.shape[1]
@@ -111,15 +170,16 @@ def hier_generate(draft, target, mid, input_ids, max_new_tokens, stop_token_ids,
     size = max_len + bs + 2
     stop = torch.tensor(stop_token_ids, device=device) if stop_token_ids else None
     position_ids = torch.arange(size, device=device).unsqueeze(0)
-    L = costs.latency_ms
     use_mid = not cfg.pearl
 
+    tb = backend if backend is not None else SimTarget(target, costs, draft.target_layer_ids)
+    if cfg.pearl and not tb.has_feats:
+        raise ValueError("pearl mode needs target features (simulated backend only)")
+    use_target_feats = use_target_feats and tb.has_feats
     ids = torch.full((1, size), draft.mask_token_id, dtype=torch.long, device=device)
     ids[:, :n] = input_ids
-    tcache = _make_cache(target.config)
-    out = target(input_ids, position_ids=position_ids[:, :n], past_key_values=tcache, use_cache=True,
-                 logits_to_keep=1, output_hidden_states=not use_mid)
-    ids[0, n] = out.logits[0, -1].argmax()
+    first, hidden = tb.prefill(input_ids, position_ids[:, :n], not use_mid)
+    ids[0, n] = first
     if use_mid:
         mcache = _make_cache(mid.config)
         mo = mid(input_ids, position_ids=position_ids[:, :n], past_key_values=mcache, use_cache=True,
@@ -127,7 +187,7 @@ def hier_generate(draft, target, mid, input_ids, max_new_tokens, stop_token_ids,
         f0 = extract_context_feature(mo.hidden_states, draft.target_layer_ids)
     else:
         mcache = None
-        f0 = extract_context_feature(out.hidden_states, draft.target_layer_ids)
+        f0 = extract_context_feature(hidden, draft.target_layer_ids)
     feat = torch.zeros((1, size, f0.shape[-1]), dtype=f0.dtype, device=device)
     feat[:, :n] = f0
     main = _Branch(ids, feat, torch.ones(size, device=device), torch.zeros(size, dtype=torch.long, device=device),
@@ -136,36 +196,24 @@ def hier_generate(draft, target, mid, input_ids, max_new_tokens, stop_token_ids,
 
     res = GenResult(ids, n, 0.0)
     res.target_calls = 1
-    st = {"tf": n, "tsub": n, "now": 0.0, "busy": 0.0, "done": False, "final": None}
-    inflight: list[_Check] = []
+    st = {"tf": n, "tsub": n, "done": False, "final": None}
     stats = {"rollbacks": 0, "caught": 0, "forks": 0, "branch_rounds": 0, "waste_tokens": 0,
-             "wasted_target_calls": 0, "lower_wait_ms": 0.0, "lower_steps": 0}
+             "wasted_target_calls": 0, "lower_wait_ms": 0.0, "lower_steps": 0,
+             "step_ms": [], "step_q": []}
     if _first_stop(ids[0, n : n + 1], stop) is not None:
         st["done"], st["final"] = True, n + 1
 
     # ------------------------------------------------------------------ target side
     def submit():
         c0, c1 = st["tsub"], main.start
-        tout = target(main.ids[:, c0 : c1 + 1], position_ids=position_ids[:, c0 : c1 + 1],
-                      past_key_values=tcache, use_cache=True, output_hidden_states=True)
-        q = c1 - c0 + 1
-        start_t = max(st["now"] + L / 2, st["busy"])
-        end_t = start_t + costs.t(q)
-        st["busy"] = end_t
-        inflight.append(_Check(c0, c1, tout.logits[0].argmax(-1),
-                               extract_context_feature(tout.hidden_states, draft.target_layer_ids),
-                               start_t, end_t, end_t + L / 2))
+        tb.submit(main.ids[:, c0 : c1 + 1], c0, c1, position_ids)
         st["tsub"] = c1 + 1
         res.target_calls += 1
-        res.tq.append(q)
+        res.tq.append(c1 - c0 + 1)
 
     def drop_inflight(p, now):
-        started = [c.end_t for c in inflight if c.start_t <= now]
-        stats["wasted_target_calls"] += len(inflight)
-        inflight.clear()
-        st["busy"] = max(started + [min(st["busy"], now)])
+        stats["wasted_target_calls"] += tb.drop(p, now)
         st["tsub"] = p
-        crop(tcache, p)
 
     def rollback(p, now):
         stats["rollbacks"] += 1
@@ -187,7 +235,8 @@ def hier_generate(draft, target, mid, input_ids, max_new_tokens, stop_token_ids,
         cmp = main.ids[0, c0 + 1 : hi + 1] == ck.preds[: hi - c0]
         a = int(cmp.long().cumprod(0).sum())
         rows = min(a + 1, c1 - c0 + 1)
-        main.feat[:, c0 : c0 + rows] = ck.feats[:, :rows]
+        if use_target_feats:
+            main.feat[:, c0 : c0 + rows] = ck.feats[:, :rows]
         old_tf = st["tf"]
         if a < hi - c0:
             p, tok = c0 + 1 + a, int(ck.preds[a])
@@ -195,7 +244,8 @@ def hier_generate(draft, target, mid, input_ids, max_new_tokens, stop_token_ids,
             if hit is not None:
                 stats["caught"] += 1
                 stats["waste_tokens"] += main.start - p
-                hit.feat[:, c0 : c0 + rows] = ck.feats[:, :rows]
+                if use_target_feats:
+                    hit.feat[:, c0 : c0 + rows] = ck.feats[:, :rows]
                 drop_inflight(p, ck.done_t)
                 main = hit
                 alts.clear()
@@ -298,6 +348,7 @@ def hier_generate(draft, target, mid, input_ids, max_new_tokens, stop_token_ids,
         stats["forks"] += 1
 
     def lower_step():
+        t_step = tb.now()
         old_start = main.start
         drafted, q, produced = (pearl_round if cfg.pearl else mid_round)(main)
         n_draft, q_total = int(drafted), q
@@ -318,7 +369,14 @@ def hier_generate(draft, target, mid, input_ids, max_new_tokens, stop_token_ids,
         if use_mid:
             cost += costs.m(q_total)
             res.mid_calls += 1
-        st["now"] += cost
+        if getattr(tb, "is_real", False):
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            cost = tb.now() - t_step            # measured wall time of the step
+        else:
+            tb.spend(cost)
+        stats["step_ms"].append(cost)
+        stats["step_q"].append(q_total)
         stats["lower_steps"] += 1
         # hedging: fork at every new position below the threshold, least confident first
         if cfg.max_branches > 0 and use_mid and len(alts) < cfg.max_branches:
@@ -335,8 +393,11 @@ def hier_generate(draft, target, mid, input_ids, max_new_tokens, stop_token_ids,
 
     # ------------------------------------------------------------------ main loop
     while not st["done"]:
-        while inflight and inflight[0].done_t <= st["now"] and not st["done"]:
-            process(inflight.pop(0))
+        while not st["done"]:
+            ck = tb.pop_ready()
+            if ck is None:
+                break
+            process(ck)
         if st["done"]:
             break
         start, tf = main.start, st["tf"]
@@ -348,20 +409,18 @@ def hier_generate(draft, target, mid, input_ids, max_new_tokens, stop_token_ids,
         want = nver >= cfg.window or blocked
         if cfg.check_rule == "conf" and nver >= cfg.min_window:
             want = want or float(main.conf[seg0 : start + 1].prod()) < cfg.tau
-        if unsub > 0 and len(inflight) < cfg.max_inflight and want:
+        if unsub > 0 and len(tb.inflight) < cfg.max_inflight and want:
             submit()
             if cfg.blocking:
                 blocked = True
-        if blocked or (cfg.blocking and inflight):
-            if not inflight:
+        if blocked or (cfg.blocking and tb.inflight):
+            if not tb.inflight:
                 raise RuntimeError("blocked with nothing in flight")
-            wait = max(inflight[0].done_t - st["now"], 0.0)
-            stats["lower_wait_ms"] += wait
-            st["now"] += wait
+            stats["lower_wait_ms"] += tb.wait_first()
             continue
         lower_step()
 
-    res.decode_time = st["now"] / 1000.0
+    res.decode_time = tb.now() / 1000.0
     res.output_ids = main.ids[:, : min(st["final"], max_len)]
     res.async_stats = stats
     return res
