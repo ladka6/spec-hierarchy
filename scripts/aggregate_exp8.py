@@ -1,6 +1,6 @@
 """Merge exp8_*.json files and print the comparison.
 
-  python scripts/aggregate_exp8.py results/r6_<jobid>
+  python scripts/aggregate_exp8.py results/r6_split [results/r7_split ...]
 """
 
 from __future__ import annotations
@@ -16,12 +16,17 @@ from hspec.utils import mean, print_table  # noqa: E402
 
 
 def main():
-    root = Path(sys.argv[1] if len(sys.argv) > 1 else "results")
-    records = []
-    for f in sorted(root.glob("exp8_*.json")):
-        records += json.loads(f.read_text())["records"]
+    roots = [Path(a) for a in sys.argv[1:]] or [Path("results")]
+    records, seen = [], set()
+    for root in roots:
+        for f in sorted(root.glob("exp8_*.json")):
+            for r in json.loads(f.read_text())["records"]:
+                key = (r["config"], r["dataset"], r["i"], r["lat"])
+                if key not in seen:          # first directory wins on duplicates
+                    seen.add(key)
+                    records.append(r)
     if not records:
-        sys.exit(f"no exp8_*.json in {root}")
+        sys.exit(f"no exp8_*.json in {roots}")
     groups = defaultdict(list)
     for r in records:
         groups[(r["lat"], r["dataset"], r["config"])].append(r)

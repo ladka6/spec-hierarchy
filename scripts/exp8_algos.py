@@ -8,6 +8,9 @@ Config specs (combine with "+"):
   sync-cP / async-cP           confidence-timed checks (tau, min window, max window P)
   +mtB                         mid verifies a DDTree of B drafter nodes
   +hK                          hedging with up to K live alternative branches
+  +fX                          fork threshold (mid top-1 probability below X)
+  +atB                         mid tree budget on alternative branches (0 = chain)
+  cPtXmM                       conf check with tau X and min window M (e.g. async-c32t0.3m2)
 
 Blocking configs behave identically at every latency, so they run once and their time is
 shifted by L per target check.
@@ -18,6 +21,7 @@ shifted by L per target check.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -34,6 +38,7 @@ from hspec.utils import save_json  # noqa: E402
 
 
 def parse(spec: str, args) -> HierConfig:
+    """e.g. async-c32t0.3m2+mt32+h4+f0.7+at0 (see module docstring)."""
     parts = spec.split("+")
     mode, arg = parts[0].split("-")
     cfg = HierConfig(tau=args.tau, min_window=args.min_window, fork_thr=args.fork_thr,
@@ -43,15 +48,25 @@ def parse(spec: str, args) -> HierConfig:
         cfg.blocking = mode == "pearlsync"
     else:
         cfg.blocking = mode == "sync"
-        if arg.startswith("c"):
-            cfg.check_rule, cfg.window = "conf", int(arg[1:])
-        else:
-            cfg.window = int(arg)
+        m = re.fullmatch(r"(c?)(\d+)(?:t([\d.]+))?(?:m(\d+))?", arg)
+        if not m:
+            raise ValueError(f"bad window spec {arg} in {spec}")
+        cfg.window = int(m.group(2))
+        if m.group(1):
+            cfg.check_rule = "conf"
+        if m.group(3):
+            cfg.tau = float(m.group(3))
+        if m.group(4):
+            cfg.min_window = int(m.group(4))
     for p in parts[1:]:
         if p.startswith("mt"):
             cfg.mid_tree = int(p[2:])
+        elif p.startswith("at"):
+            cfg.alt_tree = int(p[2:])
         elif p.startswith("h"):
             cfg.max_branches = int(p[1:])
+        elif p.startswith("f"):
+            cfg.fork_thr = float(p[1:])
         else:
             raise ValueError(f"unknown option {p} in {spec}")
     return cfg
@@ -77,6 +92,7 @@ def main():
     ap.add_argument("--fork-thr", type=float, default=0.6)
     ap.add_argument("--beta", type=float, default=0.15)
     ap.add_argument("--draft-ms", type=float, default=3.55)
+    ap.add_argument("--suffix", default="", help="appended to config names in the records (e.g. @ao4)")
     ap.add_argument("--tag", default="")
     args = ap.parse_args()
 
@@ -118,7 +134,7 @@ def main():
                 for i, p in enumerate(prompts[d]):
                     r = hier_generate(draft, target, mid, encode(tok, p), args.max_new, stops, costs, cfg)
                     s = r.summary()
-                    rec = {"dataset": d, "i": i, "config": spec, "tokens": r.num_output_tokens,
+                    rec = {"dataset": d, "i": i, "config": spec + args.suffix, "tokens": r.num_output_tokens,
                            "tgt_calls_per_tok": s["target_calls_per_token"],
                            "mid_calls_per_tok": s["mid_calls_per_token"], "tau": s["mean_round_len"],
                            "mean_q": s["mean_target_q"], **r.async_stats}

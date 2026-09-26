@@ -56,6 +56,7 @@ class HierConfig:
     mid_tree: int = 0
     max_branches: int = 0       # hedging: live alternative branches (0 = off)
     fork_thr: float = 0.6       # fork where mid's top-1 probability is below this
+    alt_tree: int = 0           # mid tree budget on alternative branches (0 = plain chain)
     pearl: bool = False         # two-stage async, drafter tokens sent unverified
     pearl_len: int = 8
     draft_batch_beta: float = 0.15   # drafter cost at batch n: c_D * (1 + beta (n - 1))
@@ -220,17 +221,18 @@ def hier_generate(draft, target, mid, input_ids, max_new_tokens, stop_token_ids,
             st["done"], st["final"] = True, max_len
 
     # ------------------------------------------------------------------ lower side
-    def mid_round(b: _Branch):
-        """One draft + mid round on branch b. Returns (drafted, mid query tokens)."""
+    def mid_round(b: _Branch, budget: int | None = None):
+        """One draft + mid round on branch b. Returns (drafted, mid query tokens, produced)."""
+        budget = cfg.mid_tree if budget is None else budget
         start, mlen, dlen = b.start, b.mlen, b.dlen
         vs = min(bs, max_len - start)
         offset = start - mlen
         ctx = b.feat[:, dlen:start]
         drafted = vs > 1
-        if cfg.mid_tree > 0 and vs > 1:
+        if budget > 0 and vs > 1:
             logits = draft_logits(draft, target, ctx, b.ids[:, start : start + vs], position_ids, start, b.dcache)
             b.dlen = start
-            dtree = build_ddtree(logits, cfg.mid_tree)
+            dtree = build_ddtree(logits, budget)
             tree = Tree()
             for i, tok in enumerate(b.ids[0, mlen + 1 : start + 1].tolist()):
                 tree.add(tok, i - 1)
@@ -305,7 +307,7 @@ def hier_generate(draft, target, mid, input_ids, max_new_tokens, stop_token_ids,
                 continue
             if _first_stop(b.ids[0, b.fork : b.start + 1], stop) is not None:
                 continue
-            d, qb, _ = mid_round(b)
+            d, qb, _ = mid_round(b, cfg.alt_tree)
             n_draft += int(d)
             q_total += qb
             stats["branch_rounds"] += 1
@@ -318,16 +320,18 @@ def hier_generate(draft, target, mid, input_ids, max_new_tokens, stop_token_ids,
             res.mid_calls += 1
         st["now"] += cost
         stats["lower_steps"] += 1
-        # hedging: fork at the least confident new position
+        # hedging: fork at every new position below the threshold, least confident first
         if cfg.max_branches > 0 and use_mid and len(alts) < cfg.max_branches:
             lo = max(old_start + 1, st["tf"] + 1)
             hi = main.start
             if hi >= lo:
-                c = main.conf[lo : hi + 1]
-                j = int(c.argmin())
-                p = lo + j
-                if float(c[j]) < cfg.fork_thr and all(b.fork != p for b in alts) and p + 1 < max_len:
-                    fork_from(p)
+                c = main.conf[lo : hi + 1].tolist()
+                for j in sorted(range(len(c)), key=c.__getitem__):
+                    p = lo + j
+                    if c[j] >= cfg.fork_thr or len(alts) >= cfg.max_branches:
+                        break
+                    if all(b.fork != p for b in alts) and p + 1 < max_len:
+                        fork_from(p)
 
     # ------------------------------------------------------------------ main loop
     while not st["done"]:
