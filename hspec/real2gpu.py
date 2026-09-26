@@ -130,7 +130,7 @@ class ProcTarget:
         self.inflight, self.by_cid = [], {}
         self.req.put(("prefill", self.epoch, input_ids.cpu()))
         while True:
-            m = self.res.get()
+            m = self.res.get(timeout=600)
             if m[0] == "prefill" and m[1] == self.epoch:
                 break
         self.t0 = _ms()
@@ -178,7 +178,11 @@ class ProcTarget:
         t = self.now()
         ck = self.inflight[0]
         while ck.preds is None:
-            self._take(self.res.get())
+            try:
+                self._take(self.res.get(timeout=300))
+            except queue.Empty:
+                raise RuntimeError(f"no answer from the target server for 300 s (check {ck.c0}..{ck.c1}, "
+                                   f"epoch {self.epoch}, server alive: {self.proc.is_alive()})") from None
         delay = ck.done_t - self.now()
         if delay > 0:
             time.sleep(delay / 1000.0)
