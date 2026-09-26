@@ -8,7 +8,7 @@ vLLM benchmark, so c_mid(q) / c_target(q) is a like-for-like ratio.
 Also measures the drafter at batch 1, 2, 4, 8 (hedging extends several branches in one
 batched drafter call).
 
-  python scripts/bench_graph.py --mids ao4:Qwen/Qwen3-8B bnb4:Qwen/Qwen3-8B
+  python scripts/bench_graph.py --mids bnb4:Qwen/Qwen3-8B
 Writes results/bench_graph.json.
 """
 
@@ -46,22 +46,30 @@ def _time(fn, reps):
 
 @torch.inference_mode()
 def bench_model(name, model, ctx, qs, reps):
-    from transformers import StaticCache
+    """Dynamic cache holding a ctx-token prefix, cropped back after every timed call.
+
+    (A StaticCache is not usable here: its internal position counter advances on every
+    forward, so repeated timing calls run past the end of the buffer.) For the CUDA graph,
+    the prefix tensors are kept alive so every replay attends over the same prefix."""
+    from dflash.model import _make_cache
+
+    from hspec.pipeline import crop
 
     dev = next(model.parameters()).device
     vocab = model.config.vocab_size
     row = {"model": name}
-    cache = StaticCache(config=model.config, max_cache_len=ctx + max(qs) + 8)
+    cache = _make_cache(model.config)
     prefix = torch.randint(0, vocab, (1, ctx), device=dev)
-    model(prefix, cache_position=torch.arange(ctx, device=dev), past_key_values=cache, use_cache=True,
-          logits_to_keep=1)
+    model(prefix, past_key_values=cache, use_cache=True, logits_to_keep=1)
+    keep = [(layer.keys, layer.values) for layer in cache.layers]
     for q in qs:
         ids = torch.randint(0, vocab, (1, q), device=dev)
-        cpos = torch.arange(ctx, ctx + q, device=dev)
-        pos = cpos.unsqueeze(0)
+        pos = torch.arange(ctx, ctx + q, device=dev).unsqueeze(0)
 
         def step():
-            return model(ids, position_ids=pos, cache_position=cpos, past_key_values=cache, use_cache=True)
+            out = model(ids, position_ids=pos, past_key_values=cache, use_cache=True)
+            crop(cache, ctx)
+            return out
 
         row[f"eager_q{q}"] = _time(step, reps)
         try:
@@ -73,12 +81,15 @@ def bench_model(name, model, ctx, qs, reps):
             torch.cuda.current_stream().wait_stream(s)
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
-                step()
+                model(ids, position_ids=pos, past_key_values=cache, use_cache=True)
+            crop(cache, ctx)
             row[f"q{q}"] = _time(g.replay, reps)
             del g
         except Exception as e:  # noqa: BLE001
+            crop(cache, ctx)
             row[f"q{q}"] = float("nan")
             print(f"[{name} q={q}] graph capture failed: {type(e).__name__}: {str(e)[:200]}", flush=True)
+    del keep
     print(row, flush=True)
     return row
 
@@ -124,7 +135,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
     ap.add_argument("--draft", default="z-lab/Qwen3-8B-DFlash-b16")
-    ap.add_argument("--mids", nargs="+", default=["ao4:Qwen/Qwen3-8B", "bnb4:Qwen/Qwen3-8B"])
+    ap.add_argument("--mids", nargs="+", default=["bnb4:Qwen/Qwen3-8B"])
     ap.add_argument("--ctx", type=int, default=512)
     ap.add_argument("--qs", nargs="+", type=int, default=[1, 8, 17, 33, 49, 65, 97, 129])
     ap.add_argument("--batches", nargs="+", type=int, default=[1, 2, 4, 8])
