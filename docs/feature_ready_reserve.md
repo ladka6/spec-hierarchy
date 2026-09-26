@@ -86,6 +86,44 @@ reserves isolate the effect of preparing alternative jobs. This sync baseline is
 fixed-window implementation in `pipeline.py`, and these ablations do not replace external
 DFlash/DDTree/SSD performance baselines.
 
+## Snellius launcher
+
+On a login node, after checking out this branch:
+
+```bash
+# Once, if the existing environment/model/dataset cache is not already prepared:
+bash snellius/setup.sh
+
+# One job with three GPUs, one model per device:
+bash snellius/submit_r9.sh
+
+# Or use two GPUs, with the middle and draft stages sharing one device:
+bash snellius/submit_r9.sh 2
+
+# Optional: submit both placements as separate jobs:
+bash snellius/submit_r9.sh both
+
+# Short first run across all four datasets:
+HSPEC_N=1 HSPEC_MAX_NEW=64 HSPEC_REPEATS=1 bash snellius/submit_r9.sh 3
+```
+
+Each job runs both target policies (`fallback.json` and `wait.json`), the synchronous
+baseline, and reserve sizes 0/1/2/4/8 over gsm8k, math500, humaneval, and mt-bench.
+Defaults are five prompts per dataset, 256 output tokens, and three repetitions.
+The launcher prints the unique results directory and job ID; per-policy logs, timing
+traces, and environment details are saved there. Failures propagate to SLURM.
+
+The launcher requests one `gpu_a100` node with 18 CPU cores per requested GPU, following
+the [SURF partition allocation](https://servicedesk.surf.nl/wiki/spaces/WIKI/pages/30660209/Snellius%2Bpartitions).
+It reuses `setup.sh`'s Python modules, `$HSPEC_VENV` (default `~/venvs/hspec`), and
+`$HF_HOME` (default `/scratch-shared/$USER/hf`), and runs offline on compute nodes.
+It does not install packages or download checkpoints in the batch job.
+
+Set `HSPEC_ACCOUNT` if your allocation needs an explicit SLURM account, `HSPEC_TIME`
+to override the eight-hour limit, or `HSPEC_OUT` to choose the output parent directory.
+`DRY_RUN=1 bash snellius/submit_r9.sh both` prints submission commands without submitting.
+`squeue -u "$USER"` shows the queued/running jobs.
+
 ## Metrics and interpretation
 
 - `confirmed_tok_s`: tokens committed after prefill / measured decode time including drain.
