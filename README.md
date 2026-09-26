@@ -1,5 +1,9 @@
 # spec-hierarchy
 
+Experimental real-worker decoder: [feature-ready job reserve](docs/feature_ready_reserve.md).
+It keeps DFlash unchanged, supports explicit 1/2/3-device placement, and measures a
+synchronous / asynchronous / reserve-size ablation with `scripts/exp9_reserve.py`.
+
 Three-stage speculative decoding on top of [DFlash](https://github.com/z-lab/dflash):
 
 ```
