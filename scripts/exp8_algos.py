@@ -134,7 +134,7 @@ def main():
                         r = ddtree_generate(draft, target, ids, args.max_new, stops, budget=int(name.split("-")[1]))
                     for lat in args.latencies_ms:
                         c = Costs(base.target, base.mid, base.draft_ms, lat)
-                        records.append({"dataset": d, "i": i, "lat": lat, "config": name,
+                        records.append({"dataset": d, "i": i, "lat": lat, "config": name + args.suffix,
                                         "tokens": r.num_output_tokens, "ms": baseline_ms(r, c),
                                         "tgt_calls_per_tok": r.target_calls / max(r.num_output_tokens, 1)})
             print(f"[{name}] done", flush=True)

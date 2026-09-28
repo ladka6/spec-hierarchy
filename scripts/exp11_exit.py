@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dflash.model import extract_context_feature  # noqa: E402
 
 from hspec.data import encode, load_prompts, stop_ids  # noqa: E402
-from hspec.exit import ExitHead, block_outcome, head_name, load_heads  # noqa: E402
+from hspec.exit import ExitHead, block_outcome, block_outcome_gated, head_name, load_heads  # noqa: E402
 from hspec.lagtrain import draft_logits_lagged  # noqa: E402
 from hspec.models import free, load_draft, load_mid, load_target, load_tokenizer  # noqa: E402
 from hspec.pipeline import two_stage_generate  # noqa: E402
@@ -50,6 +50,8 @@ def main():
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--max-new", type=int, default=512)
     ap.add_argument("--stride", type=int, default=8)
+    ap.add_argument("--gates", nargs="*", type=float, default=[],
+                    help="also score each verifier gated at these top-1 probability thresholds")
     args = ap.parse_args()
 
     tok = load_tokenizer(args.target)
@@ -119,14 +121,26 @@ def main():
                 acc[(n, d, "delivered")].append(dv)
                 acc[(n, d, "perfect")].append(pf)
                 acc[(n, d, "leak")].append(lk)
+                if tr["p1"][n] is None:
+                    continue
+                pp = tr["p1"][n][s : s + bs - 1].tolist()
+                pb = float(tr["p1"][n][s + bs - 1]) if tb is not None else None
+                for thr in args.gates:
+                    g = f"{n}@{thr}"
+                    dv, lk, pf = block_outcome_gated(dt.tolist(), t, e, pp, thr, tb, eb, pb)
+                    acc[(g, d, "delivered")].append(dv)
+                    acc[(g, d, "perfect")].append(pf)
+                    acc[(g, d, "leak")].append(lk)
 
+    gated = [f"{n}@{thr}" for n in names if n != "target" for thr in args.gates]
     rows = []
-    for n in names:
+    for n in names + gated:
         for d in args.datasets + ["ALL"]:
             ds = args.datasets if d == "ALL" else [d]
             g = lambda key: sum((acc[(n, dd, key)] for dd in ds), [])  # noqa: E731
             dv, pf = g("delivered"), g("perfect")
-            rows.append({"verifier": n, "dataset": d, "cost": cost.get(n, 1.0 if n == "target" else float("nan")),
+            base_n = n.split("@")[0]
+            rows.append({"verifier": n, "dataset": d, "cost": cost.get(base_n, 1.0 if n == "target" else float("nan")),
                          "delivered": mean(dv), "eff": sum(dv) / max(sum(pf), 1), "leak": mean(g("leak")),
                          "eps": mean(g("eps")), "conf90": mean(g("conf90")) if g("conf90") else float("nan"),
                          "dis@90": mean(g("dis90")) if g("dis90") else float("nan"), "blocks": len(dv)})

@@ -126,3 +126,29 @@ def block_outcome(d, t, e, t_bonus=None, e_bonus=None):
         return acc, 1, acc + 1
     ok = int(e[acc] == t[acc])
     return acc + ok, 1 - ok, acc + 1
+
+
+def block_outcome_gated(d, t, e, p, thr, t_bonus=None, e_bonus=None, p_bonus=None):
+    """As block_outcome, for a verifier that only trusts itself where its top-1 probability
+    p >= thr: it accepts draft tokens while it agrees confidently; at the first position where
+    it is unsure it stops without a correction (hands over the prefix, no leak); where it
+    disagrees confidently it hands over its own token as the correction."""
+    n = len(d)
+    acc = 0
+    while acc < n and d[acc] == t[acc]:
+        acc += 1
+    for j in range(min(acc + 1, n)):
+        if p[j] < thr:
+            return j, 0, acc + 1 if acc < n or t_bonus is not None else n
+        if e[j] != d[j]:
+            ok = int(j == acc and e[j] == t[j])
+            return j + ok, 1 - ok, acc + 1
+        if j == acc:                                  # confident false accept
+            return acc, 1, acc + 1
+    # full block accepted confidently
+    if t_bonus is None:
+        return n, 0, n
+    if p_bonus < thr:
+        return n, 0, n + 1
+    ok = int(e_bonus == t_bonus)
+    return n + ok, 1 - ok, n + 1

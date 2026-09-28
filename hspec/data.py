@@ -16,14 +16,19 @@ def load_prompts(dataset: str, n: int, seed: int = 0) -> list[str]:
     return [rows[i]["turns"][0] for i in order[:n]]
 
 
+def format_prompt(tokenizer, prompt: str) -> str:
+    """Chat template when the tokenizer has one (DFlash Qwen3 drafters are trained for
+    non-thinking mode), else a plain completion prompt for base models (e.g. LayerSkip
+    Llama3-8B). The text includes BOS; tokenize with add_special_tokens=False."""
+    if tokenizer.chat_template:
+        kw = {"enable_thinking": False} if "enable_thinking" in tokenizer.chat_template else {}
+        return tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False,
+                                             add_generation_prompt=True, **kw)
+    return (tokenizer.bos_token or "") + f"Question: {prompt}\nAnswer:"
+
+
 def encode(tokenizer, prompt: str, device: str = "cuda") -> torch.Tensor:
-    # DFlash Qwen3 drafters are trained for non-thinking mode.
-    text = tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}],
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
+    text = format_prompt(tokenizer, prompt)
     return tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
 
 

@@ -17,6 +17,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from hspec.data import format_prompt  # noqa: E402
 from hspec.models import load_target, load_tokenizer  # noqa: E402
 
 
@@ -55,8 +56,7 @@ def main():
     model = load_target(args.target)
     eos = model.generation_config.eos_token_id
     eos = set([eos] if isinstance(eos, int) else eos)
-    texts = [tok.apply_chat_template([{"role": "user", "content": p}], tokenize=False,
-                                     add_generation_prompt=True, enable_thinking=False) for p in prompts]
+    texts = [format_prompt(tok, p) for p in prompts]
     records = []
     for b in range(0, len(texts), args.batch):
         enc = tok(texts[b : b + args.batch], return_tensors="pt", padding=True, add_special_tokens=False).to("cuda")

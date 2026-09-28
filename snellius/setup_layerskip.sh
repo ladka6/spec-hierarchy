@@ -10,6 +10,6 @@ source "${HSPEC_VENV:-$HOME/venvs/hspec}/bin/activate"
 export HF_TOKEN=${HF_TOKEN:-$(cat "$HOME/.cache/huggingface/token" 2>/dev/null || true)}
 [ -n "$HF_TOKEN" ] || echo "no HF token found: run 'hf auth login' first"
 export HF_HOME=${HF_HOME:-/scratch-shared/$USER/hf}
-for m in facebook/layerskip-llama3-8B meta-llama/Meta-Llama-3-8B; do
+for m in facebook/layerskip-llama3-8B z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat meta-llama/Meta-Llama-3-8B; do
   hf download "$m" --exclude "original/*" --exclude "*.pth" || echo "FAILED: $m (license accepted? logged in?)"
 done
