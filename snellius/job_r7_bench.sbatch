@@ -19,4 +19,4 @@ source "${HSPEC_VENV:-$HOME/venvs/hspec}/bin/activate"
 export HF_HOME=${HF_HOME:-/scratch-shared/$USER/hf}
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export HSPEC_RESULTS="$SLURM_SUBMIT_DIR/results/r7_split"
-python scripts/bench_graph.py --mids bnb4:Qwen/Qwen3-8B 2>&1 | grep -v -i warn
+python scripts/bench_graph.py --mids bnb4:Qwen/Qwen3-8B 2>&1 | grep --line-buffered -v -i warn

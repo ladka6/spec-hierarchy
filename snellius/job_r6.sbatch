@@ -49,6 +49,6 @@ run 3 gpu3 scripts/exp8_algos.py $COMMON --tag gpu3 --fork-thr 0.6 \
 wait
 
 echo "== calibration =="
-grep -v -i warn "$HSPEC_RESULTS/calib.log" | sed -n '/==/,$p'
+grep --line-buffered -v -i warn "$HSPEC_RESULTS/calib.log" | sed -n '/==/,$p'
 echo "== algorithms =="
 python scripts/aggregate_exp8.py "$HSPEC_RESULTS" | tee "$HSPEC_RESULTS/summary.txt"

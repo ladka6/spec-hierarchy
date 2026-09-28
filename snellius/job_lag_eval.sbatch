@@ -20,4 +20,4 @@ W=${LAGFT_DIR:-/scratch-shared/$USER/hspec_lagft}
 export HSPEC_RESULTS="$SLURM_SUBMIT_DIR/results/lagft_$SLURM_JOB_ID"
 python scripts/exp10_lag_eval.py --n 10 \
   --drafters orig=z-lab/Qwen3-8B-DFlash-b16 ctrl="$W/drafter_ctrl" lag16="$W/drafter_lag16" \
-  2>&1 | grep -v -i warn
+  2>&1 | grep --line-buffered -v -i warn

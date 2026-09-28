@@ -25,6 +25,6 @@ export HSPEC_RESULTS="$SLURM_SUBMIT_DIR/results/exit_$SLURM_JOB_ID"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
 if [ ! -f "$W/exit_heads.pt" ]; then
-  python scripts/train_exit.py --data "$W/data" --out "$W/exit_heads.pt" 2>&1 | grep -v -i warn
+  python scripts/train_exit.py --data "$W/data" --out "$W/exit_heads.pt" 2>&1 | grep --line-buffered -v -i warn
 fi
-python scripts/exp11_exit.py --n 10 --heads "$W/exit_heads.pt" 2>&1 | grep -v -i warn
+python scripts/exp11_exit.py --n 10 --heads "$W/exit_heads.pt" 2>&1 | grep --line-buffered -v -i warn

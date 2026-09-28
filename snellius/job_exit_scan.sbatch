@@ -19,4 +19,4 @@ export HF_HOME=${HF_HOME:-/scratch-shared/$USER/hf}
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export HSPEC_RESULTS="$SLURM_SUBMIT_DIR/results/exitscan_$SLURM_JOB_ID"
 python scripts/exp12_exit_scan.py --n 10 \
-  --models facebook/layerskip-llama3-8B meta-llama/Meta-Llama-3-8B Qwen/Qwen3-8B 2>&1 | grep -v -i warn
+  --models facebook/layerskip-llama3-8B meta-llama/Meta-Llama-3-8B Qwen/Qwen3-8B 2>&1 | grep --line-buffered -v -i warn

@@ -22,4 +22,4 @@ CUDA_VISIBLE_DEVICES=0 python scripts/train_lag.py --data "$W/data" --out "$W/dr
 CUDA_VISIBLE_DEVICES=1 python scripts/train_lag.py --data "$W/data" --out "$W/drafter_ctrl" --max-lag 0 \
   > "$W/train_ctrl.log" 2>&1 &
 wait
-grep -h "val\|saved" "$W"/train_*.log | grep -v -i warn
+grep -h "val\|saved" "$W"/train_*.log | grep --line-buffered -v -i warn

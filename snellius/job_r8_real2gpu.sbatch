@@ -21,4 +21,4 @@ export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export HSPEC_RESULTS="$SLURM_SUBMIT_DIR/results/r8_2gpu_$SLURM_JOB_ID"
 mkdir -p "$HSPEC_RESULTS"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
-python scripts/exp9_real2gpu.py --n 10 --latencies-ms 0 100 --configs sync-16+mt32 async-8+mt32 async-c32+mt32 2>&1 | grep -v -i warn | tee "$HSPEC_RESULTS/exp9.log"
+python scripts/exp9_real2gpu.py --n 10 --latencies-ms 0 100 --configs sync-16+mt32 async-8+mt32 async-c32+mt32 2>&1 | grep --line-buffered -v -i warn | tee "$HSPEC_RESULTS/exp9.log"
