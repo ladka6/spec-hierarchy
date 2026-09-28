@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dflash.model import extract_context_feature  # noqa: E402
 
-from hspec.lagtrain import block_loss, sample_blocks  # noqa: E402
+from hspec.lagtrain import block_loss, block_loss_depth, deep_columns, sample_blocks  # noqa: E402
 from hspec.models import load_draft, load_target  # noqa: E402
 
 
@@ -35,6 +35,9 @@ def main():
     ap.add_argument("--data", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-lag", type=int, default=16)
+    ap.add_argument("--depth-exit", type=int, default=0,
+                    help="depth lag instead of token lag: lagged positions keep the features of target "
+                         "layers below this exit layer, deeper ones are missing (0 = token lag)")
     ap.add_argument("--p-zero", type=float, default=0.25)
     ap.add_argument("--blocks", type=int, default=24, help="blocks sampled per sequence")
     ap.add_argument("--batch", type=int, default=4, help="sequences per optimizer step")
@@ -77,6 +80,16 @@ def main():
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / args.warmup) * 0.5 * (1 + math.cos(math.pi * min(s, total) / total)))
     bs = draft.block_size
+    deep = {}
+
+    def loss_fn(feats, ids, blocks):
+        if not args.depth_exit:
+            return block_loss(draft, target, feats, ids, blocks, bs, args.gamma)
+        if "m" not in deep:
+            deep["m"] = deep_columns(draft, args.depth_exit, feats.shape[-1], feats.device)
+            print(f"depth lag: exit after {args.depth_exit} layers, missing feature columns "
+                  f"{int(deep['m'].sum())} of {feats.shape[-1]}", flush=True)
+        return block_loss_depth(draft, target, feats, ids, blocks, bs, deep["m"], args.gamma)
 
     def feats_of(ids):
         with torch.no_grad():
@@ -88,7 +101,7 @@ def main():
         vrng = random.Random(123)
         res = {}
         with torch.no_grad():
-            for lag in (0, 4, 8):
+            for lag in (0, 4, 8, 16):
                 losses, accs = [], []
                 for d in val:
                     ids = d["ids"].long().to(args.device)
@@ -96,7 +109,7 @@ def main():
                               sample_blocks(d["n_prompt"], len(ids), 8, bs, 0, 1.0, vrng)]
                     if not blocks:
                         continue
-                    l, a = block_loss(draft, target, feats_of(ids), ids, blocks, bs, args.gamma)
+                    l, a = loss_fn(feats_of(ids), ids, blocks)
                     losses.append(float(l))
                     accs.append(float(a))
                 res[lag] = (sum(losses) / len(losses), sum(accs) / len(accs))
@@ -119,7 +132,7 @@ def main():
                 blocks = sample_blocks(d["n_prompt"], len(ids), args.blocks, bs, args.max_lag, args.p_zero, rng)
                 if not blocks:
                     continue
-                loss, acc = block_loss(draft, target, feats_of(ids), ids, blocks, bs, args.gamma)
+                loss, acc = loss_fn(feats_of(ids), ids, blocks)
                 (loss / args.batch).backward()
                 tot_l += float(loss)
                 tot_a += float(acc)

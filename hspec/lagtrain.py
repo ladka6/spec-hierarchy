@@ -109,4 +109,102 @@ def block_loss(draft, head_src, feats, ids, blocks, bs, gamma=0.9):
     return loss, acc1
 
 
-__all__ = ["block_inputs", "pack", "draft_logits_lagged", "sample_blocks", "block_loss", "random"]
+# ---------------------------------------------------------------------------
+# Depth lag: after an early-exit check at layer k, the positions since the last full target
+# pass have features only from the target layers below k (the shallow ones); the deep layer
+# slices are missing (zeroed). A block at anchor s with depth lag g sees full features for
+# [0, s-g), shallow-only features for [s-g, s), and the standard [x_s, MASK x (bs-1)] input.
+# ---------------------------------------------------------------------------
+
+def deep_columns(draft, exit_layer: int, width: int, device=None) -> torch.Tensor:
+    """Bool mask over the concatenated feature dim: True for slices of target layers that an
+    exit after `exit_layer` executed layers has not computed (hidden_states[id + 1], id + 1 > k)."""
+    ids = list(draft.target_layer_ids)
+    h = width // len(ids)
+    m = torch.zeros(width, dtype=torch.bool, device=device)
+    for j, lid in enumerate(ids):
+        if lid + 1 > exit_layer:
+            m[j * h : (j + 1) * h] = True
+    return m
+
+
+def pack_depth(draft, head_src, feats: torch.Tensor, ids: torch.Tensor, blocks, bs: int, deep: torch.Tensor):
+    """Like pack, for depth-lagged blocks (s, g). Each block gets its own copy of the g
+    shallow-only feature rows, appended after the shared full context.
+
+    Returns (ctx [1, C, W], noise [1, Q, H], position_ids [1, C+Q], mask [1,1,Q,C+Q], starts)."""
+    T = feats.shape[1]
+    dev = ids.device
+    parts, ppos, pspans = [], [], []
+    c = T
+    for s, g in blocks:
+        if g > 0:
+            p = feats[:, s - g : s].clone()
+            p[..., deep] = 0
+            parts.append(p)
+            ppos.append(torch.arange(s - g, s, device=dev))
+        pspans.append((c, c + g))
+        c += g
+    ctx = torch.cat([feats] + parts, dim=1) if parts else feats
+    C = ctx.shape[1]
+    toks, qpos, qspans, starts = [], [], [], []
+    q = 0
+    for s, _g in blocks:
+        t = torch.full((bs,), draft.mask_token_id, dtype=torch.long, device=dev)
+        t[0] = ids[s]
+        toks.append(t)
+        qpos.append(torch.arange(s, s + bs, device=dev))
+        qspans.append((q, q + bs))
+        starts.append(q + 1)
+        q += bs
+    scale = float(_draft_value(draft.config, "input_embedding_scale", 1.0))
+    noise = _raw_input_embeddings(head_src, torch.cat(toks)[None], scale)
+    pos = torch.cat([torch.arange(T, device=dev)] + ppos + qpos)[None]
+    mask = torch.zeros((q, C + q), dtype=torch.bool, device=dev)
+    for (s, g), (a, b), (pa, pb) in zip(blocks, qspans, pspans):
+        mask[a:b, : s - g] = True
+        mask[a:b, pa:pb] = True
+        mask[a:b, C + a : C + b] = True
+    return ctx, noise, pos, mask[None, None], starts
+
+
+def draft_logits_depth(draft, head_src, feats, ids, s, g, bs, deep):
+    """Logits [bs-1, V] for one depth-lagged block (evaluation)."""
+    ctx, noise, pos, mask, starts = pack_depth(draft, head_src, feats[:, :s], ids, [(s, g)], bs, deep)
+    hidden = draft(target_hidden=ctx, noise_embedding=noise, position_ids=pos,
+                   attention_mask=mask, past_key_values=None, use_cache=False)
+    return draft.compute_logits(hidden[0, starts[0] : starts[0] + bs - 1], _output_head(head_src))
+
+
+def block_loss_depth(draft, head_src, feats, ids, blocks, bs, deep, gamma=0.9):
+    """block_loss for depth-lagged blocks."""
+    T = ids.shape[0]
+    ctx, noise, pos, mask, starts = pack_depth(draft, head_src, feats, ids, blocks, bs, deep)
+    hidden = draft(target_hidden=ctx, noise_embedding=noise, position_ids=pos, attention_mask=mask,
+                   past_key_values=None, use_cache=False)[0]
+    return _weighted_ce(draft, head_src, hidden, ids, blocks, starts, bs, T, gamma)
+
+
+def _weighted_ce(draft, head_src, hidden, ids, blocks, starts, bs, T, gamma):
+    rows, labels, weights, first = [], [], [], []
+    for (s, _g), st in zip(blocks, starts):
+        for k in range(1, bs):
+            if s + k >= T:
+                break
+            rows.append(st + k - 1)
+            labels.append(int(ids[s + k]))
+            weights.append(gamma ** (k - 1))
+            if k == 1:
+                first.append(len(rows) - 1)
+    rows = torch.tensor(rows, device=ids.device)
+    labels = torch.tensor(labels, device=ids.device)
+    w = torch.tensor(weights, device=ids.device, dtype=torch.float32)
+    logits = draft.compute_logits(hidden[rows], _output_head(head_src)).float()
+    ce = F.cross_entropy(logits, labels, reduction="none")
+    loss = (ce * w).sum() / w.sum()
+    acc1 = (logits[first].argmax(-1) == labels[first]).float().mean()
+    return loss, acc1
+
+
+__all__ = ["block_inputs", "pack", "draft_logits_lagged", "sample_blocks", "block_loss", "deep_columns",
+           "pack_depth", "draft_logits_depth", "block_loss_depth", "random"]
