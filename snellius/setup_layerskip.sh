@@ -8,5 +8,5 @@ set -euo pipefail
 source "${HSPEC_VENV:-$HOME/venvs/hspec}/bin/activate"
 export HF_HOME=${HF_HOME:-/scratch-shared/$USER/hf}
 for m in facebook/layerskip-llama3-8B meta-llama/Meta-Llama-3-8B; do
-  hf download "$m" --exclude "original/*" "*.pth" || echo "FAILED: $m (license accepted? logged in?)"
+  hf download "$m" --exclude "original/*" --exclude "*.pth" || echo "FAILED: $m (license accepted? logged in?)"
 done
