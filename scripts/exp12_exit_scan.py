@@ -94,7 +94,12 @@ def main():
     args = ap.parse_args()
     rows = []
     for m in args.models:
-        rows += scan(m, args.datasets, args.n, args.max_new, args.every)
+        try:
+            rows += scan(m, args.datasets, args.n, args.max_new, args.every)
+        except Exception as e:                      # e.g. a gated model that is not downloaded
+            print(f"[{m}] FAILED: {type(e).__name__}: {e}", flush=True)
+            free()
+            continue
         print_table(rows, ["model", "layer", "of", "depth", "eps", "conf90", "dis@90", "run8", "positions"],
                     "early-exit agreement with the final layer (teacher forced, own trajectories)")
         save_json("exp12_exit_scan", {"args": vars(args), "rows": rows})
