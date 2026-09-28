@@ -21,6 +21,9 @@ Algorithms (combinable):
   pearl          no mid: the drafter's own tokens are sent to the target unverified, and the
                  drafter only has target features for confirmed positions (feature lag),
                  i.e. PEARL-style asynchronous two-stage decoding with a DFlash drafter.
+  lag_tokens     (with pearl) the drafter also gets the unconfirmed tokens between the last
+                 target feature and its anchor as inputs (hspec.lagtrain); this is the input
+                 format of the lag-tolerant fine-tuned drafter.
 
 Greedy losslessness: every confirmed token is the target's argmax given the confirmed
 prefix; branches only change which unconfirmed tokens get proposed.
@@ -42,6 +45,7 @@ from dflash.model import (
 )
 
 from hspec.async3 import Costs, _Check
+from hspec.lagtrain import draft_logits_lagged
 from hspec.pipeline import GenResult, _first_stop, _greedy_accept, crop, draft_logits, propose
 from hspec.tree import Tree, build_ddtree, compact, greedy_walk, verify_tree
 
@@ -59,6 +63,7 @@ class HierConfig:
     alt_tree: int = 0           # mid tree budget on alternative branches (0 = plain chain)
     pearl: bool = False         # two-stage async, drafter tokens sent unverified
     pearl_len: int = 8
+    lag_tokens: bool = False    # pearl: give the lagged tokens as drafter inputs
     draft_batch_beta: float = 0.15   # drafter cost at batch n: c_D * (1 + beta (n - 1))
     max_inflight: int = 64
     max_ahead: int = 256
@@ -330,7 +335,10 @@ def hier_generate(draft, target, mid, input_ids, max_new_tokens, stop_token_ids,
     def pearl_round(b: _Branch):
         start = b.start
         k = min(cfg.pearl_len, bs - 1, max_len - start - 1)
-        logits = _draft_lagged(draft, target, b.feat, st["tf"], start, b.ids[0, start], bs).float()
+        if cfg.lag_tokens:
+            logits = draft_logits_lagged(draft, target, b.feat, b.ids[0], start, start - st["tf"], bs).float()
+        else:
+            logits = _draft_lagged(draft, target, b.feat, st["tf"], start, b.ids[0, start], bs).float()
         b.ids[0, start + 1 : start + 1 + k] = logits[:k].argmax(-1)
         b.conf[start + 1 : start + 1 + k] = torch.softmax(logits[:k], -1).max(-1).values
         b.start = start + k

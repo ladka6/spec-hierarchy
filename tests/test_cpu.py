@@ -185,7 +185,8 @@ def main():
                     print(f"  hier {name:11s} L={lat:2d} {kw} lossless={ok} tgt={r.target_calls} "
                           f"forks={s['forks']} caught={s['caught']} rollbacks={s['rollbacks']}")
         for kw in (dict(pearl=True, blocking=True, window=8), dict(pearl=True, window=8),
-                   dict(pearl=True, pearl_len=4, window=4)):
+                   dict(pearl=True, pearl_len=4, window=4), dict(pearl=True, window=8, lag_tokens=True),
+                   dict(pearl=True, pearl_len=4, window=4, lag_tokens=True, max_ahead=12)):
             for lat in (0, 50):
                 c = Costs(target={1: 10.0, 65: 14.0}, mid={1: 4.0, 65: 6.0}, draft_ms=2.0, latency_ms=lat)
                 r = hier_generate(draft, target, None, ids, max_new, stops, c, HierConfig(**kw))

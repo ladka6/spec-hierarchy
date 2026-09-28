@@ -11,6 +11,10 @@ Config specs (combine with "+"):
   +fX                          fork threshold (mid top-1 probability below X)
   +atB                         mid tree budget on alternative branches (0 = chain)
   cPtXmM                       conf check with tau X and min window M (e.g. async-c32t0.3m2)
+  +lt                          pearl: lagged tokens given as drafter inputs (lag-trained drafter)
+  +laN                         cap on unconfirmed tokens ahead of the target (max_ahead)
+  +wN                          override the check window
+  @name                        use drafter `name` from --drafters (default: the first one)
 
 Blocking configs behave identically at every latency, so they run once and their time is
 shifted by L per target check.
@@ -39,7 +43,7 @@ from hspec.utils import save_json  # noqa: E402
 
 def parse(spec: str, args) -> HierConfig:
     """e.g. async-c32t0.3m2+mt32+h4+f0.7+at0 (see module docstring)."""
-    parts = spec.split("+")
+    parts = spec.split("@")[0].split("+")
     mode, arg = parts[0].split("-")
     cfg = HierConfig(tau=args.tau, min_window=args.min_window, fork_thr=args.fork_thr,
                      draft_batch_beta=args.beta)
@@ -59,7 +63,13 @@ def parse(spec: str, args) -> HierConfig:
         if m.group(4):
             cfg.min_window = int(m.group(4))
     for p in parts[1:]:
-        if p.startswith("mt"):
+        if p == "lt":
+            cfg.lag_tokens = True
+        elif p.startswith("la"):
+            cfg.max_ahead = int(p[2:])
+        elif p.startswith("w"):
+            cfg.window = int(p[1:])
+        elif p.startswith("mt"):
             cfg.mid_tree = int(p[2:])
         elif p.startswith("at"):
             cfg.alt_tree = int(p[2:])
@@ -81,6 +91,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
     ap.add_argument("--draft", default="z-lab/Qwen3-8B-DFlash-b16")
+    ap.add_argument("--drafters", nargs="*", default=[],
+                    help="name=path, selected per config with @name (--draft is 'orig')")
     ap.add_argument("--mid", default="bnb4:Qwen/Qwen3-8B")
     ap.add_argument("--datasets", nargs="+", default=["gsm8k", "math500", "humaneval", "mt-bench"])
     ap.add_argument("--n", type=int, default=20)
@@ -99,7 +111,9 @@ def main():
     base = Costs(draft_ms=args.draft_ms)
     tok = load_tokenizer(args.target)
     target = load_target(args.target)
-    draft = load_draft(args.draft)
+    drafters = {"orig": args.draft, **dict(x.split("=", 1) for x in args.drafters)}
+    loaded = {"orig": load_draft(args.draft)}
+    draft = loaded["orig"]
     need_mid = any(not (c.startswith("base:") or c.startswith("pearl")) for c in args.configs)
     mid = load_mid(args.mid) if need_mid else None
     stops = stop_ids(target, tok)
@@ -127,12 +141,16 @@ def main():
             save_json(out_name, {"args": vars(args), "records": records})
             continue
         cfg = parse(spec, args)
+        dname = spec.split("@")[1] if "@" in spec else "orig"
+        if dname not in loaded:
+            loaded[dname] = load_draft(drafters[dname])
+        dr = loaded[dname]
         lats = [0.0] if cfg.blocking else args.latencies_ms
         for lat in lats:
             costs = Costs(base.target, base.mid, base.draft_ms, lat)
             for d in args.datasets:
                 for i, p in enumerate(prompts[d]):
-                    r = hier_generate(draft, target, mid, encode(tok, p), args.max_new, stops, costs, cfg)
+                    r = hier_generate(dr, target, mid, encode(tok, p), args.max_new, stops, costs, cfg)
                     s = r.summary()
                     rec = {"dataset": d, "i": i, "config": spec + args.suffix, "tokens": r.num_output_tokens,
                            "tgt_calls_per_tok": s["target_calls_per_token"],
