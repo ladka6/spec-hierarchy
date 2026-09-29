@@ -6,7 +6,7 @@ DFlash and DDTree on the same early-exit target, measured two ways:
          exit check r_exit * t(q), upper pass r_up * t(q) (ratios from bench_split.py)
 
 Config specs:
-  base:dflash, base:ddtree-B                   baselines (baseline drafter)
+  base:ar, base:dflash, base:ddtree-B          baselines (plain greedy decoding; baseline drafter)
   split-kK-tT-bB-mM[-pP][@name]                exit after K layers, gate T, drafter tree of B
                                                nodes (0 = chain), M exit rounds per upper pass,
                                                max pending P; @name picks a drafter
@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hspec.async3 import Costs  # noqa: E402
 from hspec.data import encode, load_prompts, stop_ids  # noqa: E402
 from hspec.models import load_draft, load_target, load_tokenizer  # noqa: E402
-from hspec.pipeline import ddtree_generate, two_stage_generate  # noqa: E402
+from hspec.pipeline import ar_generate, ddtree_generate, two_stage_generate  # noqa: E402
 from hspec.split import SplitConfig, split_generate  # noqa: E402
 from hspec.utils import mean, print_table, save_json  # noqa: E402
 
@@ -89,7 +89,9 @@ def main():
                 rec = {"config": spec, "dataset": d, "i": i}
                 if spec.startswith("base:"):
                     name = spec[5:]
-                    if name == "dflash":
+                    if name == "ar":
+                        r = ar_generate(target, ids, args.max_new, stops)
+                    elif name == "dflash":
                         r = two_stage_generate(drafts["base"], target, target, target, ids, args.max_new, stops)
                     else:
                         r = ddtree_generate(drafts["base"], target, ids, args.max_new, stops,
