@@ -47,6 +47,7 @@ def main():
     ap.add_argument("--gamma", type=float, default=0.9)
     ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--val-seqs", type=int, default=48)
+    ap.add_argument("--max-train", type=int, default=0, help="cap the number of training sequences")
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--optim", default="adamw8bit", choices=["adamw8bit", "adamw"])
@@ -61,6 +62,8 @@ def main():
     data = [d for d in data if len(d["ids"]) <= args.max_len]
     rng.shuffle(data)
     val, train = data[: args.val_seqs], data[args.val_seqs :]
+    if args.max_train:
+        train = train[: args.max_train]
     print(f"{len(train)} train / {len(val)} val sequences, "
           f"{sum(len(d['ids']) - d['n_prompt'] for d in train)} response tokens", flush=True)
 

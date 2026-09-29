@@ -47,6 +47,8 @@ def main():
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--max-new", type=int, default=512)
     ap.add_argument("--budgets", nargs="+", type=int, default=[64, 128])
+    ap.add_argument("--no-drift", action="store_true", help="speed / acceptance only")
+    ap.add_argument("--drafter-name", default="", help="label of the drafter (for the matrix)")
     args = ap.parse_args()
 
     maybe_enable_cpp_compact(True)
@@ -84,15 +86,15 @@ def main():
     # drift of the variant from the base, on the variant's own greedy outputs
     layer_ids = list(draft.target_layer_ids)
     var_out = []
-    for d, n0, x in trajs:
+    for d, n0, x in ([] if args.no_drift else trajs):
         o = target(x, output_hidden_states=True)
         var_out.append((torch.log_softmax(o.logits[0, n0 - 1 : -1].float(), -1).half().cpu(),
                         [o.hidden_states[i + 1][0, n0 - 1 : -1].float().cpu() for i in layer_ids]))
     del target, draft
     gc.collect()
     torch.cuda.empty_cache()
-    base = load_target(args.base)
     drift = defaultdict(list)
+    base = None if args.no_drift else load_target(args.base)
     for (d, n0, x), (vlp, vh) in zip(trajs, var_out):
         o = base(x, output_hidden_states=True)
         blp = torch.log_softmax(o.logits[0, n0 - 1 : -1].float(), -1).cpu()
@@ -108,14 +110,16 @@ def main():
     for m in methods:
         rs = rec[m]
         t = sum(r["tpot"] * r["n"] for r in rs) / sum(r["n"] for r in rs)
-        row = {"variant": args.name, "method": m, "tau": mean(r["tau"] for r in rs), "speedup": base_t / t}
+        row = {"variant": args.name, "drafter": args.drafter_name or args.draft, "method": m,
+               "tau": mean(r["tau"] for r in rs), "speedup": base_t / t}
         for dd in args.datasets:
             row[f"tau_{dd}"] = mean(r["tau"] for r in rs if r["dataset"] == dd)
         rows.append(row)
     print_table(rows, ["variant", "method", "tau", "speedup"] + [f"tau_{dd}" for dd in args.datasets],
                 f"base-target drafter on target variant '{args.name}' (official loops)")
     drow = {"variant": args.name, **{k: mean(v) for k, v in drift.items()}}
-    print_table([drow], list(drow), "variant vs base target, on the variant's greedy outputs")
+    if not args.no_drift:
+        print_table([drow], list(drow), "variant vs base target, on the variant's greedy outputs")
     save_json(f"exp21_{args.name}", {"args": vars(args), "rows": rows, "drift": drow, "records": rec})
 
 
