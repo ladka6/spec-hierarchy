@@ -46,9 +46,13 @@ def main():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--max-new", type=int, default=384)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--max-prompts", type=int, default=0, help="use only the first N (shuffled) prompts")
     args = ap.parse_args()
 
-    prompts = training_prompts()[args.shard :: args.nshards]
+    allp = training_prompts()
+    if args.max_prompts:
+        allp = allp[: args.max_prompts]
+    prompts = allp[args.shard :: args.nshards]
     tok = load_tokenizer(args.target)
     tok.padding_side = "left"
     if tok.pad_token is None:
