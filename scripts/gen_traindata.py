@@ -47,11 +47,14 @@ def main():
     ap.add_argument("--max-new", type=int, default=384)
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-prompts", type=int, default=0, help="use only the first N (shuffled) prompts")
+    ap.add_argument("--skip-prompts", type=int, default=0, help="drop the first N prompts (extend an earlier run)")
+    ap.add_argument("--tag", default="", help="suffix of the shard file name")
     args = ap.parse_args()
 
     allp = training_prompts()
     if args.max_prompts:
         allp = allp[: args.max_prompts]
+    allp = allp[args.skip_prompts :]
     prompts = allp[args.shard :: args.nshards]
     tok = load_tokenizer(args.target)
     tok.padding_side = "left"
@@ -80,8 +83,9 @@ def main():
               f"{sum(len(r['ids']) for r in records)} tokens", flush=True)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    torch.save(records, out / f"shard{args.shard}.pt")
-    print(f"saved {len(records)} sequences to {out / f'shard{args.shard}.pt'}")
+    fn = out / f"shard{args.shard}{args.tag}.pt"
+    torch.save(records, fn)
+    print(f"saved {len(records)} sequences to {fn}")
 
 
 if __name__ == "__main__":
