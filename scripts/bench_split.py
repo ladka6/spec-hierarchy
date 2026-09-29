@@ -116,13 +116,13 @@ def main():
             t_up = timed(upper_only, args.reps)
             cache.crop(P)
             row.update({f"low{k}+exit": t_lowx, f"low{k}": t_low, f"up{k}": t_up,
-                        f"r_low{k}+exit": t_lowx / t_full, f"r_up{k}": t_up / t_full})
+                        f"r_low{k}+exit": t_lowx / t_full, f"r_low{k}": t_low / t_full, f"r_up{k}": t_up / t_full})
         rows.append(row)
         print(f"q={q} done", flush=True)
 
     cols = ["q", "full_ms"]
     for k in args.exits:
-        cols += [f"low{k}+exit", f"up{k}", f"r_low{k}+exit", f"r_up{k}"]
+        cols += [f"r_low{k}+exit", f"r_low{k}", f"r_up{k}"]
     print_table(rows, cols, f"split verification cost, eager bf16, {P}-token prefix (ms; r_ = ratio to full)")
     save_json("bench_split", {"args": vars(args), "rows": rows})
 

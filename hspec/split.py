@@ -34,7 +34,7 @@ from dflash.model import _draft_value, _make_cache, _output_head, _raw_input_emb
 from hspec.async3 import Costs
 from hspec.lagtrain import deep_columns
 from hspec.pipeline import GenResult, _first_stop, _sync_time, crop
-from hspec.tree import Tree, build_ddtree, chain, tree_inputs, tree_mask
+from hspec.tree import build_ddtree, chain, greedy_walk, tree_inputs, tree_mask
 
 
 @dataclass
@@ -47,6 +47,10 @@ class SplitConfig:
     r_exit: float = 0.53        # simulated cost of lower layers + exit head, fraction of a pass
     r_up: float = 0.53          # simulated cost of the upper layers
     top_k: int = 16
+    thr_joint: float = 0.0      # also trust the exit at >= this when it agrees with the drafter's top-1
+    merge: bool = False         # fuse each upper pass with a full check of a new drafter tree
+    r_lower: float = 0.47       # simulated cost of the lower layers without the exit head
+    feat_exit: int = 0          # exit layer the drafter's depth-lag training assumed (0 = exit_layer)
 
 
 @dataclass
@@ -56,7 +60,9 @@ class SplitStats:
     rollbacks: int = 0
     unsure_flushes: int = 0
     rollback_tokens: int = 0
+    merged: int = 0
     exit_accepted: list = field(default_factory=list)
+    merged_accepted: list = field(default_factory=list)
     upper_q: list = field(default_factory=list)
 
 
@@ -112,7 +118,8 @@ def _causal(past, q, device):
 
 @torch.inference_mode()
 def split_generate(draft, target, input_ids, max_new_tokens, stop_token_ids, cfg: SplitConfig,
-                   costs: Costs | None = None) -> GenResult:
+                   costs: Costs | None = None, exit_head=None) -> GenResult:
+    """exit_head: optional trained hspec.exit.ExitHead (kind 'lin') for the exit check."""
     costs = costs or Costs()
     device = input_ids.device
     bs = draft.block_size
@@ -130,7 +137,7 @@ def split_generate(draft, target, input_ids, max_new_tokens, stop_token_ids, cfg
     ids[:, :n] = input_ids
     feats = torch.zeros((1, size, W), dtype=target.dtype, device=device)
     hk = torch.zeros((1, size, H), dtype=target.dtype, device=device)
-    deep = deep_columns(draft, k, W, device)
+    deep = deep_columns(draft, cfg.feat_exit or k, W, device)
     col = {lid: j for j, lid in enumerate(tg.feat_ids)}
     dcache = _make_cache(draft.config)
     scale = float(_draft_value(draft.config, "input_embedding_scale", 1.0))
@@ -147,6 +154,9 @@ def split_generate(draft, target, input_ids, max_new_tokens, stop_token_ids, cfg
     sim_ms = 0.0
     t0 = _sync_time()
 
+    def exit_logits(h):
+        return exit_head.logits(h) if exit_head is not None else tg.head(h)
+
     # prefill: all layers
     pos = torch.arange(n, device=device)[None]
     h, fd = tg.run(0, L, tg.embed(input_ids), pos, _causal(0, n, device))
@@ -154,92 +164,164 @@ def split_generate(draft, target, input_ids, max_new_tokens, stop_token_ids, cfg
     ids[0, n] = tg.head(h[:, -1:])[0, -1].argmax()
     res.target_calls = 1
     F = E = n                      # upper KV = [0, F), lower KV = [0, E); tokens <= F are final
-    anchor = int(ids[0, n])        # token at E (not yet in any KV), None if unknown
+    anchor = int(ids[0, n])        # token at E (in no KV yet)
+    tentative = False              # anchor is the exit's unsure guess: verify before building on it
     dlen = 0                       # drafter cache holds [0, dlen) (all final features)
     since = 0
     final = None
     if _first_stop(ids[0, n : n + 1], stop) is not None:
         final = n + 1
 
-    def upper_pass():
-        """Verify positions [F, E) (and the anchor at E if any) with layers k..L."""
-        nonlocal F, E, anchor, sim_ms, final, since
-        q = E - F
-        since = 0
-        if q == 0:                                  # nothing pending: anchor at F == E is final
-            return
-        pos = torch.arange(F, E, device=device)[None]
-        h, fd = tg.run(k, L, hk[:, F:E], pos, _causal(F, q, device))
-        pred = tg.head(h)[0].argmax(-1)             # predictions for positions F+1 .. E
-        st.upper_passes += 1
-        st.upper_q.append(q)
-        res.target_calls += 1
-        sim_ms += cfg.r_up * costs.t(q)
-        known = ids[0, F + 1 : E]                   # tokens at F+1 .. E-1
-        cmp = (known == pred[: q - 1]).long().cumprod(0)
-        a = int(cmp.sum())
-        old_F = F
-        if a < q - 1:                               # mismatch at position p
-            p = F + 1 + a
-            ids[0, p] = pred[a]
-            put_feats(fd, F, rows=slice(0, p - F))
-            st.rollbacks += 1
-            st.rollback_tokens += E - p
-            _crop_layers(tg.cache, upper, p)
-            _crop_layers(tg.cache, lower, p)
-            F = E = p
-            anchor = int(pred[a])
-        else:                                       # all pending tokens confirmed
-            put_feats(fd, F)
-            t = int(pred[q - 1])
-            if anchor is not None and anchor != t:
-                st.rollbacks += 1
-            ids[0, E] = t
-            anchor = t
-            F = E
+    def draft_tree():
+        """Drafter tree at anchor E; context features [dlen, E), shallow-only beyond F."""
+        nonlocal dlen, sim_ms
+        vs = min(bs, max_len - E)
+        block = torch.full((1, vs), draft.mask_token_id, dtype=torch.long, device=device)
+        block[0, 0] = anchor
+        noise = _raw_input_embeddings(target, block, scale)
+        ctx = feats[:, dlen:E].clone()
+        ctx[:, F - dlen :, deep] = 0
+        dpos = torch.arange(dlen, E + vs, device=device)[None]
+        dh = draft(target_hidden=ctx, noise_embedding=noise, position_ids=dpos, past_key_values=dcache,
+                   use_cache=True)[:, 1 - vs :, :]
+        crop(dcache, F)
+        dlen = F
+        logits = draft.compute_logits(dh, head)[0]
+        res.draft_calls += 1
+        sim_ms += costs.draft_ms
+        tree = (build_ddtree(logits, cfg.budget, top_k=cfg.top_k) if cfg.budget > 0
+                else chain(logits.argmax(-1).tolist()))
+        return tree, logits.argmax(-1).tolist()
+
+    def finish_check(old_F):
+        nonlocal final
         hit = _first_stop(ids[0, old_F + 1 : F + 1], stop)
         if hit is not None:
             final = old_F + 1 + hit + 1
         elif F + 1 >= max_len:
             final = max_len
 
+    def settle_pending(pred, fd_up, P):
+        """Compare pending tokens [F+1, E) and the anchor at E with the full model's predictions
+        pred[0 .. P-1] (for positions F+1 .. E). Returns True if everything, anchor included,
+        is confirmed; otherwise rolls back / replaces the anchor and returns False."""
+        nonlocal F, E, anchor, tentative
+        known = ids[0, F + 1 : E]
+        a = int((known == pred[: P - 1]).long().cumprod(0).sum()) if P > 1 else 0
+        if a < P - 1:                               # mismatch inside the pending tokens at p
+            p = F + 1 + a
+            ids[0, p] = pred[a]
+            put_feats(fd_up, F, rows=list(range(p - F)))
+            st.rollbacks += 1
+            st.rollback_tokens += E - p
+            _crop_layers(tg.cache, upper, p)
+            _crop_layers(tg.cache, lower, p)
+            F = E = p
+            anchor, tentative = int(pred[a]), False
+            return False
+        t = int(pred[P - 1])
+        if t != anchor:                             # pending tokens fine, anchor wrong
+            if not tentative:
+                st.rollbacks += 1
+            put_feats(fd_up, F, rows=list(range(P)))
+            _crop_layers(tg.cache, upper, E)
+            _crop_layers(tg.cache, lower, E)
+            ids[0, E] = t
+            F = E
+            anchor, tentative = t, False
+            return False
+        return True
+
+    def upper_pass():
+        """Verify positions [F, E) and the anchor at E with layers k..L (nothing new drafted)."""
+        nonlocal F, E, anchor, sim_ms, since, tentative
+        P = E - F
+        since = 0
+        if P == 0:
+            tentative = False
+            return
+        old_F = F
+        pos = torch.arange(F, E, device=device)[None]
+        h, fd = tg.run(k, L, hk[:, F:E], pos, _causal(F, P, device))
+        pred = tg.head(h)[0].argmax(-1)
+        st.upper_passes += 1
+        st.upper_q.append(P)
+        res.target_calls += 1
+        sim_ms += cfg.r_up * costs.t(P)
+        if settle_pending(pred, fd, P):
+            put_feats(fd, F, rows=list(range(P)))
+            F = E
+            tentative = False
+        finish_check(old_F)
+
+    def merged_pass():
+        """Upper pass fused with a full verification of a new drafter tree at the anchor:
+        lower layers on the tree, then layers k..L on [pending positions + tree] at once."""
+        nonlocal F, E, anchor, sim_ms, since, tentative
+        since = 0
+        old_F = F
+        P = E - F
+        tree, _ = draft_tree()
+        T = len(tree)
+        tids, tpos = tree_inputs(anchor, tree, E, device)
+        ht, fd_low = tg.run(0, k, tg.embed(tids), tpos, tree_mask(tree, E, device))
+        q = P + 1 + T
+        m = torch.zeros((q, F + q), dtype=torch.bool, device=device)
+        m[:, :F] = True
+        if P:
+            m[:P, F : F + P] = torch.ones((P, P), dtype=torch.bool, device=device).tril()
+            m[P:, F : F + P] = True
+        m[P:, F + P :] = tree_mask(tree, 0, device)[0, 0]
+        hin = torch.cat([hk[:, F:E], ht], dim=1)
+        pos = torch.cat([torch.arange(F, E, device=device)[None], tpos], dim=1)
+        h, fd_up = tg.run(k, L, hin, pos, m[None, None])
+        lg = tg.head(h)
+        pred = lg[0].argmax(-1)
+        st.upper_passes += 1
+        st.merged += 1
+        st.upper_q.append(q)
+        res.target_calls += 1
+        sim_ms += cfg.r_lower * costs.t(1 + T) + cfg.r_up * costs.t(q)
+        if P and not settle_pending(pred, fd_up, P):
+            _crop_layers(tg.cache, lower, E)       # drop the tree rows (E already reset)
+            finish_check(old_F)
+            return
+        path, bonus = greedy_walk(tree, lg[:, P:])
+        rows = [0] + [nd + 1 for nd in path]
+        _compact_layers(tg.cache, lower, E, rows)
+        _compact_layers(tg.cache, upper, F, list(range(P)) + [P + r for r in rows])
+        put_feats(fd_up, F, rows=list(range(P)) + [P + r for r in rows])
+        put_feats(fd_low, E, rows=rows)
+        ids[0, E] = anchor
+        if path:
+            ids[0, E + 1 : E + 1 + len(path)] = torch.tensor([tree.tokens[nd] for nd in path], device=device)
+        E = F = E + len(rows)
+        anchor, tentative = int(bonus), False
+        if E < size:
+            ids[0, E] = anchor
+        st.merged_accepted.append(len(path))
+        finish_check(old_F)
+
     while final is None:
-        if F == E and anchor is not None and F + 1 >= max_len:
+        if F == E and not tentative and F + 1 >= max_len:
             final = max_len
             break
-        pending_stop = _first_stop(ids[0, F + 1 : E + (1 if anchor is not None else 0)], stop) is not None
-        if (anchor is None or since >= cfg.m or E - F >= cfg.max_pending or pending_stop
-                or (E > F and E + 2 >= max_len)):
-            if anchor is None:
+        pending_stop = _first_stop(ids[0, F + 1 : E + 1], stop) is not None
+        near_end = E + 2 >= max_len or min(bs, max_len - E) < 2
+        if tentative or since >= cfg.m or E - F >= cfg.max_pending or pending_stop or (E > F and near_end):
+            if tentative:
                 st.unsure_flushes += 1
-            upper_pass()
+            if cfg.merge and not pending_stop and not near_end:
+                merged_pass()
+            else:
+                upper_pass()
             continue
 
-        # ---- draft at anchor E with context features [dlen, E) (shallow-only beyond F)
-        vs = min(bs, max_len - E)
-        tree = Tree()
-        if vs >= 2:
-            block = torch.full((1, vs), draft.mask_token_id, dtype=torch.long, device=device)
-            block[0, 0] = anchor
-            noise = _raw_input_embeddings(target, block, scale)
-            ctx = feats[:, dlen:E].clone()
-            ctx[:, F - dlen :, deep] = 0
-            dpos = torch.arange(dlen, E + vs, device=device)[None]
-            dh = draft(target_hidden=ctx, noise_embedding=noise, position_ids=dpos, past_key_values=dcache,
-                       use_cache=True)[:, 1 - vs :, :]
-            crop(dcache, F)
-            dlen = F
-            logits = draft.compute_logits(dh, head)[0]
-            res.draft_calls += 1
-            sim_ms += costs.draft_ms
-            tree = (build_ddtree(logits, cfg.budget, top_k=cfg.top_k) if cfg.budget > 0
-                    else chain(logits.argmax(-1).tolist()))
-
-        # ---- exit check: lower layers on [anchor] + tree
+        # ---- one cheap round: draft, then the exit check (lower layers + exit head) on the tree
+        tree, dtop = draft_tree()
         tids, tpos = tree_inputs(anchor, tree, E, device)
         h, fd = tg.run(0, k, tg.embed(tids), tpos, tree_mask(tree, E, device))
-        lg = tg.head(h)[0].float()
-        pr = torch.softmax(lg, -1)
+        pr = torch.softmax(exit_logits(h)[0].float(), -1)
         p1, top = pr.max(-1)
         p1, top = p1.tolist(), top.tolist()
         st.rounds += 1
@@ -247,18 +329,19 @@ def split_generate(draft, target, input_ids, max_new_tokens, stop_token_ids, cfg
         sim_ms += cfg.r_exit * costs.t(1 + len(tree))
         res.mid_calls += 1
         ch = tree.children()
-        path, cur, row = [], -1, 0
-        nxt_anchor = None
+        path, cur, row, depth = [], -1, 0, 0
         while True:
-            if p1[row] < cfg.thr:
-                break                               # unsure: no trusted next token
-            t = top[row]
+            t, conf = top[row], p1[row]
+            joint = cfg.thr_joint > 0 and depth < len(dtop) and t == dtop[depth] and conf >= cfg.thr_joint
             nd = ch.get(cur, {}).get(t)
+            if conf < cfg.thr and not joint:
+                nxt, unsure = t, True               # unsure: keep its guess, verify it next
+                break
             if nd is None:
-                nxt_anchor = t                      # confident correction
+                nxt, unsure = t, False              # confident correction
                 break
             path.append(nd)
-            cur, row = nd, nd + 1
+            cur, row, depth = nd, nd + 1, depth + 1
         rows = [0] + [nd + 1 for nd in path]
         _compact_layers(tg.cache, lower, E, rows)
         hk[0, E : E + len(rows)] = h[0, rows]
@@ -268,9 +351,9 @@ def split_generate(draft, target, input_ids, max_new_tokens, stop_token_ids, cfg
         if path:
             ids[0, E + 1 : E + 1 + len(path)] = torch.tensor([tree.tokens[nd] for nd in path], device=device)
         E = E + len(rows)
-        anchor = nxt_anchor
+        anchor, tentative = nxt, unsure
         st.exit_accepted.append(len(path))
-        if anchor is not None and E < size:
+        if E < size:
             ids[0, E] = anchor
 
     res.decode_time = _sync_time() - t0
