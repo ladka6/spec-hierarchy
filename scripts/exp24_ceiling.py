@@ -10,11 +10,14 @@ drafter side (draft + tree) with verification:
   slack        verify / draft                  how many drafter passes fit into one verify for free
 
   python scripts/exp24_ceiling.py
+  torchrun --nproc_per_node 2 scripts/exp24_ceiling.py --tp     # target tensor-parallel over 2 GPUs,
+                                                                # drafter replicated on each GPU
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -42,12 +45,26 @@ def main():
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--max-new", type=int, default=512)
     ap.add_argument("--budgets", nargs="+", type=int, default=[32, 64, 128, 256])
+    ap.add_argument("--tp", action="store_true", help="tensor-parallel target (launch with torchrun)")
+    ap.add_argument("--out", default="exp24_ceiling")
     args = ap.parse_args()
 
+    rank = 0
+    if args.tp:
+        import torch.distributed as dist
+        from transformers import AutoModelForCausalLM
+
+        rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(rank)                 # plain "cuda" now means this rank's GPU
+        dist.init_process_group("nccl")
+        target = AutoModelForCausalLM.from_pretrained(args.target, dtype=torch.bfloat16, attn_implementation="sdpa",
+                                                      tp_plan="auto").eval()
+        draft = load_draft(args.draft, f"cuda:{rank}")
+    else:
+        target = load_target(args.target)
+        draft = load_draft(args.draft)
     maybe_enable_cpp_compact(True)
     tok = load_tokenizer(args.target)
-    target = load_target(args.target)
-    draft = load_draft(args.draft)
     stops = stop_ids(target, tok)
     bs, mask = draft.block_size, draft.mask_token_id
     methods = ["ar", "dflash"] + [f"ddtree_tb{b}" for b in args.budgets]
@@ -76,9 +93,11 @@ def main():
                 a["full"] += sum(x >= bs for x in (r.acceptance_lengths or []))
                 for k, v in r.stage_times.items():
                     a[k] += v
-        print(f"[{d}] done", flush=True)
+        if rank == 0:
+            print(f"[{d}] done", flush=True)
 
     ar_tpot = acc["ar"]["T"] / acc["ar"]["tokens"]
+    print(f"AR ms/token: {1e3 * ar_tpot:.2f}", flush=True)
     rows = []
     for m in methods[1:]:
         a = acc[m]
@@ -89,7 +108,7 @@ def main():
         ver, com = a["verify"], a["commit"]
         f_full = a["full"] / R
         rows.append({
-            "method": m, "speedup": ar_tpot / (T / a["tokens"]), "tau": a["tokens"] / R,
+            "method": m, "speedup": ar_tpot / (T / a["tokens"]), "tau": a["tokens"] / R, "ms_tok": 1e3 * T / a["tokens"],
             "ms_round": 1e3 * T / R, "draft_ms": 1e3 * drf / R, "tree_ms": 1e3 * tree / R,
             "verify_ms": 1e3 * ver / R, "commit_ms": 1e3 * com / R,
             "other_ms": 1e3 * (T - drf - tree - ver - com) / R,
@@ -97,10 +116,12 @@ def main():
             "ceil_all": T / (T - drf - tree), "ceil_full": T / (T - f_full * (drf + tree)),
             "slack": ver / max(drf, 1e-9),
         })
-    print_table(rows, ["method", "speedup", "tau", "ms_round", "draft_ms", "tree_ms", "verify_ms", "commit_ms",
+    if rank != 0:
+        return
+    print_table(rows, ["method", "speedup", "tau", "ms_tok", "ms_round", "draft_ms", "tree_ms", "verify_ms", "commit_ms",
                        "other_ms", "draft_share", "f_full", "ceil_all", "ceil_full", "slack"],
                 "per-round time split and the ceiling for drafting ahead of verification")
-    save_json("exp24_ceiling", {"args": vars(args), "rows": rows})
+    save_json(args.out, {"args": vars(args), "rows": rows})
 
 
 if __name__ == "__main__":
