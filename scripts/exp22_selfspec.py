@@ -110,7 +110,7 @@ def evaluate(model_id, name, args):
             tau = mean(taus)
             rows.append({"model": name, "exit": E, "of": L, "K": K, "eps": eps, "tau": tau,
                          "est_x": tau / (1 + K * E / L)})
-    acc = gsm8k_acc(model, tok, args.gsm8k) if args.gsm8k else float("nan")
+    acc = gsm8k_acc(model, tok, args.gsm8k, args.gsm8k_max_new) if args.gsm8k else float("nan")
     del model
     free()
     return rows, acc
@@ -125,6 +125,7 @@ def main():
     ap.add_argument("--exits", nargs="+", type=int, default=[4, 6, 8, 12, 16])
     ap.add_argument("--ks", nargs="+", type=int, default=[2, 4, 6, 8])
     ap.add_argument("--gsm8k", type=int, default=200, help="GSM8K test questions for accuracy (0 = skip)")
+    ap.add_argument("--gsm8k-max-new", type=int, default=320)
     ap.add_argument("--out", default="exp22_selfspec")
     args = ap.parse_args()
     rows, accs = [], []

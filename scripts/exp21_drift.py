@@ -47,6 +47,7 @@ def main():
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--max-new", type=int, default=512)
     ap.add_argument("--budgets", nargs="+", type=int, default=[64, 128])
+    ap.add_argument("--seed", type=int, default=0, help="prompt sampling seed")
     ap.add_argument("--no-drift", action="store_true", help="speed / acceptance only")
     ap.add_argument("--drafter-name", default="", help="label of the drafter (for the matrix)")
     args = ap.parse_args()
@@ -73,7 +74,7 @@ def main():
     rec = defaultdict(list)
     trajs = []
     for d in args.datasets:
-        for p in load_prompts(d, args.n):
+        for p in load_prompts(d, args.n, args.seed):
             ids = encode(tok, p)
             for m in methods:
                 r = run(m, ids)
