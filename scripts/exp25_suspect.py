@@ -20,6 +20,7 @@ Pipeline model (2 GPUs, target split in two halves; d = draft+tree ms, v = verif
   relative to sequential tau / (d + v).
 
   python scripts/exp25_suspect.py --lag-draft /scratch-shared/$USER/hspec_lagft/drafter_lag16
+  python scripts/exp25_suspect.py --subs orig=z-lab/Qwen3-8B-DFlash-b16:depth depth18=/path/drafter_depth18:depth
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ from dflash.model import extract_context_feature  # noqa: E402
 from exp15_blocktree import accepted, tree_paths  # noqa: E402
 
 from hspec.data import encode, load_prompts, stop_ids  # noqa: E402
-from hspec.lagtrain import draft_logits_lagged  # noqa: E402
+from hspec.lagtrain import deep_columns, draft_logits_depth, draft_logits_lagged  # noqa: E402
 from hspec.models import load_draft, load_target, load_tokenizer  # noqa: E402
 from hspec.pipeline import two_stage_generate  # noqa: E402
 from hspec.tree import build_ddtree  # noqa: E402
@@ -72,7 +73,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
     ap.add_argument("--draft", default="z-lab/Qwen3-8B-DFlash-b16")
-    ap.add_argument("--lag-draft", required=True)
+    ap.add_argument("--subs", nargs="+", default=None,
+                    help="next-round drafters name=path:mode, mode token (suspected tokens get no features) or "
+                         "depth (they get the lower half's features, 2-GPU pipeline); default orig + --lag-draft")
+    ap.add_argument("--lag-draft", default=None)
+    ap.add_argument("--depth-exit", type=int, default=18, help="layers on the first GPU (depth mode)")
     ap.add_argument("--datasets", nargs="+", default=["gsm8k", "math500", "humaneval", "mt-bench"])
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--max-new", type=int, default=512)
@@ -85,8 +90,16 @@ def main():
 
     tok = load_tokenizer(args.target)
     target = load_target(args.target)
-    drafters = {"orig": load_draft(args.draft), "lag": load_draft(args.lag_draft)}
-    draft = drafters["orig"]
+    draft = load_draft(args.draft)
+    subs = args.subs or ([f"orig={args.draft}:token"] + ([f"lag={args.lag_draft}:token"] if args.lag_draft else []))
+    drafters, loaded = {}, {args.draft: draft}
+    for spec in subs:
+        name, rest = spec.split("=", 1)
+        path, mode = rest.rsplit(":", 1)
+        if path not in loaded:
+            loaded[path] = load_draft(path)
+        drafters[name] = (loaded[path], mode)
+    deep = None
     stops = stop_ids(target, tok)
     bs = draft.block_size
     B = args.budget
@@ -101,6 +114,8 @@ def main():
             x = two_stage_generate(draft, target, target, target, ids, args.max_new, stops).output_ids[0]
             feats = extract_context_feature(target(x[None], output_hidden_states=True, logits_to_keep=1).hidden_states,
                                             draft.target_layer_ids)
+            if deep is None:
+                deep = deep_columns(draft, args.depth_exit, feats.shape[-1], feats.device)
             for s in range(n0, len(x) - 2 * bs - 2, args.stride):
                 truth = x[s + 1 : s + 2 * bs].tolist()
                 lg = draft_logits_lagged(draft, target, feats, x, s, 0, bs)
@@ -121,7 +136,11 @@ def main():
                     key = (k, dname, budget)
                     if key not in cache:
                         if (k, dname) not in logit_cache:
-                            sl = draft_logits_lagged(drafters[dname], target, feats, x, s + k, k, bs)
+                            dm, mode = drafters[dname]
+                            if mode == "depth":
+                                sl = draft_logits_depth(dm, target, feats, x, s + k, k, bs, deep)
+                            else:
+                                sl = draft_logits_lagged(dm, target, feats, x, s + k, k, bs)
                             logit_cache[(k, dname)] = (sl, torch.log_softmax(sl.float(), -1).cpu())
                         sl, sq = logit_cache[(k, dname)]
                         sub = build_ddtree(sl, max(budget, 1))
