@@ -25,6 +25,8 @@ else
 fi
 export PATH="$CUDA_HOME/bin:$PATH"
 echo "CUDA_HOME=$CUDA_HOME"; nvcc --version | tail -1
+# FlashInfer JIT builds fail with the pip CUDA toolkit: use vLLM's precompiled kernels instead
+export VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export HF_HOME=${HF_HOME:-/scratch-shared/$USER/hf}
 export HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 for TP in 1 2; do
