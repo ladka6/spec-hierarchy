@@ -57,8 +57,13 @@ def main():
         rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(rank)                 # plain "cuda" now means this rank's GPU
         dist.init_process_group("nccl")
-        target = AutoModelForCausalLM.from_pretrained(args.target, dtype=torch.bfloat16, attn_implementation="sdpa",
-                                                      tp_plan="auto").eval()
+        kw = dict(dtype=torch.bfloat16, attn_implementation="sdpa")
+        try:                                        # transformers >= 5: DistributedConfig
+            from transformers.distributed import DistributedConfig
+            kw["distributed_config"] = DistributedConfig(tp_size=dist.get_world_size())
+        except ImportError:                         # transformers 4.x
+            kw["tp_plan"] = "auto"
+        target = AutoModelForCausalLM.from_pretrained(args.target, **kw).eval()
         draft = load_draft(args.draft, f"cuda:{rank}")
     else:
         target = load_target(args.target)
