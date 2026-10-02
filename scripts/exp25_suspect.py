@@ -40,6 +40,7 @@ from dflash.model import extract_context_feature  # noqa: E402
 from exp15_blocktree import accepted, tree_paths  # noqa: E402
 
 from hspec.data import encode, load_prompts, stop_ids  # noqa: E402
+from hspec.feathead import block_hidden, context_vectors, draft_logits_ctx, load_head, predict_context  # noqa: E402
 from hspec.lagtrain import deep_columns, draft_logits_depth, draft_logits_lagged  # noqa: E402
 from hspec.models import load_draft, load_target, load_tokenizer  # noqa: E402
 from hspec.pipeline import two_stage_generate  # noqa: E402
@@ -75,7 +76,8 @@ def main():
     ap.add_argument("--draft", default="z-lab/Qwen3-8B-DFlash-b16")
     ap.add_argument("--subs", nargs="+", default=None,
                     help="next-round drafters name=path:mode, mode token (suspected tokens get no features) or "
-                         "depth (they get the lower half's features, 2-GPU pipeline); default orig + --lag-draft")
+                         "depth (they get the lower half's features, 2-GPU pipeline), fresh (real features: upper bound) "
+                         "or pred@HEAD.pt (features predicted by a feature head); default orig + --lag-draft")
     ap.add_argument("--lag-draft", default=None)
     ap.add_argument("--depth-exit", type=int, default=18, help="layers on the first GPU (depth mode)")
     ap.add_argument("--datasets", nargs="+", default=["gsm8k", "math500", "humaneval", "mt-bench"])
@@ -99,6 +101,10 @@ def main():
         if path not in loaded:
             loaded[path] = load_draft(path)
         drafters[name] = (loaded[path], mode)
+    heads = {}
+    for name, (dm, mode) in drafters.items():
+        if mode.startswith("pred@"):
+            heads[name] = load_head(mode[5:], next(dm.parameters()).device, next(dm.parameters()).dtype)
     deep = None
     stops = stop_ids(target, tok)
     bs = draft.block_size
@@ -116,6 +122,7 @@ def main():
                                             draft.target_layer_ids)
             if deep is None:
                 deep = deep_columns(draft, args.depth_exit, feats.shape[-1], feats.device)
+            c_real = context_vectors(draft, feats) if heads else None
             for s in range(n0, len(x) - 2 * bs - 2, args.stride):
                 truth = x[s + 1 : s + 2 * bs].tolist()
                 lg = draft_logits_lagged(draft, target, feats, x, s, 0, bs)
@@ -127,7 +134,7 @@ def main():
                 true_node = tuple(truth[: a - 1])
                 cand = {"conf": [pth for pth, _ in ranked[:mmax]], "oracle": [true_node]}
                 # subtree for each candidate node on the true path, per drafter and budget
-                cache, logit_cache = {}, {}
+                cache, logit_cache, chat = {}, {}, {}
 
                 def outcome(pth, dname, budget):
                     k = len(pth)
@@ -139,6 +146,14 @@ def main():
                             dm, mode = drafters[dname]
                             if mode == "depth":
                                 sl = draft_logits_depth(dm, target, feats, x, s + k, k, bs, deep)
+                            elif mode == "fresh" or (mode.startswith("pred@") and k == 0):
+                                sl = draft_logits_lagged(dm, target, feats, x, s + k, 0, bs)
+                            elif mode.startswith("pred@"):
+                                if dname not in chat:          # c_hat for positions s .. s+bs-2
+                                    hid = block_hidden(dm, target, feats, x, [s], bs)[0]
+                                    chat[dname] = predict_context(heads[dname], dm, target, hid, x, s, bs)
+                                ctx = torch.cat([c_real[:, :s], chat[dname][:k][None].to(c_real.dtype)], 1)
+                                sl = draft_logits_ctx(dm, target, ctx, x, s + k, bs)
                             else:
                                 sl = draft_logits_lagged(dm, target, feats, x, s + k, k, bs)
                             logit_cache[(k, dname)] = (sl, torch.log_softmax(sl.float(), -1).cpu())
