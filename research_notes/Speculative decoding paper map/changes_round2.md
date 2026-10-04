@@ -1,0 +1,126 @@
+# Changes for in_1
+
+- Speculative Decoding (Leviathan) (2211.17192): changed method_downside, memory, accepted_tokens, speed, verified. Source: https://arxiv.org/pdf/2211.17192
+- Speculative Sampling (Chen, DeepMind) (2302.01318): changed method_downside, memory, quality, speed, verified. Source: https://arxiv.org/pdf/2302.01318
+- DistillSpec (2310.08461): changed accepted_tokens, speed, verified. Source: https://arxiv.org/pdf/2310.08461
+- Online SD (OSD) (2310.07177): changed accepted_tokens, speed, verified. Source: https://proceedings.mlr.press/v235/liu24y.html ; https://www.alphaxiv.org/overview/2310.07177 (arXiv full text rate-limited)
+- Direct Alignment / TVD++ (Qualcomm) (2403.00858): changed method_downside, verified. Source: https://arxiv.org/html/2403.00858v3
+- AdaSPEC (2510.19779): changed speed, verified. Source: https://arxiv.org/html/2510.19779v1
+- Scaling Laws for SD (Scylla) (2505.07858): changed accepted_tokens, speed, llama_results, verified. Source: https://arxiv.org/html/2505.07858v1
+- Medusa (2401.10774): changed memory, quality, accepted_tokens, speed, verified. Source: https://arxiv.org/pdf/2401.10774
+- Hydra / Hydra++ (2402.05109): changed method_downside, speed, datasets, verified. Source: https://arxiv.org/pdf/2402.05109
+- EAGLE (2401.15077): changed memory, accepted_tokens, speed, llama_results, verified. Source: https://arxiv.org/pdf/2401.15077 ; https://ar5iv.labs.arxiv.org/html/2401.15077
+- EAGLE-2 (2406.16858): changed memory, accepted_tokens, speed, llama_results, verified. Source: https://arxiv.org/html/2406.16858v1 ; https://arxiv.org/pdf/2406.16858
+- EAGLE-3 (2503.01840): changed accepted_tokens, datasets. Source: https://arxiv.org/html/2503.01840v1
+- HASS (2408.15766): changed method_downside, speed, verified. Source: https://arxiv.org/pdf/2408.15766v2
+- GRIFFIN (2502.11018): changed accepted_tokens, speed, llama_results, datasets, verified. Source: https://arxiv.org/pdf/2502.11018v3 ; https://proceedings.neurips.cc/paper_files/paper/2025/file/b6e67ae290635d0874c4cb43ba2a2cfb-Paper-Conference.pdf
+- Falcon (2412.12639): changed memory, accepted_tokens, speed, llama_results, verified. Source: https://arxiv.org/pdf/2412.12639
+- ReDrafter (Apple) (2403.09919): changed memory, quality, speed, llama_results, verified. Source: https://arxiv.org/pdf/2403.09919
+- GTO (2509.22134): changed speed, verified. Source: https://arxiv.org/html/2509.22134v1
+- LK Losses (Nebius) (2602.23881): changed speed, llama_results, verified. Source: https://arxiv.org/pdf/2602.23881
+- Draft-OPD (2605.29343): changed method_downside, memory, speed, verified. Source: https://arxiv.org/html/2605.29343
+- VAT (NAVER) (2608.30135): changed method_downside, speed, llama_results, code, verified. Source: https://arxiv.org/html/2608.30135
+- OnlineSPEC (2603.12617): changed method_downside, memory, quality, accepted_tokens, speed, llama_results, verified. Source: https://arxiv.org/html/2603.12617v1
+- EDA (2603.09527): changed memory, accepted_tokens, speed, venue. Source: https://arxiv.org/html/2603.09527
+# changes_2 (in_2.csv)
+
+- Draft & Verify: accepted_tokens, speed, quality, datasets, method_downside, verified (source: https://arxiv.org/html/2309.08168v2)
+- LayerSkip: memory, quality, accepted_tokens, speed, llama_results, datasets, verified (source: https://www.arxiv.org/pdf/2404.16710)
+- Kangaroo: memory, accepted_tokens, speed, llama_results, verified (source: https://arxiv.org/pdf/2404.18911)
+- SWIFT: accepted_tokens (source: https://arxiv.org/pdf/2410.06916)
+- CLaSp: accepted_tokens (source: https://aclanthology.org/2025.acl-long.1525.pdf)
+- DEL: memory, speed, llama_results, verified (source: https://arxiv.org/html/2504.05598v2)
+- SpecEE: method_downside, speed, llama_results, verified (source: https://arxiv.org/html/2504.08850v1)
+- HiSpec: no change (already F, no gaps found)
+- QuantSpec: accepted_tokens, speed, llama_results, datasets, code, verified (source: https://www.stat.berkeley.edu/~mmahoney/pubs/9485_QuantSpec_Self_Speculativ.pdf)
+- QSpec: quality, accepted_tokens, speed, llama_results, verified (source: https://arxiv.org/html/2410.11305v3)
+- TriForce: accepted_tokens, verified (source: https://arxiv.org/pdf/2404.11912)
+- MagicDec: speed, llama_results, verified (source: https://arxiv.org/html/2408.11049v1)
+- Jacobi decoding (Santilli et al.): quality, speed, datasets, verified (source: https://arxiv.org/pdf/2305.10427)
+- Lookahead Decoding: method_downside, accepted_tokens, verified (source: https://arxiv.org/html/2402.02057v1)
+- CLLMs: method_downside, quality, accepted_tokens, speed, llama_results, verified (source: https://arxiv.org/pdf/2403.00835)
+- REST: accepted_tokens, llama_results (source: https://arxiv.org/pdf/2311.08252)
+- Prompt Lookup Decoding: speed, quality (source: https://github.com/apoorvumang/prompt-lookup-decoding/blob/main/README.md ; https://huggingface.co/docs/transformers/main/llm_optims)
+- SuffixDecoding: accepted_tokens, speed, memory, verified (source: https://arxiv.org/pdf/2411.04975v3)
+- SAM-Decoding: accepted_tokens, code (source: https://arxiv.org/html/2411.10666v1)
+- Token Recycling: accepted_tokens (source: https://arxiv.org/html/2408.08696v3)
+- Cacheback: no change (already F, no gaps found)
+- MTP (Gloeckle et al.): memory, datasets (source: https://arxiv.org/pdf/2404.19737)
+- DeepSeek-V3 MTP: method, memory, accepted_tokens, speed, datasets, verified (source: https://github.com/deepseek-ai/DeepSeek-V3 ; https://arxiv.org/pdf/2412.19437 (sec 2.2); report quote via https://github.com/ggml-org/llama.cpp/discussions/11455)
+- FastMTP: memory, datasets (source: https://arxiv.org/pdf/2509.18362)
+- Your LLM Knows the Future (Apple): memory, accepted_tokens, datasets (source: https://arxiv.org/pdf/2507.11851)
+# Changes to in_3ab rows
+
+- Blockwise Parallel Decoding: method_downside, memory, quality, accepted_tokens, speed, datasets, verified (source: https://arxiv.org/pdf/1811.03115)
+- PARD: venue, memory, accepted_tokens, speed, llama_results, datasets, code, verified (source: https://arxiv.org/html/2504.18583)
+- DiffuSpec: memory, accepted_tokens, speed, verified (source: https://arxiv.org/pdf/2510.02358v1)
+- SpecDiff-2: method_downside, memory, accepted_tokens, speed, llama_results, datasets, verified (source: https://arxiv.org/html/2511.00606v2, https://arxiv.org/pdf/2511.00606)
+- DEER: method_downside, memory, accepted_tokens, speed, datasets, code, verified (source: https://www.arxiv.org/pdf/2512.15176)
+- P-EAGLE: method_downside, memory, quality, accepted_tokens, speed, llama_results, datasets, code, verified (source: https://arxiv.org/pdf/2602.01469, https://docs.vllm.ai/projects/speculators/en/latest/user_guide/algorithms/peagle/)
+- DFlash: method_downside, memory, quality, accepted_tokens, speed, llama_results, datasets, verified (source: https://arxiv.org/html/2602.06036v1, https://huggingface.co/z-lab/Qwen3-8B-DFlash-b16, https://huggingface.co/z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat, https://github.com/z-lab/dflash)
+- DFlash 2: venue, method, upside, method_downside, memory, quality, accepted_tokens, speed, llama_results, datasets, code, verified (source: https://inco.ai/blog/dflash2/, https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)
+- DDTree: accepted_tokens, speed, verified (source: https://liranringel.github.io/ddtree/DDTree.pdf)
+- BASTION: method_downside, memory, accepted_tokens, speed, llama_results, code, verified (source: https://arxiv.org/html/2605.29727v1)
+- CaDDTree: accepted_tokens, speed, code, verified (source: https://arxiv.org/html/2606.01813)
+- GRAFT: venue, memory, quality, accepted_tokens, speed, code, verified (source: https://arxiv.org/html/2608.20375)
+# Changes for in_3cd_filled.csv
+
+- Domino: method_downside, memory, accepted_tokens, speed, verified. Source: https://arxiv.org/html/2605.29707
+- TreeFlash: method_downside, accepted_tokens, speed, datasets. Source: https://arxiv.org/html/2606.03819
+- D2SD: method_downside, memory, accepted_tokens, speed, verified. Source: https://arxiv.org/html/2606.04446
+- JetSpec: method_downside, memory, accepted_tokens, speed, datasets, verified. Source: https://arxiv.org/html/2606.18394
+- DSpark: method_downside, memory, accepted_tokens, speed, datasets. Source: https://arxiv.org/html/2607.05147
+- xPress: method_downside, memory, accepted_tokens, speed, datasets. Source: https://arxiv.org/html/2608.02438 + https://github.com/Supercomputing-System-AI-Lab/xPress
+- DBLAST: method_downside, accepted_tokens, code. Source: https://arxiv.org/html/2608.05448
+- DARTree: method_downside, memory, accepted_tokens, speed, code. Source: https://arxiv.org/html/2608.13524
+- AdaFlash: venue, accepted_tokens, speed, datasets, code. Source: https://arxiv.org/html/2607.19223 + https://github.com/ZinYY/AdaFlash
+- DFlow: method_downside, memory, accepted_tokens, speed, code, verified. Source: https://arxiv.org/html/2609.06498
+- DPara: memory, accepted_tokens, speed. Source: https://arxiv.org/html/2609.27396
+- LongSpark: memory, speed. Source: https://arxiv.org/html/2609.37029 (paper HTML rate-limited) + https://long-spark.github.io/ + https://github.com/Hao-Yuan-He/LongSpark
+- PARD-2: memory, accepted_tokens, speed, llama_results, verified. Source: https://arxiv.org/html/2605.08632
+- PEFT block-diffusion negative result: memory, accepted_tokens, speed, datasets, code, verified. Source: https://arxiv.org/html/2607.12422
+# changes_4
+
+- SpecDec (Xia et al.): changed memory, quality, accepted_tokens, speed, verified. Source: https://arxiv.org/pdf/2203.16487
+- BiLD (Big Little Decoder): changed method_downside, memory, quality, speed, llama_results, verified. Source: https://arxiv.org/pdf/2302.07863
+- Medusa typical acceptance: changed memory, quality, accepted_tokens, speed, llama_results, datasets, verified. Source: https://arxiv.org/pdf/2401.10774
+- Mentored Decoding: changed memory, quality, accepted_tokens, speed, llama_results, datasets, code, verified. Source: https://arxiv.org/html/2609.30474v1
+- Judge Decoding (Meta): changed method_downside, memory, quality, speed, verified. Source: https://ar5iv.labs.arxiv.org/html/2501.19309
+- AutoJudge: changed method_downside, memory, quality, accepted_tokens, speed, llama_results, verified. Source: https://arxiv.org/html/2504.20039v4
+- SelfJudge: changed method_downside, memory, quality, accepted_tokens, speed, llama_results, verified. Source: https://www.arxiv.org/pdf/2510.02329
+- Fuzzy SD (FSD): changed memory, quality, accepted_tokens, speed, datasets, verified. Source: https://arxiv.org/html/2502.20704v4
+- DIVERSED (Amazon): changed venue, memory, quality, accepted_tokens, speed, llama_results, datasets, verified. Source: https://arxiv.org/pdf/2604.07622v1
+- FLy (AMD): changed quality, accepted_tokens, speed, llama_results, verified. Source: https://arxiv.org/html/2511.22972
+- Revisiting Lossy Verification: changed memory, accepted_tokens, speed, llama_results. Source: https://arxiv.org/html/2607.26627
+- Faster Cascades via SD (Google): changed memory, quality, accepted_tokens, speed, llama_results, verified. Source: https://arxiv.org/html/2405.19261v2
+- Reward-Guided SD (RSD, Salesforce): changed quality, speed, llama_results, datasets, verified. Source: https://arxiv.org/html/2501.19324v3
+- SpecReason: changed quality, speed, llama_results. Source: https://arxiv.org/html/2504.07891v2
+- Speculative Thinking: changed method_downside, quality, accepted_tokens, speed, llama_results, verified. Source: https://arxiv.org/pdf/2504.12329
+- Speculative CoT (SCoT): changed method_downside, quality, speed, llama_results, verified. Source: https://arxiv.org/pdf/2504.19095v2
+- Lookahead Reasoning: changed accepted_tokens, speed, verified. Source: https://arxiv.org/pdf/2506.19830
+- SpecGuard: changed quality, speed, llama_results, datasets, verified. Source: https://aclanthology.org/2026.findings-acl.864.pdf
+# changes_5
+
+- SpecTr: memory, accepted_tokens, speed, datasets, verified | source: https://arxiv.org/html/2310.15141v2
+- Towards Optimal Multi-Draft SD (Hu et al.): accepted_tokens, speed, llama_results, verified | source: https://www.arxiv.org/pdf/2502.18779
+- Multi-Draft Canonical Decomposition (Khisti et al.): method_downside, memory, accepted_tokens, speed, llama_results, datasets, verified | source: https://arxiv.org/html/2410.18234v2
+- Global Resolution: method_downside, quality, accepted_tokens, speed, llama_results, datasets | source: https://arxiv.org/pdf/2511.15898 (html version rate-limited)
+- Block Verification: accepted_tokens, speed, verified | source: https://arxiv.org/html/2403.10444v3
+- Recursive SD (RSD): accepted_tokens, speed, llama_results, datasets, verified | source: https://arxiv.org/pdf/2402.14160v2
+- Traversal Verification: accepted_tokens, speed, llama_results, method_downside, verified | source: https://arxiv.org/html/2505.12398v2 ; https://arxiv.org/pdf/2505.12398
+- UniVer: accepted_tokens, speed, llama_results, datasets, code, verified | source: https://arxiv.org/pdf/2605.04543
+- HSD (Hierarchical SD): venue, method_downside, memory, accepted_tokens, speed, llama_results, verified | source: https://arxiv.org/html/2601.05724
+- Max-Speedup Speculative Sampling: method | source: https://openreview.net/forum?id=oGPeI321sI (blocked, nothing read)
+- SpecInfer: memory, accepted_tokens, speed, llama_results, datasets, code, verified | source: https://arxiv.org/pdf/2305.09781
+- Sequoia: memory, accepted_tokens, speed, llama_results, verified | source: https://arxiv.org/pdf/2402.12374 ; https://arxiv.org/html/2402.12374v2
+- OPT-Tree: method_downside, memory, accepted_tokens, speed, llama_results, datasets, verified | source: https://arxiv.org/html/2406.17276v2
+- EAGLE-2: memory, accepted_tokens, speed, llama_results, verified | source: https://arxiv.org/html/2406.16858v1
+- DeFT: method_downside, memory, speed, llama_results, datasets, verified | source: https://arxiv.org/html/2404.00242v2 ; https://arxiv.org/abs/2404.00242
+- Yggdrasil: memory, speed, llama_results, verified | source: https://arxiv.org/html/2512.23858v1
+- PEARL: method_downside, memory, accepted_tokens, speed, llama_results, verified | source: https://arxiv.org/pdf/2408.11850
+- Speculative Speculative Decoding (SSD): venue, method_downside, memory, accepted_tokens, speed, llama_results, verified | source: https://arxiv.org/pdf/2603.03251
+- Polybasic SD: method_downside, memory, accepted_tokens, speed, llama_results, datasets, code, verified | source: https://openreview.net/pdf?id=JrxJUMqqz4
+- Batch SD Done Right (Correctness Forensics): method_downside, memory, quality, speed, llama_results, verified | source: https://arxiv.org/html/2510.22876v3
+- MagicDec: memory, accepted_tokens, speed, llama_results, datasets, verified | source: https://arxiv.org/pdf/2408.11049 ; https://arxiv.org/html/2408.11049 ; https://arxiv.org/html/2408.11049v1
+- SpecServe (later AdaSpec): speed, llama_results, datasets, code, verified | source: https://arxiv.org/pdf/2503.05096v1 ; https://arxiv.org/pdf/2503.05096v2 ; https://arxiv.org/html/2503.05096v2
+- Interpretable Latency Model (MIT/Red Hat): method_downside, speed, llama_results, datasets, verified | source: https://arxiv.org/html/2605.15051v1
