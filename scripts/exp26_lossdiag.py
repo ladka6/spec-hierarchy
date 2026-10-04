@@ -18,6 +18,8 @@ and, for every stop, what would have fixed it:
   depth     redraft with features from only the target's first --depth-exit layers on the prefix
             (how much target computation buys back the gap between tokens and fresh)
 
+  <proxy>   redraft with features from a cheap copy of the target (e.g. 4-bit) on the prefix
+
 If "tokens" fixes few stops and "fresh" many, the drafter is limited by missing target information,
 not by in-block independence. Also reports, per distance after a position, how much conditioning on
 the true token there helps, binned by the target's entropy at that position (branch-point hypothesis:
@@ -46,7 +48,7 @@ from exp15_blocktree import accepted, tree_paths  # noqa: E402
 
 from hspec.data import encode, load_prompts, stop_ids  # noqa: E402
 from hspec.lagtrain import deep_columns, draft_logits_depth, draft_logits_lagged, pack  # noqa: E402
-from hspec.models import load_draft, load_target, load_tokenizer  # noqa: E402
+from hspec.models import load_draft, load_mid, load_target, load_tokenizer  # noqa: E402
 from hspec.pipeline import two_stage_generate  # noqa: E402
 from hspec.tree import build_ddtree  # noqa: E402
 from hspec.utils import mean, print_table, save_json  # noqa: E402
@@ -98,6 +100,9 @@ def main():
     ap.add_argument("--lag-draft", default=None, help="lag-trained drafter for the tokens mode (else --draft)")
     ap.add_argument("--depth-draft", default=None, help="depth-lag drafter (adds mode depth)")
     ap.add_argument("--depth-exit", type=int, default=18, help="target layers run on the prefix (depth mode)")
+    ap.add_argument("--proxies", nargs="*", default=[],
+                    help="cheap target copies (load_mid specs, e.g. bnb4:Qwen/Qwen3-8B): mode <kind> redrafts "
+                         "with real features up to s and the proxy's features on the prefix s .. s+i-1")
     ap.add_argument("--datasets", nargs="+", default=["gsm8k", "math500", "humaneval", "mt-bench"])
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--max-new", type=int, default=512)
@@ -115,7 +120,8 @@ def main():
     lagd = load_draft(args.lag_draft) if args.lag_draft else draft
     depd = load_draft(args.depth_draft) if args.depth_draft else None
     deep = None
-    modes = ["tokens"] + (["depth"] if depd else []) + ["fresh"]
+    proxies = {spec.split(":", 1)[0]: load_mid(spec) for spec in args.proxies}
+    modes = ["tokens"] + (["depth"] if depd else []) + list(proxies) + ["fresh"]
     stops = stop_ids(target, tok)
     bs = draft.block_size
     D = bs - 1
@@ -138,6 +144,11 @@ def main():
             lpt = torch.log_softmax(out.logits[0].float(), -1)
             ent = (-(lpt.exp() * lpt).nan_to_num(0.0).sum(-1)).cpu().tolist()       # ent[p-1] = entropy of the dist. of x[p]
             del out, lpt
+            pfeats = {}
+            for name, pm in proxies.items():
+                po = pm(x[None], output_hidden_states=True, logits_to_keep=1)
+                pfeats[name] = extract_context_feature(po.hidden_states, draft.target_layer_ids).to(feats.dtype)
+                del po
             for s in range(n0, len(x) - bs - 1, args.stride):
                 truth = x[s + 1 : s + bs]
                 lg = draft_logits_lagged(draft, target, feats, x, s, 0, bs)
@@ -146,6 +157,9 @@ def main():
                     rank_pos[k + 1].append(r_u[k])
                 cl = {"tokens": cond_logits(lagd, target, feats, x, s, bs, "tokens"),
                       "fresh": cond_logits(draft, target, feats, x, s, bs, "fresh")}
+                for name, pf in pfeats.items():
+                    mix = torch.cat([feats[:, :s], pf[:, s : s + bs - 1]], 1)
+                    cl[name] = cond_logits(draft, target, mix, x, s, bs, "fresh")
                 if depd is not None:
                     if deep is None:
                         deep = deep_columns(draft, args.depth_exit, feats.shape[-1], feats.device)
