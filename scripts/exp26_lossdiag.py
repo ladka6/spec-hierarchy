@@ -18,6 +18,7 @@ and, for every stop, what would have fixed it:
   depth     redraft with features from only the target's first --depth-exit layers on the prefix
             (how much target computation buys back the gap between tokens and fresh)
 
+  faker     redraft with context vectors emulated by a trained faker (hspec/faker.py)
   <proxy>   redraft with features from a cheap copy of the target (e.g. 4-bit) on the prefix
 
 If "tokens" fixes few stops and "fresh" many, the drafter is limited by missing target information,
@@ -47,6 +48,8 @@ from dflash.model import _output_head, extract_context_feature  # noqa: E402
 from exp15_blocktree import accepted, tree_paths  # noqa: E402
 
 from hspec.data import encode, load_prompts, stop_ids  # noqa: E402
+from hspec.faker import block_logits_ctx, fake_context, load_faker  # noqa: E402
+from hspec.feathead import context_vectors  # noqa: E402
 from hspec.lagtrain import deep_columns, draft_logits_depth, draft_logits_lagged, pack  # noqa: E402
 from hspec.models import load_draft, load_mid, load_target, load_tokenizer  # noqa: E402
 from hspec.pipeline import two_stage_generate  # noqa: E402
@@ -103,6 +106,7 @@ def main():
     ap.add_argument("--proxies", nargs="*", default=[],
                     help="cheap target copies (load_mid specs, e.g. bnb4:Qwen/Qwen3-8B): mode <kind> redrafts "
                          "with real features up to s and the proxy's features on the prefix s .. s+i-1")
+    ap.add_argument("--faker", default=None, help="trained faker (adds mode faker)")
     ap.add_argument("--datasets", nargs="+", default=["gsm8k", "math500", "humaneval", "mt-bench"])
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--max-new", type=int, default=512)
@@ -121,7 +125,8 @@ def main():
     depd = load_draft(args.depth_draft) if args.depth_draft else None
     deep = None
     proxies = {spec.split(":", 1)[0]: load_mid(spec) for spec in args.proxies}
-    modes = ["tokens"] + (["depth"] if depd else []) + list(proxies) + ["fresh"]
+    faker = load_faker(args.faker, "cuda") if args.faker else None
+    modes = ["tokens"] + (["depth"] if depd else []) + list(proxies) + (["faker"] if faker else []) + ["fresh"]
     stops = stop_ids(target, tok)
     bs = draft.block_size
     D = bs - 1
@@ -157,6 +162,11 @@ def main():
                     rank_pos[k + 1].append(r_u[k])
                 cl = {"tokens": cond_logits(lagd, target, feats, x, s, bs, "tokens"),
                       "fresh": cond_logits(draft, target, feats, x, s, bs, "fresh")}
+                if faker is not None:
+                    cvec = context_vectors(draft, feats)[0].float()
+                    c_hat = fake_context(faker, draft, target, cvec, x, s, bs - 1)
+                    ctx = torch.cat([cvec[:s], c_hat], 0)[None].to(feats.dtype)
+                    cl["faker"] = block_logits_ctx(draft, target, ctx, x, [s + i for i in range(1, bs - 1)], bs)
                 for name, pf in pfeats.items():
                     mix = torch.cat([feats[:, :s], pf[:, s : s + bs - 1]], 1)
                     cl[name] = cond_logits(draft, target, mix, x, s, bs, "fresh")
