@@ -24,6 +24,22 @@ def load_tokenizer(model_id: str):
     return AutoTokenizer.from_pretrained(model_id)
 
 
+@torch.no_grad()
+def fake_quantize_(model, bits: int, group: int = 64):
+    """In-place round-to-nearest N-bit quantize-dequantize of every Linear in the decoder layers."""
+    qmax = 2 ** bits - 1
+    for layer in model.model.layers:
+        for mod in layer.modules():
+            if isinstance(mod, torch.nn.Linear):
+                w = mod.weight
+                out_f, in_f = w.shape
+                g = w.float().reshape(out_f, in_f // group, group)
+                lo, hi = g.amin(-1, keepdim=True), g.amax(-1, keepdim=True)
+                scale = (hi - lo).clamp_min(1e-8) / qmax
+                q = ((g - lo) / scale).round().clamp(0, qmax)
+                w.copy_((q * scale + lo).reshape(out_f, in_f).to(w.dtype))
+
+
 def load_mid(spec: str, device: str = "cuda"):
     """Load a middle verifier from a spec string "kind:model_id".
 
@@ -32,6 +48,7 @@ def load_mid(spec: str, device: str = "cuda"):
       bnb8  8-bit LLM.int8 (bitsandbytes). Very slow at batch 1.
       ao4   4-bit weight-only (torchao, group 128). Fast small-batch kernel.
       ao8   8-bit weight-only (torchao).
+      rtnN  simulated N-bit round-to-nearest weights (group 64), bf16 storage: quality only
       hqqN  N-bit HQQ (N = 2, 3, 4; needs `pip install hqq`). Quality test only: default backend is slow.
       hf    plain bf16 checkpoint (e.g. a smaller model of the same family,
             or a pre-quantized AWQ/GPTQ checkpoint whose kernels are installed)
@@ -51,6 +68,13 @@ def load_mid(spec: str, device: str = "cuda"):
         kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
         kwargs["device_map"] = device
         kwargs["dtype"] = torch.bfloat16
+    elif kind.startswith("rtn"):
+        # simulated N-bit weight quantization (round-to-nearest, asymmetric, group 64) of the
+        # decoder layers, stored back in bf16: quality test only, no speed benefit
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, device_map=device,
+                                                     attn_implementation="sdpa")
+        fake_quantize_(model, int(kind[3:]))
+        return model.eval()
     elif kind.startswith("hqq"):
         # HQQ calibration-free low-bit quantization (hqq2 / hqq3 / hqq4), group size 64
         from transformers import HqqConfig

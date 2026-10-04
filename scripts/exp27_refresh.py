@@ -76,6 +76,7 @@ def main():
     ap.add_argument("--lag-draft", default=None)
     ap.add_argument("--proxies", nargs="*", default=["bnb4:Qwen/Qwen3-8B"])
     ap.add_argument("--no-fresh", action="store_true")
+    ap.add_argument("--no-tokens", action="store_true", help="skip the tokens-only source (saves the lag drafter)")
     ap.add_argument("--datasets", nargs="+", default=["gsm8k", "math500", "humaneval", "mt-bench"])
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--max-new", type=int, default=512)
@@ -90,12 +91,12 @@ def main():
     tok = load_tokenizer(args.target)
     target = load_target(args.target)
     draft = load_draft(args.draft)
-    lagd = load_draft(args.lag_draft) if args.lag_draft else draft
+    lagd = draft if args.no_tokens else (load_draft(args.lag_draft) if args.lag_draft else draft)
     proxies = {spec.split(":", 1)[0]: load_mid(spec) for spec in args.proxies}
     stops = stop_ids(target, tok)
     bs = draft.block_size
     D = bs - 1                                       # drafted tokens per block
-    sources = ["tokens"] + list(proxies) + ([] if args.no_fresh else ["fresh"])
+    sources = ([] if args.no_tokens else ["tokens"]) + list(proxies) + ([] if args.no_fresh else ["fresh"])
     policies = ["all", "end", "oracle"] + [f"conf{k}" for k in args.ks]
 
     rec = defaultdict(list)                          # (source, policy) -> [(tau, nodes, beyond_block)]
