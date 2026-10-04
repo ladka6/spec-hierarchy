@@ -163,3 +163,9 @@ From the title alone: an iterative editing pass over a draft would be a uniform 
 - Future Lens exact numbers.
 - Per-checkpoint DFlash configs (Qwen3-4B, Coder-30B, LLaMA-3.1-8B) layer counts.
 - EAGLE-3 data-scaling figure numbers; Scylla capacity scaling figure.
+
+## Follow-up (read from PDFs, 2026-10-04)
+
+2610.00888 "Match the Distribution, Not the Compute" (Microsoft, NeurIPS 2026 workshop). Not a counter-claim. "Compute" means training compute: post-trained chained MTP heads on frozen Qwen3-8B (K=3, ~200M per head, 2.5B self-distilled tokens) match jointly pretrained MiMo-7B MTP heads (MAL 3.05 vs 2.80 GSM8K, vLLM bs4 A100). Plus chain-aware lossy verification (+14% MAL) and a bandit choosing K at serving time. Self-distillation matters most; Mamba chaining helps a bit; KL loss and backbone LoRA do not. Closeness to offset-dependent depth: 0.
+
+2609.38510 DEdit (AWS/UCR/NYU, 29 Sep 2026). DFlash-style drafter re-run K times with the same weights on its own previous proposal (bidirectional editing), trained jointly with ProposalMix (high-confidence positions replaced by ground truth for the edit pass). Qwen3-4B/8B, 7 benchmarks, greedy macro speedup 5.72x / 5.97x, highest tau among DFlash, Domino, DSpark. W=32: tau 7.12 (P2) -> 7.58 (P3) -> 7.77 (P4); speedup 5.48x -> 5.72x -> 5.74x. Window 16 -> 32 adds 10.3% tau with editing vs 2.1% for DFlash. Causal (lower-triangular) editor is worse, so they attribute gains to future context. About two thirds of edit passes change nothing (adaptive skipping left as future work). Closeness: 2 (uniform extra drafter compute via weight-tied repeated passes; not offset-dependent).
