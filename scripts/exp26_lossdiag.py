@@ -15,6 +15,9 @@ and, for every stop, what would have fixed it:
             (= what in-block dependency fixes can give: D2SD, exp18, dependency heads)
   fresh     redraft with real target features up to the stop (upper bound: more target information)
 
+  depth     redraft with features from only the target's first --depth-exit layers on the prefix
+            (how much target computation buys back the gap between tokens and fresh)
+
 If "tokens" fixes few stops and "fresh" many, the drafter is limited by missing target information,
 not by in-block independence. Also reports, per distance after a position, how much conditioning on
 the true token there helps, binned by the target's entropy at that position (branch-point hypothesis:
@@ -42,7 +45,7 @@ from dflash.model import _output_head, extract_context_feature  # noqa: E402
 from exp15_blocktree import accepted, tree_paths  # noqa: E402
 
 from hspec.data import encode, load_prompts, stop_ids  # noqa: E402
-from hspec.lagtrain import draft_logits_lagged, pack  # noqa: E402
+from hspec.lagtrain import deep_columns, draft_logits_depth, draft_logits_lagged, pack  # noqa: E402
 from hspec.models import load_draft, load_target, load_tokenizer  # noqa: E402
 from hspec.pipeline import two_stage_generate  # noqa: E402
 from hspec.tree import build_ddtree  # noqa: E402
@@ -81,12 +84,20 @@ def cond_logits(dm, head_src, feats, x, s, bs, mode):
     return dm.compute_logits(rows, _output_head(head_src))
 
 
+def depth_logits(dm, head_src, feats, x, s, bs, deep):
+    """Like cond_logits, mode depth: full features up to s, then features from only the target's
+    lower layers (deep slices zeroed) for the prefix positions s .. s+i-1."""
+    return torch.stack([draft_logits_depth(dm, head_src, feats, x, s + i, i, bs, deep) for i in range(1, bs - 1)])
+
+
 @torch.inference_mode()
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
     ap.add_argument("--draft", default="z-lab/Qwen3-8B-DFlash-b16")
     ap.add_argument("--lag-draft", default=None, help="lag-trained drafter for the tokens mode (else --draft)")
+    ap.add_argument("--depth-draft", default=None, help="depth-lag drafter (adds mode depth)")
+    ap.add_argument("--depth-exit", type=int, default=18, help="target layers run on the prefix (depth mode)")
     ap.add_argument("--datasets", nargs="+", default=["gsm8k", "math500", "humaneval", "mt-bench"])
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--max-new", type=int, default=512)
@@ -102,6 +113,9 @@ def main():
     target = load_target(args.target)
     draft = load_draft(args.draft)
     lagd = load_draft(args.lag_draft) if args.lag_draft else draft
+    depd = load_draft(args.depth_draft) if args.depth_draft else None
+    deep = None
+    modes = ["tokens"] + (["depth"] if depd else []) + ["fresh"]
     stops = stop_ids(target, tok)
     bs = draft.block_size
     D = bs - 1
@@ -132,6 +146,10 @@ def main():
                     rank_pos[k + 1].append(r_u[k])
                 cl = {"tokens": cond_logits(lagd, target, feats, x, s, bs, "tokens"),
                       "fresh": cond_logits(draft, target, feats, x, s, bs, "fresh")}
+                if depd is not None:
+                    if deep is None:
+                        deep = deep_columns(draft, args.depth_exit, feats.shape[-1], feats.device)
+                    cl["depth"] = depth_logits(depd, target, feats, x, s, bs, deep)
                 cr = {}
                 for m, L in cl.items():           # cr[m][i-1][k] = (rank, logp) of offset i+1+k
                     cr[m] = []
@@ -178,14 +196,14 @@ def main():
                "cap": sum(r["cls"] == "cap" for r in recs) / n,
                "coverage": sum(r["cls"] == "coverage" for r in recs) / n,
                "path": sum(r["cls"] == "path" for r in recs) / n}
-        for m in ("tokens", "fresh"):
+        for m in modes:
             ok = [r for r in miss if m in r]
             row[f"fix_{m}@1"] = mean(float(r[m] == 1) for r in ok) if ok else float("nan")
             row[f"fix_{m}@16"] = mean(float(r[m] <= TOPK) for r in ok) if ok else float("nan")
         row["ent_stop"] = mean(r["ent"] for r in miss) if miss else float("nan")
         rows.append(row)
-    print_table(rows, ["who", "tau", "stops", "cap", "coverage", "path", "fix_tokens@1", "fix_fresh@1",
-                       "fix_tokens@16", "fix_fresh@16", "ent_stop"],
+    print_table(rows, ["who", "tau", "stops", "cap", "coverage", "path"] + [f"fix_{m}@1" for m in modes]
+                + [f"fix_{m}@16" for m in modes] + ["ent_stop"],
                 f"why acceptance stops (T={args.temp}); fix_* = redraft from the stop with true prefix: "
                 "tokens only vs real features")
     # stops split by entropy at the stop and before it (chain)
@@ -198,9 +216,8 @@ def main():
         for eb, rs in sorted(by.items()):
             erows.append({"who": w, "ent_at_stop": eb, "share": len(rs) / len(stop_rec[w]),
                           "coverage": mean(float(r["cls"] == "coverage") for r in rs),
-                          "fix_tokens@1": mean(float(r.get("tokens", 0) == 1) for r in rs),
-                          "fix_fresh@1": mean(float(r.get("fresh", 0) == 1) for r in rs)})
-    print_table(erows, ["who", "ent_at_stop", "share", "coverage", "fix_tokens@1", "fix_fresh@1"],
+                          **{f"fix_{m}@1": mean(float(r.get(m, 0) == 1) for r in rs) for m in modes}})
+    print_table(erows, ["who", "ent_at_stop", "share", "coverage"] + [f"fix_{m}@1" for m in modes],
                 "stops by target entropy at the stop position")
     grows = []
     for (m, eb, dist), v in sorted(gain.items()):
