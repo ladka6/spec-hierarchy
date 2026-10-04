@@ -32,6 +32,7 @@ def load_mid(spec: str, device: str = "cuda"):
       bnb8  8-bit LLM.int8 (bitsandbytes). Very slow at batch 1.
       ao4   4-bit weight-only (torchao, group 128). Fast small-batch kernel.
       ao8   8-bit weight-only (torchao).
+      hqqN  N-bit HQQ (N = 2, 3, 4; needs `pip install hqq`). Quality test only: default backend is slow.
       hf    plain bf16 checkpoint (e.g. a smaller model of the same family,
             or a pre-quantized AWQ/GPTQ checkpoint whose kernels are installed)
     """
@@ -50,6 +51,13 @@ def load_mid(spec: str, device: str = "cuda"):
         kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
         kwargs["device_map"] = device
         kwargs["dtype"] = torch.bfloat16
+    elif kind.startswith("hqq"):
+        # HQQ calibration-free low-bit quantization (hqq2 / hqq3 / hqq4), group size 64
+        from transformers import HqqConfig
+
+        kwargs["quantization_config"] = HqqConfig(nbits=int(kind[3:]), group_size=64)
+        kwargs["dtype"] = torch.bfloat16
+        kwargs["device_map"] = device
     elif kind == "hf":
         kwargs["dtype"] = torch.bfloat16
         kwargs["device_map"] = device
