@@ -122,7 +122,7 @@ def main():
             out = target(x[None], output_hidden_states=True)
             feats = extract_context_feature(out.hidden_states, draft.target_layer_ids)
             lpt = torch.log_softmax(out.logits[0].float(), -1)
-            ent = -(lpt.exp() * lpt).sum(-1).cpu().tolist()       # ent[p-1] = entropy of the dist. of x[p]
+            ent = (-(lpt.exp() * lpt).nan_to_num(0.0).sum(-1)).cpu().tolist()       # ent[p-1] = entropy of the dist. of x[p]
             del out, lpt
             for s in range(n0, len(x) - bs - 1, args.stride):
                 truth = x[s + 1 : s + bs]
