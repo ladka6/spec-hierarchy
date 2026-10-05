@@ -49,6 +49,10 @@ def stage(model, ctx, q, reps, keep=None):
               use_cache=True, output_hidden_states=True, logits_to_keep=keep or q)
 
     def run():
+        # this transformers StaticCache writes at its own counter (cumulative_length), not at
+        # cache_position: reset it so every call overwrites the same q slots after the context
+        for layer in cache.layers:
+            layer.cumulative_length.fill_(ctx)
         out = model(ids, **kw)
         return out.logits, out.hidden_states[-1]
 
