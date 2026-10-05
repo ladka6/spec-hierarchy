@@ -180,8 +180,22 @@ def main():
     ap.add_argument("--verify-qs", nargs="+", type=int, default=[1, 16, 32, 48, 64])
     ap.add_argument("--copy-qs", nargs="+", type=int, default=[16, 26, 32])
     ap.add_argument("--reps", type=int, default=30)
+    ap.add_argument("--only-copies", action="store_true")
     args = ap.parse_args()
     rows = []
+    if args.only_copies:
+        for spec in args.copies:
+            try:
+                m = load_mid(spec)
+            except Exception as e:  # noqa: BLE001
+                print(f"[{spec}] load failed: {type(e).__name__}: {str(e)[:300]}", flush=True)
+                continue
+            bench("copy_" + spec.split(":")[0], m, args, args.copy_qs, 16, rows)
+            free(m)
+            del m
+        print_table(rows, ["stage", "q", "eager_ms", "graph_ms"], f"copy latency, batch 1, ctx {args.ctx}")
+        save_json("bench_refresh_copies", {"args": vars(args), "rows": rows})
+        return
     target = load_target(args.target)
     bench("verify_bf16", target, args, args.verify_qs, None, rows)
     from hspec.models import load_draft

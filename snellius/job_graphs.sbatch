@@ -20,4 +20,4 @@ export HSPEC_RESULTS="$SLURM_SUBMIT_DIR/results/graphs"
 mkdir -p "$HSPEC_RESULTS"
 F="grep --line-buffered -v -i warn"
 L=/scratch-shared/$USER/hspec_lagft/drafter_lag16
-python scripts/bench_refresh.py 2>&1 | $F
+python scripts/bench_refresh.py --only-copies --copies tao4:Qwen/Qwen3-8B tao8:Qwen/Qwen3-8B 2>&1 | $F

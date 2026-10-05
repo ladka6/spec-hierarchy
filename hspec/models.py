@@ -66,6 +66,7 @@ def load_mid(spec: str, device: str = "cuda"):
       bnb8  8-bit LLM.int8 (bitsandbytes). Very slow at batch 1.
       ao4   4-bit weight-only (torchao, group 128). Fast small-batch kernel.
       ao8   8-bit weight-only (torchao).
+      tao4 / tao8  torchao int4 / int8 weight-only via quantize_ on the decoder layers (fast at batch 1)
       keepN layer-skipped target, N layers kept evenly over 0..33 (others identity): quality only
       rtnN  simulated N-bit round-to-nearest weights (group 64), bf16 storage: quality only
       hqqN  N-bit HQQ (N = 2, 3, 4; needs `pip install hqq`). Quality test only: default backend is slow.
@@ -87,6 +88,26 @@ def load_mid(spec: str, device: str = "cuda"):
         kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
         kwargs["device_map"] = device
         kwargs["dtype"] = torch.bfloat16
+    elif kind in ("tao4", "tao8"):
+        # torchao weight-only int4 / int8 applied directly to the decoder layers of a bf16 model
+        # (bypasses transformers' TorchAoConfig weight conversion, which fails under transformers 5)
+        from torchao.quantization import quantize_
+
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, device_map=device,
+                                                     attn_implementation="sdpa")
+        if kind == "tao4":
+            from torchao.quantization import Int4WeightOnlyConfig
+
+            try:
+                cfg = Int4WeightOnlyConfig(group_size=128, int4_packing_format="tile_packed_to_4d")
+            except TypeError:
+                cfg = Int4WeightOnlyConfig(group_size=128)
+        else:
+            from torchao.quantization import Int8WeightOnlyConfig
+
+            cfg = Int8WeightOnlyConfig()
+        quantize_(model.model.layers, cfg)
+        return model.eval()
     elif kind.startswith("keep"):
         # layer-skipped target: keep N decoder layers spread evenly over 0..33 (the deepest layer DFlash
         # reads); the others become identity (their o_proj / down_proj are zeroed, so the residual
