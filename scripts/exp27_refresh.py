@@ -19,6 +19,8 @@ Feature sources (step 2):
 
 Option 1 (pc*): the copy's own next-token predictions find the first likely error j in block 1 and
 supply the corrected token (pc1 = its top-1, pc2 = its top-2); the drafter restarts after it.
+Ablations: pc_tok (same correction, continuation drafted from tokens only by the lag drafter, no
+copy features), pc_none (the correction alone, no continuation: a quantized intermediate verifier).
 Option 2 (|gateG): all extra work only on rounds with P(stop within 8 tokens) >= G; "ran" = share of
 rounds that run it.
 
@@ -98,7 +100,7 @@ def main():
     tok = load_tokenizer(args.target)
     target = load_target(args.target)
     draft = load_draft(args.draft)
-    lagd = draft if args.no_tokens else (load_draft(args.lag_draft) if args.lag_draft else draft)
+    lagd = load_draft(args.lag_draft) if args.lag_draft else draft
     proxies = {spec.split(":", 1)[0]: load_mid(spec) for spec in args.proxies}
     stops = stop_ids(target, tok)
     bs = draft.block_size
@@ -163,10 +165,18 @@ def main():
                             zc = torch.cat([z[: s + j + 1], torch.tensor([tokj], device=z.device)])
                             Lc = blocks_logits(draft, target, full, zc, [(s + j + 1, 0)], bs)
                             extra[name] = y[:j] + [tokj] + Lc[0].argmax(-1).tolist()
+                            if alt == 0:
+                                # ablations: same correction, continuation from tokens only (lag drafter,
+                                # no copy features), and the correction alone (no continuation)
+                                Lt = blocks_logits(lagd, target, feats[:, :s], zc, [(s + j + 1, j + 1)], bs)
+                                extra["pc_tok"] = y[:j] + [tokj] + Lt[0].argmax(-1).tolist()
+                                extra["pc_none"] = y[:j] + [tokj]
                     pols = {pol: [cont[i] for i in rs] for pol, rs in restarts.items()}
                     if extra:
                         pols["pc"] = [extra["pc1"]]
                         pols["pc_fork"] = [extra["pc1"], extra["pc2"]]
+                        pols["pc_tok"] = [extra["pc_tok"]]
+                        pols["pc_none"] = [extra["pc_none"]]
                         for k in args.ks:
                             pols[f"pc+conf{k}"] = [extra["pc1"]] + [cont[i] for i in restarts[f"conf{k}"]]
                     # option 2: skip all extra work when block 1 looks safe
