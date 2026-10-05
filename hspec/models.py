@@ -40,6 +40,24 @@ def fake_quantize_(model, bits: int, group: int = 64):
                 w.copy_((q * scale + lo).reshape(out_f, in_f).to(w.dtype))
 
 
+def kept_layers(n_layers: int, keep: int, last: int = 33) -> list[int]:
+    """keep layer indices spread evenly over 0..last (incl. both ends)."""
+    if keep >= last + 1:
+        return list(range(last + 1))
+    return sorted({round(i * last / (keep - 1)) for i in range(keep)})
+
+
+@torch.no_grad()
+def skip_layers_(model, keep: int, last: int = 33):
+    """Turn every decoder layer not in kept_layers into identity by zeroing its output projections."""
+    keep_ids = set(kept_layers(len(model.model.layers), keep, last))
+    for i, layer in enumerate(model.model.layers):
+        if i not in keep_ids:
+            layer.self_attn.o_proj.weight.zero_()
+            layer.mlp.down_proj.weight.zero_()
+    model.kept_layers = sorted(keep_ids)
+
+
 def load_mid(spec: str, device: str = "cuda"):
     """Load a middle verifier from a spec string "kind:model_id".
 
@@ -48,6 +66,7 @@ def load_mid(spec: str, device: str = "cuda"):
       bnb8  8-bit LLM.int8 (bitsandbytes). Very slow at batch 1.
       ao4   4-bit weight-only (torchao, group 128). Fast small-batch kernel.
       ao8   8-bit weight-only (torchao).
+      keepN layer-skipped target, N layers kept evenly over 0..33 (others identity): quality only
       rtnN  simulated N-bit round-to-nearest weights (group 64), bf16 storage: quality only
       hqqN  N-bit HQQ (N = 2, 3, 4; needs `pip install hqq`). Quality test only: default backend is slow.
       hf    plain bf16 checkpoint (e.g. a smaller model of the same family,
@@ -68,6 +87,14 @@ def load_mid(spec: str, device: str = "cuda"):
         kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
         kwargs["device_map"] = device
         kwargs["dtype"] = torch.bfloat16
+    elif kind.startswith("keep"):
+        # layer-skipped target: keep N decoder layers spread evenly over 0..33 (the deepest layer DFlash
+        # reads); the others become identity (their o_proj / down_proj are zeroed, so the residual
+        # passes through). bf16 storage: quality test of a pruned feature generator, no speed benefit
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, device_map=device,
+                                                     attn_implementation="sdpa")
+        skip_layers_(model, int(kind[4:]))
+        return model.eval()
     elif kind.startswith("rtn"):
         # simulated N-bit weight quantization (round-to-nearest, asymmetric, group 64) of the
         # decoder layers, stored back in bf16: quality test only, no speed benefit
