@@ -52,7 +52,7 @@ def mean(xs):
 def print_table(rows: list[dict], cols: list[str], title: str = "") -> None:
     if title:
         print(f"\n== {title} ==")
-    widths = {c: max(len(c), *(len(_fmt(r.get(c))) for r in rows)) for c in cols}
+    widths = {c: max([len(c)] + [len(_fmt(r.get(c))) for r in rows]) for c in cols}
     print("  ".join(c.ljust(widths[c]) for c in cols))
     for r in rows:
         print("  ".join(_fmt(r.get(c)).ljust(widths[c]) for c in cols))
