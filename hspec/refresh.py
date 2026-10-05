@@ -48,6 +48,39 @@ def chains_to_tree(chains) -> Tree:
     return tree
 
 
+@torch.inference_mode()
+def batched_restarts(draft, head_src, cfeat, specs, dcache, start, bs, position_ids):
+    """All restart blocks in ONE drafter call. specs: list of (ctx_len, anchor_pos, anchor_token):
+    block r sees the drafter cache [0, start), the copy features cfeat[:, :ctx_len] (positions
+    start .. start+ctx_len-1) and its own block (anchor + bs-1 masks at anchor_pos ..).
+    Returns logits [R, bs-1, V]; the drafter cache is restored to [0, start)."""
+    from dflash.model import _draft_value, _output_head, _raw_input_embeddings
+
+    dev = cfeat.device
+    R = len(specs)
+    M = max(c for c, _, _ in specs)
+    ctx = cfeat[:, :M]
+    toks = torch.full((1, R * bs), draft.mask_token_id, dtype=torch.long, device=dev)
+    pos = [position_ids[0, start : start + M]]
+    for r, (_, a, t) in enumerate(specs):
+        toks[0, r * bs] = int(t)
+        pos.append(position_ids[0, a : a + bs])
+    pos = torch.cat(pos)[None]
+    noise = _raw_input_embeddings(head_src, toks, float(_draft_value(draft.config, "input_embedding_scale", 1.0)))
+    Lc = dcache.get_seq_length()
+    mask = torch.zeros((R * bs, Lc + M + R * bs), dtype=torch.bool, device=dev)
+    mask[:, :Lc] = True
+    for r, (c, _, _) in enumerate(specs):
+        rows = slice(r * bs, (r + 1) * bs)
+        mask[rows, Lc : Lc + c] = True
+        mask[rows, Lc + M + r * bs : Lc + M + (r + 1) * bs] = True
+    hid = draft(target_hidden=ctx, noise_embedding=noise, position_ids=pos, attention_mask=mask[None, None],
+                past_key_values=dcache, use_cache=True)[0]
+    crop(dcache, start)
+    rows = torch.stack([hid[r * bs + 1 : (r + 1) * bs] for r in range(R)])
+    return draft.compute_logits(rows, _output_head(head_src))
+
+
 def stop_posterior(conf: list[float]) -> dict[int, float]:
     """P(acceptance of block 1 stops right after keeping i tokens), i = 1 .. D (D = all kept)."""
     D = len(conf)
@@ -61,7 +94,7 @@ def stop_posterior(conf: list[float]) -> dict[int, float]:
 @torch.inference_mode()
 def refresh_generate(draft, target, copy, input_ids, max_new_tokens, stop_token_ids,
                      ks: int = 2, use_pc: bool = True, block_size: int | None = None,
-                     profile: bool = False) -> GenResult:
+                     profile: bool = False, batch_restarts: bool = True) -> GenResult:
     """Greedy feature-refreshed decoding. ks = number of confidence restarts besides the copy-corrected
     one (0 = pc only). use_pc=False gives the conf-only variant."""
     device = input_ids.device
@@ -115,27 +148,31 @@ def refresh_generate(draft, target, copy, input_ids, max_new_tokens, stop_token_
         del co
         tc = tick()
 
-        # 3. restarts (separate drafter calls; drafter cache is restored to [0, start) after each)
+        # 3. restarts: (ctx_len, anchor position, anchor token, kept prefix) per restart
         chains = [y]
+        specs = []
         if use_pc:
             j = next((k for k in range(D) if cpred[k] != y[k]), D)
-            a = start + j + 1                              # restart anchor position
-            blk = torch.full((1, bs), draft.mask_token_id, dtype=torch.long, device=device)
-            blk[0, 0] = cpred[j]
-            lr = draft_logits(draft, target, cfeat[:, : j + 1], blk, position_ids, a, dcache)
-            crop(dcache, start)
-            res.draft_calls += 1
-            chains.append(y[:j] + [cpred[j]] + lr.argmax(-1).tolist())
+            specs.append((j + 1, start + j + 1, cpred[j], y[:j] + [cpred[j]]))
         if ks:
             post = stop_posterior(conf)
             for i in sorted(post, key=lambda i: -post[i])[:ks]:
-                a = start + i
-                blk = torch.full((1, bs), draft.mask_token_id, dtype=torch.long, device=device)
-                blk[0, 0] = y[i - 1]
-                lr = draft_logits(draft, target, cfeat[:, :i], blk, position_ids, a, dcache)
-                crop(dcache, start)
+                specs.append((i, start + i, y[i - 1], y[:i]))
+        if specs:
+            if batch_restarts:
+                L = batched_restarts(draft, target, cfeat, [sp[:3] for sp in specs], dcache, start, bs,
+                                     position_ids)
                 res.draft_calls += 1
-                chains.append(y[:i] + lr.argmax(-1).tolist())
+            else:
+                L = []
+                for c, a, t, _ in specs:
+                    blk = torch.full((1, bs), draft.mask_token_id, dtype=torch.long, device=device)
+                    blk[0, 0] = int(t)
+                    L.append(draft_logits(draft, target, cfeat[:, :c], blk, position_ids, a, dcache))
+                    crop(dcache, start)
+                    res.draft_calls += 1
+            for sp, lr in zip(specs, L):
+                chains.append(sp[3] + lr.argmax(-1).tolist())
         room = max_len - start                             # never draft past the length budget
         chains = [c[:room] for c in chains]
         tree = chains_to_tree(chains)
