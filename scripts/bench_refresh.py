@@ -190,6 +190,8 @@ def main():
             except Exception as e:  # noqa: BLE001
                 print(f"[{spec}] load failed: {type(e).__name__}: {str(e)[:300]}", flush=True)
                 continue
+            print(f"[{spec}] linear layer class: {type(m.model.layers[0].mlp.down_proj).__module__}."
+                  f"{type(m.model.layers[0].mlp.down_proj).__name__}", flush=True)
             bench("copy_" + spec.split(":")[0], m, args, args.copy_qs, 16, rows)
             free(m)
             del m
