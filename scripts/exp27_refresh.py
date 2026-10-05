@@ -17,6 +17,11 @@ Feature sources (step 2):
   <proxy>  a cheap target copy (load_mid spec, e.g. bnb4:Qwen/Qwen3-8B)
   fresh    the bf16 target itself (upper bound; costs a target pass)
 
+Option 1 (pc*): the copy's own next-token predictions find the first likely error j in block 1 and
+supply the corrected token (pc1 = its top-1, pc2 = its top-2); the drafter restarts after it.
+Option 2 (|gateG): all extra work only on rounds with P(stop within 8 tokens) >= G; "ran" = share of
+rounds that run it.
+
 Restart policies: all (i = 1 .. 15), conf-K (top-K positions by the drafter's stop posterior
 prod_{k<=i} c_k * (1 - c_{i+1}), c = max prob of block 1; i = 15 uses prod of all c), end (i = 15
 only: plain second block), oracle (the true stop; upper bound for one restart).
@@ -82,6 +87,8 @@ def main():
     ap.add_argument("--max-new", type=int, default=512)
     ap.add_argument("--stride", type=int, default=8)
     ap.add_argument("--ks", nargs="+", type=int, default=[1, 2, 4])
+    ap.add_argument("--gates", nargs="+", type=float, default=[0.1, 0.2, 0.3, 0.5],
+                    help="option 2: run the refresh only if P(stop within the first 8 tokens) >= gate")
     ap.add_argument("--temp", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="exp27_refresh")
@@ -138,23 +145,54 @@ def main():
                         L = blocks_logits(lagd, target, feats[:, :s], z, [(s + i, i) for i in need], bs)
                     else:
                         fm = target if src == "fresh" else proxies[src]
-                        pz = extract_context_feature(
-                            fm(z[None], output_hidden_states=True, logits_to_keep=1).hidden_states,
-                            draft.target_layer_ids).to(feats.dtype)
+                        po = fm(z[None], output_hidden_states=True, logits_to_keep=bs)
+                        pz = extract_context_feature(po.hidden_states, draft.target_layer_ids).to(feats.dtype)
+                        top2 = po.logits[0].float().topk(2, -1).indices.tolist()   # [bs][2]: predictions for s+1 .. s+16
+                        del po
                         mix = torch.cat([feats[:, :s], pz[:, s : s + D]], 1)
                         L = blocks_logits(draft, target, mix, z, [(s + i, 0) for i in need], bs)
                     cont = {i: y[:i] + L[j].argmax(-1).tolist() for j, i in enumerate(need)}
-                    for pol, rs in restarts.items():
-                        chains = [y] + [cont[i] for i in rs]
+                    extra = {}
+                    if src != "tokens":
+                        # option 1: the copy's own predictions locate the first likely error j and supply the
+                        # corrected token; restart there (anchor = corrected token, copy features before it)
+                        j = next((k for k in range(D) if top2[k][0] != y[k]), D)        # 0-based; D = no error
+                        full = torch.cat([feats[:, :s], pz[:, s : s + bs]], 1)           # features through s+15
+                        for name, alt in (("pc1", 0), ("pc2", 1)):
+                            tokj = top2[j][alt]
+                            zc = torch.cat([z[: s + j + 1], torch.tensor([tokj], device=z.device)])
+                            Lc = blocks_logits(draft, target, full, zc, [(s + j + 1, 0)], bs)
+                            extra[name] = y[:j] + [tokj] + Lc[0].argmax(-1).tolist()
+                    pols = {pol: [cont[i] for i in rs] for pol, rs in restarts.items()}
+                    if extra:
+                        pols["pc"] = [extra["pc1"]]
+                        pols["pc_fork"] = [extra["pc1"], extra["pc2"]]
+                        for k in args.ks:
+                            pols[f"pc+conf{k}"] = [extra["pc1"]] + [cont[i] for i in restarts[f"conf{k}"]]
+                    # option 2: skip all extra work when block 1 looks safe
+                    p8 = 1.0
+                    for c in conf[:8]:
+                        p8 *= c
+                    gated = {}
+                    for g in args.gates:
+                        run = (1.0 - p8) >= g
+                        for pol in ("conf2", "pc+conf2", "pc"):
+                            if pol in pols:
+                                gated[f"{pol}|gate{g}"] = (pols[pol] if run else [], run)
+                    for pol, ch in list(pols.items()):
+                        gated[pol] = (ch, True)
+                    for pol, (ch, ran) in gated.items():
+                        chains = [y] + ch
                         best = max(matched(c, truth) for c in chains)
-                        rec[(src, pol)].append((best + 1, tree_nodes(chains), float(best > D)))
+                        rec[(src, pol)].append((best + 1, tree_nodes(chains), float(best > D), float(ran)))
             print(f"[{d}] {len(base)} anchors", flush=True)
 
-    rows = [{"source": "-", "policy": "block1 only", "tau": mean(base), "nodes": D, "beyond_block1": 0.0}]
+    rows = [{"source": "-", "policy": "block1 only", "tau": mean(base), "nodes": D, "beyond_block1": 0.0,
+             "ran": 0.0}]
     for (src, pol), v in sorted(rec.items()):
-        rows.append({"source": src, "policy": pol, "tau": mean(a for a, _, _ in v),
-                     "nodes": mean(n for _, n, _ in v), "beyond_block1": mean(b for _, _, b in v)})
-    print_table(rows, ["source", "policy", "tau", "nodes", "beyond_block1"],
+        rows.append({"source": src, "policy": pol, "tau": mean(r[0] for r in v), "nodes": mean(r[1] for r in v),
+                     "beyond_block1": mean(r[2] for r in v), "ran": mean(r[3] for r in v)})
+    print_table(rows, ["source", "policy", "tau", "nodes", "beyond_block1", "ran"],
                 f"refreshed redrafting (T={args.temp}): accepted per verify pass, tree nodes, share of rounds "
                 "accepting past block 1")
     save_json(args.out, {"args": vars(args), "rows": rows})
