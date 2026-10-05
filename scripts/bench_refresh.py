@@ -188,7 +188,7 @@ def main():
             try:
                 m = load_mid(spec)
             except Exception as e:  # noqa: BLE001
-                print(f"[{spec}] load failed: {type(e).__name__}: {str(e)[:300]}", flush=True)
+                print(f"[{spec}] load failed: {type(e).__name__}: {e}", flush=True)   # full text (build logs)
                 continue
             print(f"[{spec}] linear layer class: {type(m.model.layers[0].mlp.down_proj).__module__}."
                   f"{type(m.model.layers[0].mlp.down_proj).__name__}", flush=True)

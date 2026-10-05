@@ -23,5 +23,6 @@ L=/scratch-shared/$USER/hspec_lagft/drafter_lag16
 # gptqmodel JIT-compiles its Marlin kernels on first use: needs nvcc (take the one pip installed into the vLLM venv)
 NVCC=$(find "$HOME/venvs/vllm" -type f -name nvcc -path "*bin*" 2>/dev/null | head -1)
 if [ -n "$NVCC" ]; then export CUDA_HOME=$(dirname "$(dirname "$NVCC")"); export PATH="$CUDA_HOME/bin:$PATH"; fi
-echo "CUDA_HOME=${CUDA_HOME:-unset}"
-python scripts/bench_refresh.py --only-copies --copies hf:Qwen/Qwen3-8B-AWQ 2>&1 | $F
+export TORCH_CUDA_ARCH_LIST="8.0" MAX_JOBS=8
+echo "CUDA_HOME=${CUDA_HOME:-unset}"; ls "$CUDA_HOME/include" | head -5; gcc --version | head -1
+python scripts/bench_refresh.py --only-copies --copies hf:Qwen/Qwen3-8B-AWQ 2>&1 | grep --line-buffered -v -i 'warn\|pytree'
