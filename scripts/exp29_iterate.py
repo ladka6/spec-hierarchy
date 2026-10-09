@@ -90,6 +90,7 @@ def main():
     span = D + K * bs                                  # longest chain the round can build
 
     rec = defaultdict(list)                            # k -> [(tau_chain, tau_tree, nodes, chain_len)]
+    traj = []                                          # per anchor: [(chain_len, accepted, full_agree, conf)] per iteration
     base, agree = [], []
     for d in args.datasets:
         for p in load_prompts(d, args.n):
@@ -118,6 +119,8 @@ def main():
                 C = lg.argmax(-1).tolist()
                 base.append(matched(C, truth) + 1)
                 chains = [C]
+                conf0 = float(torch.softmax(lg.float(), -1).max(-1).values.mean())
+                states = [(len(C), matched(C, truth) + 1, False, conf0)]
                 for it in range(1, K + 1):
                     z = torch.cat([x[: s + 1], torch.tensor(C, device=x.device)])
                     new = z[s:]                                       # x_s + chain, positions s .. s+len(C)
@@ -132,11 +135,15 @@ def main():
                     ctx = torch.cat([feats[:, :s], pz[:, : j + 1]], 1)
                     zc = torch.cat([z[: s + j + 1], torch.tensor([pred[j]], device=x.device)])
                     L = blocks_logits(draft, target, ctx, zc, [(s + j + 1, 0)], bs)
+                    full = j == len(C)
                     C = (C[:j] + [pred[j]] + L[0].argmax(-1).tolist())[:span]
                     chains.append(C)
+                    states.append((len(C), matched(C, truth) + 1, full,
+                                   float(torch.softmax(L[0].float(), -1).max(-1).values.mean())))
                     if it in args.ks:
                         rec[it].append((matched(C, truth) + 1, max(matched(c, truth) for c in chains) + 1,
                                         tree_nodes(chains), len(C)))
+                traj.append(states)
             del ccache
             log(f"[{d}] {len(base)} anchors")
 
@@ -165,7 +172,54 @@ def main():
                                  "round_ms": t, "x_vs_dflash": row[f"tau_{mode}"] / t / r0})
     print_table(crow, ["engine", "copy_ms", "k", "verify", "round_ms", "x_vs_dflash"],
                 "estimated speedup over plain DFlash (measured stage costs)")
-    save_json(args.out, {"args": vars(args), "rows": rows, "costs": crow, "agree": mean(agree)})
+    # stopping rules: decide after each iteration whether to stop (iteration 0 = block 1 only, never stop
+    # before 1 iteration). Cost per round: (k+1) drafter + k copy passes (each over ~16 new tokens with a
+    # cached prefix) + one chain verify.
+    def stop_at(st, rule):
+        kmax = len(st) - 1
+        for k in range(1, kmax + 1):
+            ln, _, full, conf = st[k]
+            if rule[0] == "fixed" and k >= rule[1]:
+                return k
+            if rule[0] == "agree" and (full or k >= rule[1]):
+                return k
+            if rule[0] == "len" and (ln >= rule[1] or k >= rule[2]):
+                return k
+            if rule[0] == "conf" and (conf < rule[1] or k >= rule[2]):
+                return k
+            if rule[0] == "agree+len" and (full or ln >= rule[1] or k >= rule[2]):
+                return k
+        return kmax
+
+    rules = [("fixed", k) for k in range(1, K + 1)] + [("agree", K)] + \
+        [("len", L, K) for L in (32, 40, 48, 64)] + [("conf", c, K) for c in (0.5, 0.6, 0.7, 0.8)] + \
+        [("agree+len", L, K) for L in (40, 48)]
+    srows = []
+    for eng, (dd, ps, vt) in costs.items():
+        t_plain = dd + interp(vt, 16)
+        for p in ps:
+            for rule in rules:
+                tok = tim = ks = 0.0
+                for st in traj:
+                    k = stop_at(st, rule)
+                    tok += st[k][1]
+                    ks += k
+                    tim += (k + 1) * dd + k * p + interp(vt, st[k][0] + 1)
+                plain = sum(st[0][1] for st in traj) / (len(traj) * t_plain)
+                srows.append({"engine": eng, "copy_ms": p, "rule": "/".join(str(r) for r in rule),
+                              "mean_k": ks / len(traj), "tau": tok / len(traj),
+                              "x_vs_dflash": (tok / tim) / plain})
+    best = {}
+    for r in srows:
+        key = (r["engine"], r["copy_ms"])
+        if key not in best or r["x_vs_dflash"] > best[key]["x_vs_dflash"]:
+            best[key] = r
+    print_table(srows, ["engine", "copy_ms", "rule", "mean_k", "tau", "x_vs_dflash"],
+                "stopping rules (fixed k / stop on full copy agreement / chain length budget / low drafter "
+                "confidence)")
+    print_table(list(best.values()), ["engine", "copy_ms", "rule", "mean_k", "tau", "x_vs_dflash"],
+                "best rule per engine and copy cost")
+    save_json(args.out, {"args": vars(args), "rows": rows, "costs": crow, "agree": mean(agree), "rules": srows})
 
 
 if __name__ == "__main__":

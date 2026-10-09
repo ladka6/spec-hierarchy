@@ -21,5 +21,5 @@ mkdir -p "$HSPEC_RESULTS"
 F="grep --line-buffered -v -i warn"
 L=/scratch-shared/$USER/hspec_lagft/drafter_lag16
 for T in 0.0 1.0; do
-  python scripts/exp29_iterate.py --copy bnb4:Qwen/Qwen3-8B --ks 1 2 3 4 --temp $T --out exp29_iterate_t$T 2>&1 | $F
+  python scripts/exp29_iterate.py --copy bnb4:Qwen/Qwen3-8B --ks 1 2 3 4 5 6 --temp $T --out exp29_rules_t$T 2>&1 | $F
 done
