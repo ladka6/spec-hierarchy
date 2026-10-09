@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=18
-#SBATCH --time=05:00:00
+#SBATCH --time=08:00:00
 #SBATCH --output=iterate-%j.out
 # exp29: k refresh iterations (drafter -> 4-bit copy -> drafter ...) before one target verify; chain vs tree verify; cost model.
 set -uo pipefail

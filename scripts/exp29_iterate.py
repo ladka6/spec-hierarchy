@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -33,13 +34,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from dflash.model import extract_context_feature  # noqa: E402
+from dflash.model import _make_cache, extract_context_feature  # noqa: E402
 from exp27_refresh import blocks_logits, matched, tree_nodes  # noqa: E402
 
 from hspec.data import encode, load_prompts, stop_ids  # noqa: E402
 from hspec.lagtrain import draft_logits_lagged  # noqa: E402
 from hspec.models import load_draft, load_mid, load_target, load_tokenizer  # noqa: E402
-from hspec.pipeline import two_stage_generate  # noqa: E402
+from hspec.pipeline import crop, two_stage_generate  # noqa: E402
 from hspec.utils import mean, print_table, save_json  # noqa: E402
 
 VLLM_V = [(1, 12.7), (16, 13.3), (32, 14.1), (64, 14.2), (128, 15.8), (256, 19.0)]
@@ -70,10 +71,18 @@ def main():
     args = ap.parse_args()
     torch.manual_seed(args.seed)
 
+    t0 = time.time()
+
+    def log(msg):
+        print(f"[{time.time() - t0:7.0f}s] {msg}", flush=True)
+
     tok = load_tokenizer(args.target)
     target = load_target(args.target)
+    log("target loaded")
     draft = load_draft(args.draft)
+    log("drafter loaded")
     copy = load_mid(args.copy)
+    log("copy loaded")
     stops = stop_ids(target, tok)
     bs = draft.block_size
     D = bs - 1
@@ -96,7 +105,14 @@ def main():
             # per-token agreement of the copy with the trajectory (generated part)
             cl = copy(x[None]).logits[0, n0 - 1 : -1].argmax(-1)
             agree.append(float((cl == x[n0:]).float().mean()))
+            # copy KV cache over the true text, extended anchor by anchor (iterations only add new tokens)
+            ccache = _make_cache(copy.config)
+            c_len = 0
             for s in range(n0, len(x) - span - 2, args.stride):
+                if c_len < s:
+                    copy(x[None, c_len:s], position_ids=torch.arange(c_len, s, device=x.device)[None],
+                         past_key_values=ccache, use_cache=True, logits_to_keep=1)
+                    c_len = s
                 truth = x[s + 1 : s + 1 + span].tolist()
                 lg = draft_logits_lagged(draft, target, feats, x, s, 0, bs)
                 C = lg.argmax(-1).tolist()
@@ -104,12 +120,16 @@ def main():
                 chains = [C]
                 for it in range(1, K + 1):
                     z = torch.cat([x[: s + 1], torch.tensor(C, device=x.device)])
-                    co = copy(z[None], output_hidden_states=True, logits_to_keep=len(C) + 1)
+                    new = z[s:]                                       # x_s + chain, positions s .. s+len(C)
+                    co = copy(new[None], position_ids=torch.arange(s, s + len(new), device=x.device)[None],
+                              past_key_values=ccache, use_cache=True, output_hidden_states=True,
+                              logits_to_keep=len(new))
                     pz = extract_context_feature(co.hidden_states, draft.target_layer_ids).to(feats.dtype)
                     pred = co.logits[0].argmax(-1).tolist()          # predictions for s+1 .. s+len(C)+1
                     del co
+                    crop(ccache, s)
                     j = next((i for i in range(len(C)) if pred[i] != C[i]), len(C))
-                    ctx = torch.cat([feats[:, :s], pz[:, s : s + j + 1]], 1)
+                    ctx = torch.cat([feats[:, :s], pz[:, : j + 1]], 1)
                     zc = torch.cat([z[: s + j + 1], torch.tensor([pred[j]], device=x.device)])
                     L = blocks_logits(draft, target, ctx, zc, [(s + j + 1, 0)], bs)
                     C = (C[:j] + [pred[j]] + L[0].argmax(-1).tolist())[:span]
@@ -117,7 +137,8 @@ def main():
                     if it in args.ks:
                         rec[it].append((matched(C, truth) + 1, max(matched(c, truth) for c in chains) + 1,
                                         tree_nodes(chains), len(C)))
-            print(f"[{d}] {len(base)} anchors", flush=True)
+            del ccache
+            log(f"[{d}] {len(base)} anchors")
 
     tau0 = mean(base)
     rows = [{"k": 0, "tau_chain": tau0, "tau_tree": tau0, "chain_len": D, "tree_nodes": D}]
