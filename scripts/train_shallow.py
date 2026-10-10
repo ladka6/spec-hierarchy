@@ -57,9 +57,16 @@ def main():
     ap.add_argument("--max-train", type=int, default=0)
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--train-drafter", action="store_true", help="also fine-tune the drafter (fp32 master weights)")
+    ap.add_argument("--draft-lr", type=float, default=3e-5)
+    ap.add_argument("--p-zero", type=float, default=0.25,
+                    help="with --train-drafter: share of blocks with real features only (keeps normal drafting)")
+    ap.add_argument("--freeze-adapter", action="store_true",
+                    help="keep the adapter at its zero init (missing slices = h_k): drafter-only control")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
-    tag = f"k{args.exit}_a{args.adapter_layers}"
+    tag = f"k{args.exit}_a{args.adapter_layers}" + ("_joint" if args.train_drafter else "") + \
+        ("_noadapt" if args.freeze_adapter else "")
 
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
@@ -77,13 +84,28 @@ def main():
     target.requires_grad_(False)
     draft = load_draft(args.draft)
     draft.requires_grad_(False)
+    if args.train_drafter:
+        draft.float()
+        draft.requires_grad_(True)
+        draft.train()
     lids = list(draft.target_layer_ids)
     adapter = ShallowAdapter(target, lids, args.exit, args.adapter_layers).to(args.device)
+    if args.freeze_adapter:
+        adapter.requires_grad_(False)
     params = [p for p in adapter.parameters() if p.requires_grad]
+    dparams = [p for p in draft.parameters() if p.requires_grad]
     print(f"[{tag}] exact slices: {[l for j, l in enumerate(lids) if j not in adapter.missing]}, "
           f"predicted: {[lids[j] for j in adapter.missing]}; adapter {sum(p.numel() for p in params) / 1e6:.0f} M "
           f"params", flush=True)
-    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0, betas=(0.9, 0.95))
+    groups = ([{"params": params, "lr": args.lr}] if params else []) + \
+        ([{"params": dparams, "lr": args.draft_lr}] if dparams else [])
+    if args.device == "cpu":
+        opt = torch.optim.AdamW(groups, weight_decay=0.0, betas=(0.9, 0.95))
+    else:
+        import bitsandbytes as bnb
+        opt = bnb.optim.AdamW8bit(groups, weight_decay=0.0, betas=(0.9, 0.95))
+    print(f"[{tag}] trainable: adapter {sum(p.numel() for p in params) / 1e6:.0f} M, "
+          f"drafter {sum(p.numel() for p in dparams) / 1e6:.0f} M", flush=True)
     total = int(len(train) * args.epochs / args.batch)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / args.warmup) * 0.5 * (1 + math.cos(math.pi * min(s, total) / total)))
@@ -106,6 +128,8 @@ def main():
         out = []
         for _ in range(n):
             g = lag if lag is not None else r.randint(1, args.max_lag)
+            if lag is None and args.train_drafter and r.random() < args.p_zero:
+                g = 0
             lo, hi = max(d["n_prompt"], g + 1), T - 2
             if hi <= lo:
                 continue
@@ -116,6 +140,7 @@ def main():
 
     def evaluate(step):
         adapter.eval()
+        draft.eval()
         res = {}
         with torch.no_grad():
             for lag in (4, 8, 16):
@@ -141,6 +166,8 @@ def main():
                 res[lag]["agree"] = sum(agree) / len(agree)
                 res[lag]["cos"] = sum(cos) / len(cos)
         adapter.train()
+        if args.train_drafter:
+            draft.train()
         history.append({"step": step, "val": res})
         msg = " | ".join(f"lag{g}: tau real {v['real']:.2f} shallow {v['shallow']:.2f} adapter {v['adapter']:.2f}"
                          f" agree {v['agree']:.3f} cos {v['cos']:.3f}" for g, v in res.items())
@@ -167,13 +194,16 @@ def main():
                 missing, final, alt = run_adapter(hs, len(ids))
                 ld, _ = drafter_block_loss(draft, target, real, alt, ids, blocks, bs, args.gamma)
                 rows = torch.tensor(sorted({t for s, g in blocks for t in range(s - g, s)}), device=ids.device)
-                lf, lp, ag = adapter_aux(adapter, target, missing, final, hs, tp, rows)
+                if len(rows) and not args.freeze_adapter:
+                    lf, lp, ag = adapter_aux(adapter, target, missing, final, hs, tp, rows)
+                else:
+                    lf = lp = ag = torch.zeros((), device=ids.device)
                 loss = ld + args.lam_feat * lf + args.lam_pred * lp
                 (loss / args.batch).backward()
                 for k, v in (("draft", ld), ("feat", lf), ("pred", lp), ("agree", ag)):
                     acc[k] += float(v)
                 n += 1
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            torch.nn.utils.clip_grad_norm_(params + dparams, 1.0)
             opt.step()
             sched.step()
             step += 1
@@ -186,6 +216,8 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     torch.save({"args": vars(args), "state": adapter.state_dict()}, out / "adapter.pt")
+    if args.train_drafter:
+        draft.to(torch.bfloat16).save_pretrained(out / "drafter")
     (out / "history.json").write_text(json.dumps({"args": vars(args), "history": history}, indent=1))
     print(f"[{tag}] saved to {out}", flush=True)
 

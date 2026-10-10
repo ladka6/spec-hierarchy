@@ -124,8 +124,9 @@ def drafter_block_loss(draft, head_src, real, alt, ids, blocks, bs, gamma=0.9):
     """Gamma-weighted CE of the drafter on depth-lagged blocks + per-block correctness rows."""
     T = ids.shape[0]
     ctx, noise, pos, mask, starts = pack_alt(draft, head_src, real, alt, ids, blocks, bs)
-    hid = draft(target_hidden=ctx, noise_embedding=noise, position_ids=pos, attention_mask=mask,
-                past_key_values=None, use_cache=False)[0]
+    ddt = next(draft.parameters()).dtype              # fp32 when the drafter is being trained
+    hid = draft(target_hidden=ctx.to(ddt), noise_embedding=noise.to(ddt), position_ids=pos, attention_mask=mask,
+                past_key_values=None, use_cache=False)[0].to(_output_head(head_src).weight.dtype)
     rows, labels, weights, where = [], [], [], []
     for b, ((s, _g), st) in enumerate(zip(blocks, starts)):
         for k in range(1, bs):
