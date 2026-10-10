@@ -60,6 +60,12 @@ def main():
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
     ap.add_argument("--draft", default="z-lab/Qwen3-8B-DFlash-b16")
     ap.add_argument("--copy", default="bnb4:Qwen/Qwen3-8B")
+    ap.add_argument("--small", default=None,
+                    help="estimated states instead of a copy: small same-family model + mapper (hspec/smallmap.py)")
+    ap.add_argument("--mapper", default=None, help="trained mapper.pt (train_shallow --small); else a ridge fit")
+    ap.add_argument("--data", default=None, help="training sequences for the ridge fit (no --mapper)")
+    ap.add_argument("--ridge-seqs", type=int, default=400)
+    ap.add_argument("--n-sel", type=int, default=6)
     ap.add_argument("--datasets", nargs="+", default=["gsm8k", "math500", "humaneval", "mt-bench"])
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--max-new", type=int, default=512)
@@ -81,8 +87,36 @@ def main():
     log("target loaded")
     draft = load_draft(args.draft)
     log("drafter loaded")
-    copy = load_mid(args.copy)
-    log("copy loaded")
+    mapper = None
+    if args.small:
+        from hspec.smallmap import SmallMapper, ridge_fit, small_layers
+        dev = next(target.parameters()).device
+        copy = load_target(args.small)
+        if args.mapper:
+            ck = torch.load(args.mapper, map_location=dev)
+            sel = ck["layers"]
+            w = ck["state"]["lin.weight"]
+            mapper = SmallMapper(w.shape[1], w.shape[0], ck["args"]["map_hidden"]).to(dev)
+            mapper.load_state_dict(ck["state"])
+        else:
+            import random as _r
+            from pathlib import Path as _P
+            seqs = []
+            for f in sorted(_P(args.data).glob("shard*.pt")):
+                seqs += torch.load(f)
+            seqs = [q for q in seqs if len(q["ids"]) <= 1024]
+            _r.Random(0).shuffle(seqs)
+            sel = small_layers(copy.config.num_hidden_layers, args.n_sel)
+            W_r, b_r = ridge_fit(copy, target, list(draft.target_layer_ids), sel, seqs[48 : 48 + args.ridge_seqs],
+                                 dev, log=log)
+            mapper = SmallMapper(W_r.shape[0], W_r.shape[1]).to(dev)
+            mapper.lin.weight.copy_(W_r.T)
+            mapper.lin.bias.copy_(b_r)
+        mapper.eval()
+        log(f"small model {args.small} + {'trained mapper' if args.mapper else 'ridge map'} (layers {sel})")
+    else:
+        copy = load_mid(args.copy)
+        log("copy loaded")
     stops = stop_ids(target, tok)
     bs = draft.block_size
     D = bs - 1
@@ -132,7 +166,11 @@ def main():
                     co = copy(new[None], position_ids=torch.arange(s, s + len(new), device=x.device)[None],
                               past_key_values=ccache, use_cache=True, output_hidden_states=True,
                               logits_to_keep=len(new))
-                    pz = extract_context_feature(co.hidden_states, draft.target_layer_ids).to(feats.dtype)
+                    if mapper is not None:     # estimated target states from the small model
+                        hc = torch.cat([co.hidden_states[i][0] for i in sel], -1).float()
+                        pz = mapper(hc)[None].to(feats.dtype)
+                    else:
+                        pz = extract_context_feature(co.hidden_states, draft.target_layer_ids).to(feats.dtype)
                     cpr = torch.softmax(co.logits[0].float(), -1).max(-1).values
                     cmean = float(cpr[:-1].mean())                   # over the chain being checked
                     pred = co.logits[0].argmax(-1).tolist()          # predictions for s+1 .. s+len(C)+1
