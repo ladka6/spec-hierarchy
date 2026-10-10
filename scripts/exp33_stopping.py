@@ -127,6 +127,21 @@ def main():
                 if name not in ("oracle",) and (best is None or thr > best[1]):
                     best = (name, thr)
             print(f"best non-oracle: {best[0]} ({best[1] / base:.3f}x)")
+    # per held-out dataset (vLLM, copy 3 ms): does the learned rule generalise to every domain?
+    dd, ps, vt = ENGINES["vLLM"]
+    p = ps[0]
+    print("\n== per dataset, vLLM, copy 3 ms (x vs plain DFlash on that dataset; learned rule never saw it) ==")
+    print(f"{'dataset':12s} {'anchors':>7s} {'best_conf':>10s} {'x_conf':>7s} {'x_learned':>9s} {'x_oracle':>8s} "
+          f"{'learned/oracle gain':>20s}")
+    for d in dsets:
+        sub = [st for st in traj if st[0][-1] == d]
+        base = solve(sub, dd, p, vt, p_fixed(0))[0]
+        confs = [(c, solve(sub, dd, p, vt, p_conf(c))[0]) for c in (0.5, 0.6, 0.7, 0.8, 0.85, 0.9)]
+        bc, bthr = max(confs, key=lambda z: z[1])
+        xl = solve(sub, dd, p, vt, p_learned)[0] / base
+        xo = solve(sub, dd, p, vt, p_oracle)[0] / base
+        share = (xl - 1) / (xo - 1) if xo > 1 else float("nan")
+        print(f"{d:12s} {len(sub):7d} {bc:10.2f} {bthr / base:7.3f} {xl:9.3f} {xo:8.3f} {share:20.2f}")
 
 
 if __name__ == "__main__":
