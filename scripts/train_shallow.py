@@ -1,0 +1,194 @@
+"""Train the shallow-feature adapter (hspec/shallow.py): target's first k layers + adapter as the
+drafter's feature source for recently drafted positions. Target and drafter frozen.
+
+Loss = drafter CE on depth-lagged blocks (real features up to s-g, adapter features for the
+last g positions; g uniform in 1..max-lag) + lam_feat * (1 - cos) to the real feature slices
++ lam_pred * CE of the adapter's next-token prediction against the target's greedy token.
+
+Validation (held-out sequences, lags 4 / 8 / 16): tau (accepted tokens per block, greedy) with
+  real     the target's real features for the lagged positions (ceiling)
+  shallow  only the exact shallow slices, deep slices zeroed (no adapter, floor)
+  adapter  shallow + adapter
+plus the adapter's token agreement with the target (the copy's was 0.969 at T=0) and mean cosine.
+
+  python scripts/train_shallow.py --exit 12 --adapter-layers 2 --data .../hspec_lagft/data --out .../k12_a2
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+import sys
+import time
+from pathlib import Path
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from dflash.model import extract_context_feature  # noqa: E402
+
+from hspec.fusion import accepted  # noqa: E402
+from hspec.models import load_draft, load_target  # noqa: E402
+from hspec.shallow import ShallowAdapter, adapter_aux, assemble, drafter_block_loss  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--target", default="Qwen/Qwen3-8B")
+    ap.add_argument("--draft", default="z-lab/Qwen3-8B-DFlash-b16")
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--exit", type=int, default=12, help="number of target layers run in the refresh pass")
+    ap.add_argument("--adapter-layers", type=int, default=2, help="trainable layers from target k.. (0 = MLP)")
+    ap.add_argument("--max-lag", type=int, default=16)
+    ap.add_argument("--blocks", type=int, default=16, help="blocks per sequence")
+    ap.add_argument("--batch", type=int, default=4)
+    ap.add_argument("--epochs", type=float, default=2.0)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--warmup", type=int, default=100)
+    ap.add_argument("--lam-feat", type=float, default=1.0)
+    ap.add_argument("--lam-pred", type=float, default=0.5)
+    ap.add_argument("--gamma", type=float, default=0.9)
+    ap.add_argument("--max-len", type=int, default=1024)
+    ap.add_argument("--val-seqs", type=int, default=48)
+    ap.add_argument("--max-train", type=int, default=0)
+    ap.add_argument("--eval-every", type=int, default=250)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--device", default="cuda")
+    args = ap.parse_args()
+    tag = f"k{args.exit}_a{args.adapter_layers}"
+
+    torch.manual_seed(args.seed)
+    rng = random.Random(args.seed)
+    data = []
+    for f in sorted(Path(args.data).glob("shard*.pt")):
+        data += torch.load(f)
+    data = [d for d in data if len(d["ids"]) <= args.max_len]
+    rng.shuffle(data)
+    val, train = data[: args.val_seqs], data[args.val_seqs :]
+    if args.max_train:
+        train = train[: args.max_train]
+    print(f"[{tag}] {len(train)} train / {len(val)} val sequences", flush=True)
+
+    target = load_target(args.target)
+    target.requires_grad_(False)
+    draft = load_draft(args.draft)
+    draft.requires_grad_(False)
+    lids = list(draft.target_layer_ids)
+    adapter = ShallowAdapter(target, lids, args.exit, args.adapter_layers).to(args.device)
+    params = [p for p in adapter.parameters() if p.requires_grad]
+    print(f"[{tag}] exact slices: {[l for j, l in enumerate(lids) if j not in adapter.missing]}, "
+          f"predicted: {[lids[j] for j in adapter.missing]}; adapter {sum(p.numel() for p in params) / 1e6:.0f} M "
+          f"params", flush=True)
+    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0, betas=(0.9, 0.95))
+    total = int(len(train) * args.epochs / args.batch)
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, lambda s: min(1.0, (s + 1) / args.warmup) * 0.5 * (1 + math.cos(math.pi * min(s, total) / total)))
+    bs = draft.block_size
+    rotary = target.model.rotary_emb
+
+    def target_pass(ids):
+        with torch.no_grad():
+            out = target(ids[None], output_hidden_states=True)
+            hs = out.hidden_states
+            return hs, extract_context_feature(hs, lids), out.logits[0].argmax(-1)
+
+    def run_adapter(hs, T):
+        pos = torch.arange(T, device=args.device)[None]
+        missing, final = adapter(hs[args.exit], rotary, pos)
+        return missing, final, assemble(hs, lids, args.exit, missing)
+
+    def blocks_of(d, n, r, lag=None):
+        T = len(d["ids"])
+        out = []
+        for _ in range(n):
+            g = lag if lag is not None else r.randint(1, args.max_lag)
+            lo, hi = max(d["n_prompt"], g + 1), T - 2
+            if hi <= lo:
+                continue
+            out.append((r.randrange(lo, hi), g))
+        return out
+
+    history = []
+
+    def evaluate(step):
+        adapter.eval()
+        res = {}
+        with torch.no_grad():
+            for lag in (4, 8, 16):
+                vrng = random.Random(123)
+                taus = {"real": [], "shallow": [], "adapter": []}
+                agree, cos = [], []
+                for d in val:
+                    ids = d["ids"].long().to(args.device)
+                    blocks = blocks_of(d, 8, vrng, lag)
+                    if not blocks:
+                        continue
+                    hs, real, tp = target_pass(ids)
+                    missing, final, alt = run_adapter(hs, len(ids))
+                    zero = assemble(hs, lids, args.exit, [torch.zeros_like(m) for m in missing])
+                    rows = torch.tensor(sorted({t for s, g in blocks for t in range(s - g, s)}), device=ids.device)
+                    fl, _, ag = adapter_aux(adapter, target, missing, final, hs, tp, rows)
+                    agree.append(float(ag))
+                    cos.append(1 - float(fl))
+                    for name, src in (("real", real), ("shallow", zero), ("adapter", alt)):
+                        _, correct = drafter_block_loss(draft, target, real, src, ids, blocks, bs, args.gamma)
+                        taus[name] += [accepted(r) for r in correct if None not in r]
+                res[lag] = {k: sum(v) / max(len(v), 1) for k, v in taus.items()}
+                res[lag]["agree"] = sum(agree) / len(agree)
+                res[lag]["cos"] = sum(cos) / len(cos)
+        adapter.train()
+        history.append({"step": step, "val": res})
+        msg = " | ".join(f"lag{g}: tau real {v['real']:.2f} shallow {v['shallow']:.2f} adapter {v['adapter']:.2f}"
+                         f" agree {v['agree']:.3f} cos {v['cos']:.3f}" for g, v in res.items())
+        print(f"[{tag} step {step}] {msg}", flush=True)
+
+    evaluate(0)
+    step, t0 = 0, time.time()
+    order = list(range(len(train)))
+    while step < total:
+        rng.shuffle(order)
+        for i in range(0, len(order) - args.batch + 1, args.batch):
+            if step >= total:
+                break
+            opt.zero_grad(set_to_none=True)
+            acc = {"draft": 0.0, "feat": 0.0, "pred": 0.0, "agree": 0.0}
+            n = 0
+            for j in order[i : i + args.batch]:
+                d = train[j]
+                ids = d["ids"].long().to(args.device)
+                blocks = blocks_of(d, args.blocks, rng)
+                if not blocks:
+                    continue
+                hs, real, tp = target_pass(ids)
+                missing, final, alt = run_adapter(hs, len(ids))
+                ld, _ = drafter_block_loss(draft, target, real, alt, ids, blocks, bs, args.gamma)
+                rows = torch.tensor(sorted({t for s, g in blocks for t in range(s - g, s)}), device=ids.device)
+                lf, lp, ag = adapter_aux(adapter, target, missing, final, hs, tp, rows)
+                loss = ld + args.lam_feat * lf + args.lam_pred * lp
+                (loss / args.batch).backward()
+                for k, v in (("draft", ld), ("feat", lf), ("pred", lp), ("agree", ag)):
+                    acc[k] += float(v)
+                n += 1
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
+            sched.step()
+            step += 1
+            if step % 50 == 0:
+                print(f"[{tag} step {step}/{total}] " + " ".join(f"{k} {v / max(n, 1):.3f}" for k, v in acc.items())
+                      + f" {(time.time() - t0) / step:.2f}s/step", flush=True)
+            if step % args.eval_every == 0:
+                evaluate(step)
+    evaluate(step)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    torch.save({"args": vars(args), "state": adapter.state_dict()}, out / "adapter.pt")
+    (out / "history.json").write_text(json.dumps({"args": vars(args), "history": history}, indent=1))
+    print(f"[{tag}] saved to {out}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
