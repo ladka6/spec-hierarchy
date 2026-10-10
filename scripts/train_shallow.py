@@ -67,12 +67,20 @@ def main():
                     help="full-depth low-bit copy as the source instead of shallow layers + adapter "
                          "(load_mid spec, e.g. rtn2:Qwen/Qwen3-8B); the adapter is not used")
     ap.add_argument("--copy-device", default="cuda:1")
+    ap.add_argument("--small", default=None,
+                    help="small same-family model (e.g. Qwen/Qwen3-0.6B) + mapper as the source (proposal 1)")
+    ap.add_argument("--n-sel", type=int, default=6, help="small-model layers fed to the mapper")
+    ap.add_argument("--ridge-seqs", type=int, default=400, help="training sequences for the ridge init")
+    ap.add_argument("--map-hidden", type=int, default=2048)
+    ap.add_argument("--map-lr", type=float, default=1e-4)
+    ap.add_argument("--freeze-map", action="store_true", help="keep the mapper at its ridge init")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
-    if args.copy:
+    if args.copy or args.small:
         args.freeze_adapter = True
-    tag = (args.copy.split(":")[0] if args.copy else f"k{args.exit}_a{args.adapter_layers}") + \
-        ("_joint" if args.train_drafter else "") + ("_noadapt" if args.freeze_adapter and not args.copy else "")
+    tag = (args.copy.split(":")[0] if args.copy else args.small.split("/")[-1] + ("_ridge" if args.freeze_map else "")
+           if args.small else f"k{args.exit}_a{args.adapter_layers}") + \
+        ("_joint" if args.train_drafter else "") + ("_noadapt" if args.freeze_adapter and not (args.copy or args.small) else "")
 
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
@@ -100,7 +108,23 @@ def main():
         from hspec.models import load_mid
         copy = load_mid(args.copy, args.copy_device)
         copy.requires_grad_(False)
-    if copy is not None:              # unused placeholder: all slices "exact", no layers
+    small = mapper = None
+    if args.small:
+        from hspec.smallmap import SmallMapper, ridge_fit, small_inputs, small_layers
+        small = load_target(args.small, args.device)
+        small.requires_grad_(False)
+        sel = small_layers(small.config.num_hidden_layers, args.n_sel)
+        with torch.no_grad():
+            W_r, b_r = ridge_fit(small, target, lids, sel, train[: args.ridge_seqs], args.device,
+                                 log=lambda m: print(f"[{tag}] {m}", flush=True))
+        mapper = SmallMapper(W_r.shape[0], W_r.shape[1], args.map_hidden).to(args.device)
+        with torch.no_grad():
+            mapper.lin.weight.copy_(W_r.T)
+            mapper.lin.bias.copy_(b_r)
+        mapper.requires_grad_(not args.freeze_map)
+        print(f"[{tag}] small model layers {sel}, mapper {sum(p.numel() for p in mapper.parameters()) / 1e6:.0f} M "
+              f"params", flush=True)
+    if copy is not None or small is not None:   # unused placeholder: all slices "exact", no layers
         args.exit, args.adapter_layers = target.config.num_hidden_layers, 0
     adapter = ShallowAdapter(target, lids, args.exit, args.adapter_layers).to(args.device)
     if args.freeze_adapter:
@@ -110,8 +134,11 @@ def main():
     print(f"[{tag}] exact slices: {[l for j, l in enumerate(lids) if j not in adapter.missing]}, "
           f"predicted: {[lids[j] for j in adapter.missing]}; adapter {sum(p.numel() for p in params) / 1e6:.0f} M "
           f"params", flush=True)
+    mparams = [p for p in mapper.parameters() if p.requires_grad] if mapper is not None else []
     groups = ([{"params": params, "lr": args.lr}] if params else []) + \
-        ([{"params": dparams, "lr": args.draft_lr}] if dparams else [])
+        ([{"params": dparams, "lr": args.draft_lr}] if dparams else []) + \
+        ([{"params": mparams, "lr": args.map_lr}] if mparams else [])
+    params = params + mparams
     if not groups:
         opt = torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=0.0)   # placeholder: evaluation only
     elif args.device == "cpu":
@@ -126,6 +153,7 @@ def main():
         opt, lambda s: min(1.0, (s + 1) / args.warmup) * 0.5 * (1 + math.cos(math.pi * min(s, total) / total)))
     bs = draft.block_size
     rotary = target.model.rotary_emb
+    H_t = target.config.hidden_size
 
     def target_pass(ids):
         with torch.no_grad():
@@ -133,9 +161,16 @@ def main():
             hs = out.hidden_states
             return hs, extract_context_feature(hs, lids), out.logits[0].argmax(-1)
 
+    ridge_cache = {}
+
     def run_adapter(hs, T, ids=None):
         """(missing slices, final pre-norm state, assembled features); copy mode: ([], copy's greedy
         predictions, copy features)."""
+        if small is not None:
+            with torch.no_grad():
+                x, sp = small_inputs(small, ids, sel)
+            ridge_cache["x"] = x
+            return [], sp, mapper(x)[None]
         if copy is not None:
             with torch.no_grad():
                 co = copy(ids.to(args.copy_device)[None], output_hidden_states=True)
@@ -177,8 +212,9 @@ def main():
                     hs, real, tp = target_pass(ids)
                     missing, final, alt = run_adapter(hs, len(ids), ids)
                     rows = torch.tensor(sorted({t for s, g in blocks for t in range(s - g, s)}), device=ids.device)
-                    if copy is not None:      # "shallow" column = copy features too (no shallow source)
-                        zero = alt
+                    if copy is not None or small is not None:
+                        # "shallow" column: copy features again (copy mode) / the ridge-init map (small mode)
+                        zero = alt if small is None else (ridge_cache["x"] @ W_r + b_r)[None]
                         agree.append(float((final[rows] == tp[rows]).float().mean()))
                         cos.append(float(torch.nn.functional.cosine_similarity(
                             alt[0, rows].float(), real[0, rows].float(), dim=-1).mean()))
@@ -225,7 +261,13 @@ def main():
                 missing, final, alt = run_adapter(hs, len(ids), ids)
                 ld, _ = drafter_block_loss(draft, target, real, alt, ids, blocks, bs, args.gamma)
                 rows = torch.tensor(sorted({t for s, g in blocks for t in range(s - g, s)}), device=ids.device)
-                if len(rows) and not args.freeze_adapter:
+                if len(rows) and small is not None and not args.freeze_map:
+                    lf = torch.stack([1 - torch.nn.functional.cosine_similarity(
+                        alt[0, rows, j * H_t : (j + 1) * H_t].float(), real[0, rows, j * H_t : (j + 1) * H_t].float(),
+                        dim=-1).mean() for j in range(len(lids))]).mean()
+                    lp = torch.zeros((), device=ids.device)
+                    ag = (final[rows] == tp[rows]).float().mean()
+                elif len(rows) and not args.freeze_adapter:
                     lf, lp, ag = adapter_aux(adapter, target, missing, final, hs, tp, rows)
                 else:
                     lf = lp = ag = torch.zeros((), device=ids.device)
@@ -247,6 +289,8 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     torch.save({"args": vars(args), "state": adapter.state_dict()}, out / "adapter.pt")
+    if mapper is not None:
+        torch.save({"args": vars(args), "layers": sel, "state": mapper.state_dict()}, out / "mapper.pt")
     if args.train_drafter:
         draft.to(torch.bfloat16).save_pretrained(out / "drafter")
     (out / "history.json").write_text(json.dumps({"args": vars(args), "history": history}, indent=1))
