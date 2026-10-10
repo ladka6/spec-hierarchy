@@ -66,6 +66,10 @@ def main():
     ap.add_argument("--data", default=None, help="training sequences for the ridge fit (no --mapper)")
     ap.add_argument("--ridge-seqs", type=int, default=400)
     ap.add_argument("--n-sel", type=int, default=6)
+    ap.add_argument("--corr", default="model",
+                    help="token inserted at the corrector's first disagreement j: model (corrector's argmax) | "
+                         "oracle (the target's true token: diagnostic) | none (no insert: restart from the draft's "
+                         "own token at j-1) | conf:<p> (corrector's token only if its prob >= p, else none)")
     ap.add_argument("--datasets", nargs="+", default=["gsm8k", "math500", "humaneval", "mt-bench"])
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--max-new", type=int, default=512)
@@ -177,11 +181,22 @@ def main():
                     del co
                     crop(ccache, s)
                     j = next((i for i in range(len(C)) if pred[i] != C[i]), len(C))
-                    ctx = torch.cat([feats[:, :s], pz[:, : j + 1]], 1)
-                    zc = torch.cat([z[: s + j + 1], torch.tensor([pred[j]], device=x.device)])
-                    L = blocks_logits(draft, target, ctx, zc, [(s + j + 1, 0)], bs)
                     full = j == len(C)
-                    C = (C[:j] + [pred[j]] + L[0].argmax(-1).tolist())[:span]
+                    mode = args.corr
+                    if mode.startswith("conf:"):
+                        mode = "model" if float(cpr[j]) >= float(mode[5:]) else "none"
+                    if mode == "none" and j == 0:
+                        mode = "model"                   # nothing to restart from: fall back to the corrector
+                    if mode == "none":                   # keep C[:j], re-anchor on the draft's own C[j-1]
+                        ctx = torch.cat([feats[:, :s], pz[:, :j]], 1)
+                        L = blocks_logits(draft, target, ctx, z[: s + j + 1], [(s + j, 0)], bs)
+                        C = (C[:j] + L[0].argmax(-1).tolist())[:span]
+                    else:
+                        tok_j = truth[j] if mode == "oracle" and j < len(truth) else pred[j]
+                        ctx = torch.cat([feats[:, :s], pz[:, : j + 1]], 1)
+                        zc = torch.cat([z[: s + j + 1], torch.tensor([tok_j], device=x.device)])
+                        L = blocks_logits(draft, target, ctx, zc, [(s + j + 1, 0)], bs)
+                        C = (C[:j] + [tok_j] + L[0].argmax(-1).tolist())[:span]
                     chains.append(C)
                     pl = torch.softmax(L[0].float(), -1).max(-1).values
                     states.append((len(C), matched(C, truth) + 1, full, float(pl.mean()), j, float(pl.min()),
