@@ -66,6 +66,10 @@ def main():
     ap.add_argument("--data", default=None, help="training sequences for the ridge fit (no --mapper)")
     ap.add_argument("--ridge-seqs", type=int, default=400)
     ap.add_argument("--n-sel", type=int, default=6)
+    ap.add_argument("--restart", default="corrector",
+                    help="where to restart the draft each refresh: corrector (first disagreement of the corrector's "
+                         "argmax with the draft) | dconf:<p> (first drafted token whose drafter confidence < p, "
+                         "nothing inserted; whole chain kept if none) | append (keep the whole chain, extend its end)")
     ap.add_argument("--corr", default="model",
                     help="token inserted at the corrector's first disagreement j: model (corrector's argmax) | "
                          "oracle (the target's true token: diagnostic) | none (no insert: restart from the draft's "
@@ -162,6 +166,7 @@ def main():
                 # (chain_len, accepted, full_agree, mean_conf, | extra features for learned stopping rules:)
                 # j (first copy disagreement, -1 at iteration 0), min conf of the new block,
                 # copy's prob. of its correction token, mean copy prob. over the chain, dataset
+                cc = pc0.tolist()                    # drafter confidence per chain token (kept aligned with C)
                 states = [(len(C), matched(C, truth) + 1, False, conf0, -1, float(pc0.min()), float("nan"),
                            float("nan"), d)]
                 for it in range(1, K + 1):
@@ -183,6 +188,13 @@ def main():
                     j = next((i for i in range(len(C)) if pred[i] != C[i]), len(C))
                     full = j == len(C)
                     mode = args.corr
+                    if args.restart != "corrector":      # restart point from the drafter, not the corrector
+                        if args.restart == "append":
+                            j = len(C)
+                        else:
+                            thr = float(args.restart.split(":")[1])
+                            j = next((i for i in range(1, len(C)) if cc[i] < thr), len(C))
+                        mode = "none"
                     if mode.startswith("conf:"):
                         mode = "model" if float(cpr[j]) >= float(mode[5:]) else "none"
                     if mode == "none" and j == 0:
@@ -191,12 +203,14 @@ def main():
                         ctx = torch.cat([feats[:, :s], pz[:, :j]], 1)
                         L = blocks_logits(draft, target, ctx, z[: s + j + 1], [(s + j, 0)], bs)
                         C = (C[:j] + L[0].argmax(-1).tolist())[:span]
+                        cc = (cc[:j] + torch.softmax(L[0].float(), -1).max(-1).values.tolist())[:span]
                     else:
                         tok_j = truth[j] if mode == "oracle" and j < len(truth) else pred[j]
                         ctx = torch.cat([feats[:, :s], pz[:, : j + 1]], 1)
                         zc = torch.cat([z[: s + j + 1], torch.tensor([tok_j], device=x.device)])
                         L = blocks_logits(draft, target, ctx, zc, [(s + j + 1, 0)], bs)
                         C = (C[:j] + [tok_j] + L[0].argmax(-1).tolist())[:span]
+                        cc = (cc[:j] + [1.0] + torch.softmax(L[0].float(), -1).max(-1).values.tolist())[:span]
                     chains.append(C)
                     pl = torch.softmax(L[0].float(), -1).max(-1).values
                     states.append((len(C), matched(C, truth) + 1, full, float(pl.mean()), j, float(pl.min()),

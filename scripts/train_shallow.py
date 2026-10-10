@@ -74,12 +74,14 @@ def main():
     ap.add_argument("--map-hidden", type=int, default=2048)
     ap.add_argument("--map-lr", type=float, default=1e-4)
     ap.add_argument("--freeze-map", action="store_true", help="keep the mapper at its ridge init")
+    ap.add_argument("--freeze-lin", action="store_true",
+                    help="keep the ridge linear map fixed, train only the zero-initialised residual MLP")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     if args.copy or args.small:
         args.freeze_adapter = True
     tag = (args.copy.split(":")[0] if args.copy else args.small.split("/")[-1] + ("_ridge" if args.freeze_map else "")
-           if args.small else f"k{args.exit}_a{args.adapter_layers}") + \
+           + ("_mlp" if args.freeze_lin else "") if args.small else f"k{args.exit}_a{args.adapter_layers}") + \
         ("_joint" if args.train_drafter else "") + ("_noadapt" if args.freeze_adapter and not (args.copy or args.small) else "")
 
     torch.manual_seed(args.seed)
@@ -122,6 +124,8 @@ def main():
             mapper.lin.weight.copy_(W_r.T)
             mapper.lin.bias.copy_(b_r)
         mapper.requires_grad_(not args.freeze_map)
+        if args.freeze_lin:
+            mapper.lin.requires_grad_(False)
         print(f"[{tag}] small model layers {sel}, mapper {sum(p.numel() for p in mapper.parameters()) / 1e6:.0f} M "
               f"params", flush=True)
     if copy is not None or small is not None:   # unused placeholder: all slices "exact", no layers
