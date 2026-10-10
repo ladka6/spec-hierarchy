@@ -119,8 +119,13 @@ def main():
                 C = lg.argmax(-1).tolist()
                 base.append(matched(C, truth) + 1)
                 chains = [C]
-                conf0 = float(torch.softmax(lg.float(), -1).max(-1).values.mean())
-                states = [(len(C), matched(C, truth) + 1, False, conf0)]
+                pc0 = torch.softmax(lg.float(), -1).max(-1).values
+                conf0 = float(pc0.mean())
+                # (chain_len, accepted, full_agree, mean_conf, | extra features for learned stopping rules:)
+                # j (first copy disagreement, -1 at iteration 0), min conf of the new block,
+                # copy's prob. of its correction token, mean copy prob. over the chain, dataset
+                states = [(len(C), matched(C, truth) + 1, False, conf0, -1, float(pc0.min()), float("nan"),
+                           float("nan"), d)]
                 for it in range(1, K + 1):
                     z = torch.cat([x[: s + 1], torch.tensor(C, device=x.device)])
                     new = z[s:]                                       # x_s + chain, positions s .. s+len(C)
@@ -128,6 +133,8 @@ def main():
                               past_key_values=ccache, use_cache=True, output_hidden_states=True,
                               logits_to_keep=len(new))
                     pz = extract_context_feature(co.hidden_states, draft.target_layer_ids).to(feats.dtype)
+                    cpr = torch.softmax(co.logits[0].float(), -1).max(-1).values
+                    cmean = float(cpr[:-1].mean())                   # over the chain being checked
                     pred = co.logits[0].argmax(-1).tolist()          # predictions for s+1 .. s+len(C)+1
                     del co
                     crop(ccache, s)
@@ -138,8 +145,9 @@ def main():
                     full = j == len(C)
                     C = (C[:j] + [pred[j]] + L[0].argmax(-1).tolist())[:span]
                     chains.append(C)
-                    states.append((len(C), matched(C, truth) + 1, full,
-                                   float(torch.softmax(L[0].float(), -1).max(-1).values.mean())))
+                    pl = torch.softmax(L[0].float(), -1).max(-1).values
+                    states.append((len(C), matched(C, truth) + 1, full, float(pl.mean()), j, float(pl.min()),
+                                   float(cpr[j]), cmean, d))
                     if it in args.ks:
                         rec[it].append((matched(C, truth) + 1, max(matched(c, truth) for c in chains) + 1,
                                         tree_nodes(chains), len(C)))
@@ -178,7 +186,7 @@ def main():
     def stop_at(st, rule):
         kmax = len(st) - 1
         for k in range(1, kmax + 1):
-            ln, _, full, conf = st[k]
+            ln, _, full, conf = st[k][:4]
             if rule[0] == "fixed" and k >= rule[1]:
                 return k
             if rule[0] == "agree" and (full or k >= rule[1]):
@@ -219,7 +227,8 @@ def main():
                 "confidence)")
     print_table(list(best.values()), ["engine", "copy_ms", "rule", "mean_k", "tau", "x_vs_dflash"],
                 "best rule per engine and copy cost")
-    save_json(args.out, {"args": vars(args), "rows": rows, "costs": crow, "agree": mean(agree), "rules": srows})
+    save_json(args.out, {"args": vars(args), "rows": rows, "costs": crow, "agree": mean(agree), "rules": srows,
+                         "traj": traj})
 
 
 if __name__ == "__main__":
