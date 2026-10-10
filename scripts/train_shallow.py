@@ -63,10 +63,16 @@ def main():
                     help="with --train-drafter: share of blocks with real features only (keeps normal drafting)")
     ap.add_argument("--freeze-adapter", action="store_true",
                     help="keep the adapter at its zero init (missing slices = h_k): drafter-only control")
+    ap.add_argument("--copy", default=None,
+                    help="full-depth low-bit copy as the source instead of shallow layers + adapter "
+                         "(load_mid spec, e.g. rtn2:Qwen/Qwen3-8B); the adapter is not used")
+    ap.add_argument("--copy-device", default="cuda:1")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
-    tag = f"k{args.exit}_a{args.adapter_layers}" + ("_joint" if args.train_drafter else "") + \
-        ("_noadapt" if args.freeze_adapter else "")
+    if args.copy:
+        args.freeze_adapter = True
+    tag = (args.copy.split(":")[0] if args.copy else f"k{args.exit}_a{args.adapter_layers}") + \
+        ("_joint" if args.train_drafter else "") + ("_noadapt" if args.freeze_adapter and not args.copy else "")
 
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
@@ -89,6 +95,13 @@ def main():
         draft.requires_grad_(True)
         draft.train()
     lids = list(draft.target_layer_ids)
+    copy = None
+    if args.copy:
+        from hspec.models import load_mid
+        copy = load_mid(args.copy, args.copy_device)
+        copy.requires_grad_(False)
+    if copy is not None:              # unused placeholder: all slices "exact", no layers
+        args.exit, args.adapter_layers = target.config.num_hidden_layers, 0
     adapter = ShallowAdapter(target, lids, args.exit, args.adapter_layers).to(args.device)
     if args.freeze_adapter:
         adapter.requires_grad_(False)
@@ -99,7 +112,9 @@ def main():
           f"params", flush=True)
     groups = ([{"params": params, "lr": args.lr}] if params else []) + \
         ([{"params": dparams, "lr": args.draft_lr}] if dparams else [])
-    if args.device == "cpu":
+    if not groups:
+        opt = torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=0.0)   # placeholder: evaluation only
+    elif args.device == "cpu":
         opt = torch.optim.AdamW(groups, weight_decay=0.0, betas=(0.9, 0.95))
     else:
         import bitsandbytes as bnb
@@ -118,7 +133,14 @@ def main():
             hs = out.hidden_states
             return hs, extract_context_feature(hs, lids), out.logits[0].argmax(-1)
 
-    def run_adapter(hs, T):
+    def run_adapter(hs, T, ids=None):
+        """(missing slices, final pre-norm state, assembled features); copy mode: ([], copy's greedy
+        predictions, copy features)."""
+        if copy is not None:
+            with torch.no_grad():
+                co = copy(ids.to(args.copy_device)[None], output_hidden_states=True)
+                cf = extract_context_feature(co.hidden_states, lids).to(args.device)
+                return [], co.logits[0].argmax(-1).to(args.device), cf
         pos = torch.arange(T, device=args.device)[None]
         missing, final = adapter(hs[args.exit], rotary, pos)
         return missing, final, assemble(hs, lids, args.exit, missing)
@@ -153,12 +175,18 @@ def main():
                     if not blocks:
                         continue
                     hs, real, tp = target_pass(ids)
-                    missing, final, alt = run_adapter(hs, len(ids))
-                    zero = assemble(hs, lids, args.exit, [torch.zeros_like(m) for m in missing])
+                    missing, final, alt = run_adapter(hs, len(ids), ids)
                     rows = torch.tensor(sorted({t for s, g in blocks for t in range(s - g, s)}), device=ids.device)
-                    fl, _, ag = adapter_aux(adapter, target, missing, final, hs, tp, rows)
-                    agree.append(float(ag))
-                    cos.append(1 - float(fl))
+                    if copy is not None:      # "shallow" column = copy features too (no shallow source)
+                        zero = alt
+                        agree.append(float((final[rows] == tp[rows]).float().mean()))
+                        cos.append(float(torch.nn.functional.cosine_similarity(
+                            alt[0, rows].float(), real[0, rows].float(), dim=-1).mean()))
+                    else:
+                        zero = assemble(hs, lids, args.exit, [torch.zeros_like(m) for m in missing])
+                        fl, _, ag = adapter_aux(adapter, target, missing, final, hs, tp, rows)
+                        agree.append(float(ag))
+                        cos.append(1 - float(fl))
                     for name, src in (("real", real), ("shallow", zero), ("adapter", alt)):
                         _, correct = drafter_block_loss(draft, target, real, src, ids, blocks, bs, args.gamma)
                         taus[name] += [accepted(r) for r in correct if None not in r]
@@ -174,6 +202,9 @@ def main():
         print(f"[{tag} step {step}] {msg}", flush=True)
 
     evaluate(0)
+    if not (params or dparams):
+        print(f"[{tag}] nothing to train (frozen evaluation only)", flush=True)
+        return
     step, t0 = 0, time.time()
     order = list(range(len(train)))
     while step < total:
@@ -191,7 +222,7 @@ def main():
                 if not blocks:
                     continue
                 hs, real, tp = target_pass(ids)
-                missing, final, alt = run_adapter(hs, len(ids))
+                missing, final, alt = run_adapter(hs, len(ids), ids)
                 ld, _ = drafter_block_loss(draft, target, real, alt, ids, blocks, bs, args.gamma)
                 rows = torch.tensor(sorted({t for s, g in blocks for t in range(s - g, s)}), device=ids.device)
                 if len(rows) and not args.freeze_adapter:
