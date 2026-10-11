@@ -5,6 +5,7 @@ Same data (target-greedy sequences), same steps, same blocks, same validation fo
                    trained with DFlash's own block loss (the fair small-budget baseline)
   pdraft           PDraft (hspec/pdraft.py): Qwen3-0.6B (or its first n layers) + target features
   pdraft_nofeat    PDraft without target features (does the target context matter?)
+  pdraft_kv        PDraft with the features injected DFlash-style as gated extra K/V in every layer
 Validation every --eval-every steps on the 48 held-out sequences (8 anchors each):
   tau     accepted tokens per block under greedy verification (leading correct + 1)
   acc@k   top-1 accuracy at block offset k
@@ -45,7 +46,7 @@ def lead(hits):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arch", required=True, choices=["dflash_scratch", "pdraft", "pdraft_nofeat"])
+    ap.add_argument("--arch", required=True, choices=["dflash_scratch", "pdraft", "pdraft_nofeat", "pdraft_kv"])
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
     ap.add_argument("--draft", default="z-lab/Qwen3-8B-DFlash-b16")
     ap.add_argument("--small", default="Qwen/Qwen3-0.6B")
@@ -57,6 +58,7 @@ def main():
     ap.add_argument("--epochs", type=float, default=2.0)
     ap.add_argument("--lr", type=float, default=0.0, help="0 = arch default (scratch 3e-4, pretrained 5e-5)")
     ap.add_argument("--lr-new", type=float, default=3e-4)
+    ap.add_argument("--lr-gate", type=float, default=3e-3, help="pdraft_kv: per-layer injection gates (init 0)")
     ap.add_argument("--warmup", type=int, default=200)
     ap.add_argument("--gamma", type=float, default=0.9)
     ap.add_argument("--max-len", type=int, default=1024)
@@ -99,11 +101,14 @@ def main():
         groups = [{"params": [p for p in model.parameters() if p.requires_grad], "lr": args.lr or 3e-4}]
     else:
         small = load_target(args.small, dev)
-        model = PDraft(small, W, args.n_layers or None, use_feats=args.arch == "pdraft").to(dev).float()
+        model = PDraft(small, W, args.n_layers or None, use_feats=args.arch != "pdraft_nofeat",
+                       feat_mode="kv" if args.arch == "pdraft_kv" else "input").to(dev).float()
         del small
         model.train()
         groups = [{"params": model.pretrained_params(), "lr": args.lr or 5e-5},
                   {"params": model.new_params(), "lr": args.lr_new}]
+        if model.gate_params():
+            groups.append({"params": model.gate_params(), "lr": args.lr_gate})
     n_params = sum(p.numel() for g in groups for p in g["params"])
     print(f"[{tag}] trainable {n_params / 1e6:.0f} M params", flush=True)
     if dev == "cpu":
@@ -200,8 +205,10 @@ def main():
             sched.step()
             step += 1
             if step % 50 == 0:
-                print(f"[{tag} step {step}/{total}] loss {tot / max(n, 1):.3f} {(time.time() - t0) / step:.2f}s/step",
-                      flush=True)
+                g = getattr(model, "gates", None)
+                gs = f" |tanh(gate)| mean {float(torch.tanh(g).abs().mean()):.3f}" if g is not None else ""
+                print(f"[{tag} step {step}/{total}] loss {tot / max(n, 1):.3f} {(time.time() - t0) / step:.2f}s/step"
+                      + gs, flush=True)
             if step % args.eval_every == 0:
                 evaluate(step)
     evaluate(step)
