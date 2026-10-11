@@ -94,6 +94,8 @@ def main():
     ap.add_argument("--probe-epochs", type=int, default=10)
     ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--out", default="exp40_lookahead_lora")
+    ap.add_argument("--save", default="", help="save the trained LoRA (+ held-out sequences) to this .pt file")
+    ap.add_argument("--no-probe", action="store_true")
     args = ap.parse_args()
     torch.manual_seed(0)
     rng = random.Random(0)
@@ -204,6 +206,14 @@ def main():
         rows.append(evaluate(f"lora epoch {ep + 1}"))
     print_table(rows, list(rows[0]), "slots after the verified prefix: cosine to the oracle state (final layer) and "
                                      "direct top-1 for x_(s+k); official DFlash acc@1/4/8 = 0.818/0.585/0.397")
+    if args.save:
+        Path(args.save).parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"args": vars(args), "A": [m.A.detach().cpu() for m in loras], "B": [m.B.detach().cpu() for m in loras],
+                    "val_ids": [d["ids"] for d in val]}, args.save)
+        print(f"saved LoRA to {args.save}", flush=True)
+    if args.no_probe:
+        save_json(args.out, {"args": vars(args), "slots": rows})
+        return
 
     # probe (exp39 protocol) with the trained slots, final layer, on sequences unseen by the LoRA
     feats = {"tr": {"A": [], "S": [], "O": [], "y": []}, "va": {"A": [], "S": [], "O": [], "y": []}}
