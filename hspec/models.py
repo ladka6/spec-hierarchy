@@ -14,8 +14,10 @@ warnings.filterwarnings("ignore", message=".*MatMul8bitLt.*")
 
 
 def load_target(model_id: str, device: str = "cuda"):
+    # device_map loads the shards straight onto the device instead of mmapping them on the host and
+    # paging them in during .to() (which crawled on a slow GPFS node: 25 min, under 1 GB moved)
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, dtype=torch.bfloat16, attn_implementation="sdpa"
+        model_id, dtype=torch.bfloat16, attn_implementation="sdpa", device_map=device
     )
     return model.to(device).eval()
 
