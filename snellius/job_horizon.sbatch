@@ -20,17 +20,18 @@ export HSPEC_RESULTS="$SLURM_SUBMIT_DIR/results/horizon"
 mkdir -p "$HSPEC_RESULTS"
 F="grep --line-buffered -v -i warn"
 D=${LAGFT_DIR:-/scratch-shared/$USER/hspec_lagft}/data
-J=/scratch-shared/$USER/hspec_smalljoint
+J=${HORIZON_DIR:-/scratch-shared/$USER/hspec_smalljoint}
+SUF=${HORIZON_SUFFIX:-_joint}
 for T in 0.0 1.0; do
   # ridge map, original drafter (no training needed)
-  python scripts/exp29_iterate.py --small Qwen/Qwen3-0.6B --data "$D" --ks 1 2 3 4 5 6 --temp $T \
+  [ -z "${SKIP_RIDGE:-}" ] && python scripts/exp29_iterate.py --small Qwen/Qwen3-0.6B --data "$D" --ks 1 2 3 4 5 6 --temp $T \
     --out exp34_q06_ridge_t$T 2>&1 | $F
   # trained mapper + jointly trained drafter (from job_smalljoint), if present
   for S in 0.6B 1.7B; do
-    R=$J/Qwen3-${S}_joint
+    R=$J/Qwen3-${S}${SUF}
     if [ -f "$R/mapper.pt" ] && [ -d "$R/drafter" ]; then
       python scripts/exp29_iterate.py --small Qwen/Qwen3-$S --mapper "$R/mapper.pt" --draft "$R/drafter" \
-        --ks 1 2 3 4 5 6 --temp $T --out exp34_q${S/./}_joint_t$T 2>&1 | $F
+        --ks 1 2 3 4 5 6 --temp $T --out exp34_q${S/./}${SUF}_t$T 2>&1 | $F
     else
       echo "skip $S joint: $R/mapper.pt or $R/drafter missing"
     fi
