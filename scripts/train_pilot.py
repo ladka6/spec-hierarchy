@@ -86,7 +86,15 @@ def main():
 
     if args.arch == "dflash_scratch":
         model = load_draft(args.draft, dev)
-        model.apply(model._init_weights)                 # same architecture, fresh weights
+        std = float(getattr(model.config, "initializer_range", 0.02))
+        with torch.no_grad():                            # same architecture, fresh weights (explicit:
+            for name, prm in model.named_parameters():   # HF's _init_weights skips loaded modules)
+                if name.endswith("bias"):
+                    prm.zero_()
+                elif prm.dim() == 1:                     # norm weights
+                    prm.fill_(1.0)
+                else:
+                    prm.normal_(0.0, std)
         model.float().train()
         groups = [{"params": [p for p in model.parameters() if p.requires_grad], "lr": args.lr or 3e-4}]
     else:
