@@ -19,6 +19,10 @@ k_proj/v_proj (+ k_norm, rotary at the feature's position). Queries attend to th
 attention whose output is added through a per-layer tanh gate initialised at 0 (Flamingo-style),
 so at init the model is exactly the pretrained small LM. Rows at position p see features [0, p)
 for block rows (anchor s: features of 0..s-1) and [0, t] for context rows.
+
+ctx_tokens=False (pdraft_featonly): block rows do not attend to the drafter's own token context;
+they see only the anchor, their mask slots and the injected target features (as in DFlash).
+Separates "the prior crowds out the features" from "the small LM cannot use the features".
 """
 
 from __future__ import annotations
@@ -42,7 +46,7 @@ def _attn(q, k, v, mask):
 
 class PDraft(nn.Module):
     def __init__(self, small, d_feat: int, n_layers: int | None = None, use_feats: bool = True,
-                 feat_mode: str = "input"):
+                 feat_mode: str = "input", ctx_tokens: bool = True):
         super().__init__()
         cfg = small.config
         H = cfg.hidden_size
@@ -56,6 +60,8 @@ class PDraft(nn.Module):
             self.head.weight = self.embed.weight
         self.use_feats = use_feats
         self.feat_mode = feat_mode
+        self.ctx_tokens = ctx_tokens
+        assert ctx_tokens or feat_mode == "kv", "features-only needs kv injection"
         self.feat_norm = nn.LayerNorm(d_feat)
         if feat_mode == "kv":
             self.fc = nn.Linear(d_feat, H, bias=False)
@@ -122,7 +128,8 @@ class PDraft(nn.Module):
         mask[:T, :T] = torch.tril(torch.ones(T, T, dtype=torch.bool, device=dev))
         for b, s in enumerate(anchors):
             r = slice(T + b * B, T + (b + 1) * B)
-            mask[r, :s] = True
+            if self.ctx_tokens:
+                mask[r, :s] = True
             mask[r, r] = True
         pe = self.rotary(h, pos)
         fctx = fpe = fmask = None

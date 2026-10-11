@@ -78,6 +78,19 @@ def main():
         used = (o1 - kv(ids, f3, [anc[0]], B)).abs().max().item()
     print(f"future-feature leak {leak:.2e}, past-feature effect {used:.2e}")
     assert leak < 1e-5 and used > 1e-3
+    # 5. features-only: blocks ignore the token context before the anchor, but do use the features
+    fo = PDraft(small, D, feat_mode="kv", ctx_tokens=False).eval()
+    with torch.no_grad():
+        fo.gates.fill_(0.5)
+        s0 = anc[1]
+        ids2 = ids.clone()
+        ids2[:s0] = torch.randint(0, 97, (s0,))
+        tok_eff = (fo(ids, feats, [s0], B) - fo(ids2, feats, [s0], B)).abs().max().item()
+        f4 = feats.clone()
+        f4[:s0] += 5 * torch.randn_like(f4[:s0])
+        feat_eff = (fo(ids, feats, [s0], B) - fo(ids, f4, [s0], B)).abs().max().item()
+    print(f"features-only: token-context effect {tok_eff:.2e}, feature effect {feat_eff:.2e}")
+    assert tok_eff < 1e-5 and feat_eff > 1e-3
     print("OK")
 
 

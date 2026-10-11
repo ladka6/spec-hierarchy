@@ -6,6 +6,7 @@ Same data (target-greedy sequences), same steps, same blocks, same validation fo
   pdraft           PDraft (hspec/pdraft.py): Qwen3-0.6B (or its first n layers) + target features
   pdraft_nofeat    PDraft without target features (does the target context matter?)
   pdraft_kv        PDraft with the features injected DFlash-style as gated extra K/V in every layer
+  pdraft_featonly  pdraft_kv, but blocks cannot see the drafter's token context (features only, as DFlash)
 Validation every --eval-every steps on the 48 held-out sequences (8 anchors each):
   tau     accepted tokens per block under greedy verification (leading correct + 1)
   acc@k   top-1 accuracy at block offset k
@@ -46,7 +47,7 @@ def lead(hits):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arch", required=True, choices=["dflash_scratch", "pdraft", "pdraft_nofeat", "pdraft_kv"])
+    ap.add_argument("--arch", required=True, choices=["dflash_scratch", "pdraft", "pdraft_nofeat", "pdraft_kv", "pdraft_featonly"])
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
     ap.add_argument("--draft", default="z-lab/Qwen3-8B-DFlash-b16")
     ap.add_argument("--small", default="Qwen/Qwen3-0.6B")
@@ -102,7 +103,8 @@ def main():
     else:
         small = load_target(args.small, dev)
         model = PDraft(small, W, args.n_layers or None, use_feats=args.arch != "pdraft_nofeat",
-                       feat_mode="kv" if args.arch == "pdraft_kv" else "input").to(dev).float()
+                       feat_mode="kv" if args.arch in ("pdraft_kv", "pdraft_featonly") else "input",
+                       ctx_tokens=args.arch != "pdraft_featonly").to(dev).float()
         del small
         model.train()
         groups = [{"params": model.pretrained_params(), "lr": args.lr or 5e-5},
