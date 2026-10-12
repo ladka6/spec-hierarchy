@@ -35,8 +35,30 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-STATE = {"S": None, "n": None, "teacher": False}
+from exp47_blockroute import weights_per_token  # noqa: E402
+
+STATE = {"S": None, "n": None, "teacher": False, "rec": None}
+
+
+def window_unions(rec, E, n):
+    """rec: per-layer top-k indices [T, k]. Mean over layers of the distinct experts in n-token windows that start
+    inside the constrained region (t >= n): (sum over aligned windows, count, sum over all windows, count)."""
+    ua = na = uu = nu = 0.0
+    for idx in rec:
+        T = idx.shape[0]
+        if T < 2 * n:
+            continue
+        m = F.one_hot(idx, E).sum(1).float()                                  # [T, E]
+        cs = torch.cat([torch.zeros(1, E, device=m.device), m.cumsum(0)])
+        st = torch.arange(n, T - n + 1, device=m.device)
+        u = ((cs[st + n] - cs[st]) > 0).sum(-1).float()                       # [windows]
+        al = st % n == 0
+        ua += float(u[al].sum()); na += float(al.sum())
+        uu += float(u.sum()); nu += len(u)
+    L = len(rec)
+    return ua / L, na / L, uu / L, nu / L
 
 
 def routed_forward(self, hidden_states):
@@ -55,6 +77,8 @@ def routed_forward(self, hidden_states):
                 allowed[b * n : (b + 1) * n] = keep
         probs = probs.masked_fill(~allowed, 0.0)
     top_v, top_i = torch.topk(probs, self.top_k, dim=-1)
+    if STATE["rec"] is not None:
+        STATE["rec"].append(top_i.detach())
     if self.norm_topk_prob:
         top_v = top_v / top_v.sum(-1, keepdim=True).clamp_min(1e-9)
     return logits, top_v.to(logits.dtype), top_i
@@ -205,16 +229,36 @@ def main():
         return lp
 
     history = []
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    cfg = model.config
+    E, k = cfg.num_experts, cfg.num_experts_per_tok
+
+    def save():
+        (out / "history.json").write_text(json.dumps({"args": vars(args), "history": history}, indent=1))
+        torch.save({"routers": [r.weight.detach().cpu() for r in routers],
+                    **{kk: [p.detach().cpu() for p in v] for kk, v in extra.items()}}, out / "routers.pt")
+
+    def cost(u):
+        return weights_per_token(cfg, u) / weights_per_token(cfg, k)
 
     @torch.no_grad()
     def evaluate(step):
         model.eval()
         STATE.update(S=args.S, n=args.n)
         kl = ag = nc = nr = cnt = 0.0
+        un = {"free": [0.0] * 4, "block": [0.0] * 4}
         for s in val:
             s = s.cuda()
+            STATE["rec"] = []
             ref = teacher_lp(s)
+            for i, v in enumerate(window_unions(STATE["rec"], E, args.n)):
+                un["free"][i] += v
+            STATE["rec"] = []
             lp = F.log_softmax(model(s[None]).logits[0].float(), -1)
+            for i, v in enumerate(window_unions(STATE["rec"], E, args.n)):
+                un["block"][i] += v
+            STATE["rec"] = None
             m = slice(args.n, len(s) - 1)
             tgt = s[args.n + 1 :]
             kl += float((ref[m].exp() * (ref[m] - lp[m])).sum())
@@ -223,9 +267,17 @@ def main():
             nr -= float(ref[m].gather(-1, tgt[:, None]).sum())
             cnt += len(tgt)
         rec = {"step": step, "KL": kl / cnt, "agree": ag / cnt, "ppl": math.exp(nc / cnt), "ppl_orig": math.exp(nr / cnt)}
+        for nm, (ua, na, uu, nu) in un.items():
+            rec[f"union_{nm}_aligned"] = ua / max(na, 1)
+            rec[f"union_{nm}_any"] = uu / max(nu, 1)
         history.append(rec)
         print(f"[eval step {step}] KL {rec['KL']:.4f} agree {rec['agree']:.4f} ppl {rec['ppl']:.3f} "
               f"(original {rec['ppl_orig']:.3f})", flush=True)
+        print(f"[eval step {step}] experts/layer in {args.n}-token windows (cost vs 1 token): "
+              f"block-routed aligned {rec['union_block_aligned']:.1f} ({cost(rec['union_block_aligned']):.2f}x), "
+              f"any offset {rec['union_block_any']:.1f} ({cost(rec['union_block_any']):.2f}x); "
+              f"free routing {rec['union_free_any']:.1f} ({cost(rec['union_free_any']):.2f}x)", flush=True)
+        save()
         model.train()
 
     evaluate(0)
@@ -250,11 +302,6 @@ def main():
             print(f"[train {step}/{args.steps}] KL {tot / args.batch:.4f} {(time.time() - t0) / step:.2f}s/step", flush=True)
         if step % args.eval_every == 0 or step == args.steps:
             evaluate(step)
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "history.json").write_text(json.dumps({"args": vars(args), "history": history}, indent=1))
-    torch.save({"routers": [r.weight.detach().cpu() for r in routers],
-                **{k: [p.detach().cpu() for p in v] for k, v in extra.items()}}, out / "routers.pt")
     print("done", flush=True)
 
 
