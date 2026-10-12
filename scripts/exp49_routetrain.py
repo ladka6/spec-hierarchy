@@ -9,6 +9,10 @@ Here the model is fine-tuned to work under the constraint, with distillation to 
   router       only the router weights train (2M params for OLMoE): the "locality adapter"
   router+attn  routers + LoRA on the attention projections (hidden states can adapt to the restricted
                experts; the LoRA is switched off for the teacher pass)
+  router+experts         routers + one low-rank adapter per expert (gate_up and down; OLMoE r=8: ~59M params):
+               each expert can widen what it covers, so a block's S experts can serve tokens that would
+               have gone elsewhere (OLMoE-style experts: 3D gate_up_proj / down_proj tensors)
+  router+attn+experts    all three
 Loss: KL(teacher || student) on positions inside constrained blocks. Reported on held-out text, before
 and during training: KL, top-1 agreement with the original, perplexity vs the original's.
 
@@ -73,10 +77,82 @@ class SwitchLoRA(torch.nn.Module):
         return y
 
 
+def lora_experts_forward(self, hidden_states, top_k_index, top_k_weights):
+    """OlmoeExperts.forward (transformers 5.x, eager loop) + per-expert LoRA on gate_up and down, off for the teacher."""
+    final = torch.zeros_like(hidden_states)
+    on = not STATE["teacher"]
+    with torch.no_grad():
+        expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+    for e in expert_hit:
+        e = e[0]
+        if e == self.num_experts:
+            continue
+        top_k_pos, token_idx = torch.where(expert_mask[e])
+        x = hidden_states[token_idx]
+        gu = F.linear(x, self.gate_up_proj[e])
+        if on:
+            gu = gu + ((x.float() @ self.lA_gu[e].T) @ self.lB_gu[e].T * self.lscale).to(gu.dtype)
+        gate, up = gu.chunk(2, dim=-1)
+        h = self.act_fn(gate) * up
+        y = F.linear(h, self.down_proj[e])
+        if on:
+            y = y + ((h.float() @ self.lA_d[e].T) @ self.lB_d[e].T * self.lscale).to(y.dtype)
+        y = y * top_k_weights[token_idx, top_k_pos, None]
+        final.index_add_(0, token_idx, y.to(final.dtype))
+    return final
+
+
+def add_expert_lora(model, r=8, alpha=16.0):
+    mods = [m for m in model.modules() if hasattr(m, "gate_up_proj") and hasattr(m, "down_proj")
+            and m.gate_up_proj.dim() == 3]
+    params = []
+    for m in mods:
+        E, I2, H = m.gate_up_proj.shape
+        I = m.down_proj.shape[2]
+        dev = m.gate_up_proj.device
+        m.lA_gu = torch.nn.Parameter(torch.randn(E, r, H, device=dev) / math.sqrt(H))
+        m.lB_gu = torch.nn.Parameter(torch.zeros(E, I2, r, device=dev))
+        m.lA_d = torch.nn.Parameter(torch.randn(E, r, I, device=dev) / math.sqrt(I))
+        m.lB_d = torch.nn.Parameter(torch.zeros(E, H, r, device=dev))
+        m.lscale = alpha / r
+        m.forward = types.MethodType(lora_experts_forward, m)
+        params += [m.lA_gu, m.lB_gu, m.lA_d, m.lB_d]
+    return mods, params
+
+
+def add_adapters(model, mode, lr=0.0, rank=8):
+    """Patch routers (block-shared, trainable) and add the LoRAs `mode` asks for. Returns (routers, groups, extra)."""
+    routers = [m for m in model.modules() if type(m).__name__.endswith("TopKRouter")]
+    for r in routers:
+        r.register_buffer("orig_weight", r.weight.detach().clone())
+        r.forward = types.MethodType(routed_forward, r)
+        r.weight.data = r.weight.data.float()
+        r.weight.requires_grad_(True)
+    groups = [{"params": [r.weight for r in routers], "lr": lr or 1e-3}]
+    extra = {}
+    if "attn" in mode:                                          # LoRA on attention, off for the teacher
+        loras = []
+        for layer in model.model.layers:
+            for nm in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                lo = SwitchLoRA(getattr(layer.self_attn, nm))
+                setattr(layer.self_attn, nm, lo)
+                loras.append(lo)
+        p = [p for lo in loras for p in (lo.A, lo.B)]
+        groups.append({"params": p, "lr": lr or 5e-4})
+        extra["attn"] = p
+    if "experts" in mode:                                       # one LoRA per expert, off for the teacher
+        mods, p = add_expert_lora(model, r=rank)
+        assert mods, "no 3D expert tensors found (expects OLMoE-style experts)"
+        groups.append({"params": p, "lr": lr or 5e-4})
+        extra["experts"] = p
+    return routers, groups, extra
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="allenai/OLMoE-1B-7B-0924")
-    ap.add_argument("--mode", choices=["router", "router+attn"], default="router")
+    ap.add_argument("--mode", choices=["router", "router+attn", "router+experts", "router+attn+experts"], default="router")
     ap.add_argument("--S", type=int, default=16)
     ap.add_argument("--n", type=int, default=16)
     ap.add_argument("--data", required=True)
@@ -87,6 +163,7 @@ def main():
     ap.add_argument("--steps", type=int, default=1500)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--lr", type=float, default=0.0, help="0 = 1e-3 routers / 5e-4 attention LoRA")
+    ap.add_argument("--expert-rank", type=int, default=8)
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -112,21 +189,7 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, device_map="cuda")
     model.requires_grad_(False)
-    routers = [m for m in model.modules() if type(m).__name__.endswith("TopKRouter")]
-    for r in routers:
-        r.register_buffer("orig_weight", r.weight.detach().clone())
-        r.forward = types.MethodType(routed_forward, r)
-        r.weight.data = r.weight.data.float()
-        r.weight.requires_grad_(True)
-    groups = [{"params": [r.weight for r in routers], "lr": args.lr or 1e-3}]
-    if args.mode == "router+attn":                              # LoRA on attention, off for the teacher
-        loras = []
-        for layer in model.model.layers:
-            for nm in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                lo = SwitchLoRA(getattr(layer.self_attn, nm))
-                setattr(layer.self_attn, nm, lo)
-                loras.append(lo)
-        groups.append({"params": [p for lo in loras for p in (lo.A, lo.B)], "lr": args.lr or 5e-4})
+    routers, groups, extra = add_adapters(model, args.mode, args.lr, args.expert_rank)
     n_params = sum(p.numel() for g in groups for p in g["params"])
     print(f"[{args.mode}] {len(routers)} routers, {n_params / 1e6:.1f} M trainable params, S={args.S} n={args.n}",
           flush=True)
@@ -190,7 +253,8 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "history.json").write_text(json.dumps({"args": vars(args), "history": history}, indent=1))
-    torch.save({"routers": [r.weight.detach().cpu() for r in routers]}, out / "routers.pt")
+    torch.save({"routers": [r.weight.detach().cpu() for r in routers],
+                **{k: [p.detach().cpu() for p in v] for k, v in extra.items()}}, out / "routers.pt")
     print("done", flush=True)
 
 
