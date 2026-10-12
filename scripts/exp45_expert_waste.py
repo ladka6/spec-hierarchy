@@ -128,6 +128,7 @@ def main():
     ap.add_argument("--anchors", type=int, default=8)
     ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--out", default="exp45_expert_waste")
+    ap.add_argument("--save", default="", help="save per-block routing (int16) + acceptance + confidence here")
     args = ap.parse_args()
 
     data = []
@@ -195,6 +196,14 @@ def main():
     crow = [{"drafter_conf": f"{lo}-{min(hi, 1)}", "tokens": len(v), "new_experts": m([x for x, _ in v]),
              "accepted_share": m([float(a) for _, a in v])} for (lo, hi), v in sorted(conf_new.items())]
     print_table(crow, list(crow[0]), "new experts per layer and acceptance by drafter confidence")
+    if args.save:
+        torch.save({"A": torch.tensor([int(b["match"].long().cumprod(0).sum()) for b in blocks]),
+                    "match": torch.stack([b["match"] for b in blocks]),
+                    "dprob": torch.stack([b["dprob"] for b in blocks]),
+                    "draft_rout": torch.stack([r["draft"] for r in routs]).to(torch.int16),   # [n, L, 16, k]
+                    "true_rout": torch.stack([r["true"] for r in routs]).to(torch.int16),
+                    "non_expert": non_expert, "expert": expert, "layers": L}, args.save)
+        print(f"saved per-block routing to {args.save}", flush=True)
     save_json(args.out, {"args": vars(args), "summary": summary, "by_position": prow, "growth": grow,
                          "by_confidence": crow})
 
