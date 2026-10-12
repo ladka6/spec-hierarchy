@@ -39,18 +39,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from exp47_blockroute import weights_per_token  # noqa: E402
 
-STATE = {"S": None, "n": None, "teacher": False, "rec": None}
+STATE = {"S": None, "n": None, "teacher": False, "rec": None, "route": "block", "k": None}
 
 
 def window_unions(rec, E, n):
-    """rec: per-layer top-k indices [T, k]. Mean over layers of the distinct experts in n-token windows that start
+    """rec: per-layer bool masks [T, E] of the experts each token uses (nonzero weight). Mean over layers of the distinct experts in n-token windows that start
     inside the constrained region (t >= n): (sum over aligned windows, count, sum over all windows, count)."""
     ua = na = uu = nu = 0.0
     for idx in rec:
         T = idx.shape[0]
         if T < 2 * n:
             continue
-        m = F.one_hot(idx, E).sum(1).float()                                  # [T, E]
+        m = idx.float()                                                       # [T, E]
         cs = torch.cat([torch.zeros(1, E, device=m.device), m.cumsum(0)])
         st = torch.arange(n, T - n + 1, device=m.device)
         u = ((cs[st + n] - cs[st]) > 0).sum(-1).float()                       # [windows]
@@ -68,17 +68,26 @@ def routed_forward(self, hidden_states):
     probs = torch.softmax(logits, dtype=torch.float, dim=-1)
     T, E = probs.shape
     if STATE["S"] is not None and not STATE["teacher"]:
-        n, S = STATE["n"], STATE["S"]
+        n, S, route = STATE["n"], STATE["S"], STATE["route"]
         allowed = torch.ones_like(probs, dtype=torch.bool)
         with torch.no_grad():
-            for b in range(1, (T + n - 1) // n):
+            if route == "block":                    # causal block-shared: block b uses the top-S of block b-1
+                for b in range(1, (T + n - 1) // n):
+                    keep = torch.zeros(E, dtype=torch.bool, device=probs.device)
+                    keep[probs[(b - 1) * n : b * n].sum(0).topk(S).indices] = True
+                    allowed[b * n : (b + 1) * n] = keep
+            elif route == "seq":                    # baseline: one set for the whole sequence, from block 0
                 keep = torch.zeros(E, dtype=torch.bool, device=probs.device)
-                keep[probs[(b - 1) * n : b * n].sum(0).topk(S).indices] = True
-                allowed[b * n : (b + 1) * n] = keep
+                keep[probs[:n].sum(0).topk(S).indices] = True
+                allowed[n:] = keep
+            elif route == "topk":                   # baseline: free routing with fewer experts per token
+                kk = torch.zeros_like(allowed)
+                kk.scatter_(1, probs.topk(STATE["k"], -1).indices, True)
+                allowed[n:] = kk[n:]
         probs = probs.masked_fill(~allowed, 0.0)
     top_v, top_i = torch.topk(probs, self.top_k, dim=-1)
     if STATE["rec"] is not None:
-        STATE["rec"].append(top_i.detach())
+        STATE["rec"].append(torch.zeros_like(probs, dtype=torch.bool).scatter_(1, top_i, top_v > 0))
     if self.norm_topk_prob:
         top_v = top_v / top_v.sum(-1, keepdim=True).clamp_min(1e-9)
     return logits, top_v.to(logits.dtype), top_i
@@ -218,12 +227,16 @@ def main():
     ap.add_argument("--steps", type=int, default=1500)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--lr", type=float, default=0.0, help="0 = 1e-3 routers / 5e-4 attention LoRA")
+    ap.add_argument("--route", choices=["block", "seq", "topk"], default="block",
+                    help="block = causal block-shared sets (ours); seq = one set per sequence; topk = fewer experts/token")
+    ap.add_argument("--k", type=int, default=2, help="experts per token for --route topk")
     ap.add_argument("--expert-rank", type=int, default=8)
     ap.add_argument("--expert-impl", choices=["grouped", "loop"], default="grouped")
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     torch.manual_seed(0)
+    STATE.update(route=args.route, k=args.k)
 
     ttok = AutoTokenizer.from_pretrained(args.text_tokenizer)
     tok = AutoTokenizer.from_pretrained(args.model)
@@ -258,7 +271,7 @@ def main():
                 if hasattr(m, "lA_gu"):
                     m.forward = types.MethodType(lora_experts_forward, m)
     n_params = sum(p.numel() for g in groups for p in g["params"])
-    print(f"[{args.mode}] {len(routers)} routers, {n_params / 1e6:.1f} M trainable params, S={args.S} n={args.n}",
+    print(f"[{args.mode}] {len(routers)} routers, {n_params / 1e6:.1f} M trainable params, route={args.route} S={args.S} k={args.k} n={args.n}",
           flush=True)
     opt = torch.optim.AdamW(groups, weight_decay=0.0)
     sched = torch.optim.lr_scheduler.LambdaLR(
