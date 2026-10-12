@@ -90,6 +90,9 @@ def routed_forward(self, hidden_states):
                         keep[probs[b * n : (b + 1) * n].sum(0).topk(S).indices] = True
                         sets[b] = keep
                     allowed[b * n : (b + 1) * n] = sets[b]
+            elif route == "set":                    # exp53: one given expert set per layer for every token of the call
+                if self.layer_idx in STATE["sets"]:
+                    allowed[:] = STATE["sets"][self.layer_idx]
             elif route == "seq":                    # baseline: one set for the whole sequence, from block 0
                 keep = torch.zeros(E, dtype=torch.bool, device=probs.device)
                 keep[probs[:n].sum(0).topk(S).indices] = True
