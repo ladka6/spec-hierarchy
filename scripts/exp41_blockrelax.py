@@ -75,6 +75,7 @@ def main():
     ap.add_argument("--anchors", type=int, default=16)
     ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--out", default="exp41_blockrelax")
+    ap.add_argument("--save-blocks", default="", help="save per-block match / gap / drafter top-prob tensors here")
     args = ap.parse_args()
     rng = random.Random(0)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -116,6 +117,7 @@ def main():
                 "is2": (dtok == top2.indices[:, 1]).cpu(),
                 "ratio": (top2.values[:, 1] / top2.values[:, 0].clamp_min(1e-6)).cpu(),     # MARS logit ratio
                 "js": js(F.log_softmax(dl, -1), lp).cpu(),
+                "dprob": torch.softmax(dl, -1).max(-1).values.cpu(),
             })
         if (i + 1) % 50 == 0:
             print(f"[{i + 1}/{len(data)}] {len(blocks)} blocks", flush=True)
@@ -149,6 +151,9 @@ def main():
     print_table(brows, ["budget_gap_per_tok", "exact"] + list(fams)[1:],
                 "best tau at a quality budget (mean target-probability gap spent per generated token)")
     save_json(args.out, {"args": vars(args), "all": rows, "budget": brows, "n_blocks": len(blocks)})
+    if args.save_blocks:
+        torch.save({k: torch.stack([b[k] for b in blocks]) for k in ("match", "gap", "dprob")}, args.save_blocks)
+        print(f"saved blocks to {args.save_blocks}", flush=True)
 
 
 if __name__ == "__main__":
