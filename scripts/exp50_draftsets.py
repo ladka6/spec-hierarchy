@@ -1,0 +1,92 @@
+"""Experiment 50 (CPU): can the drafter's block tell the MoE which experts the block will need?
+
+Block-shared routing (exp47/49) picks a block's S experts from the PREVIOUS block, which is stale. A drafter has
+a guess of the CURRENT block (its draft). exp45 --save holds, per DFlash block, the Qwen3-30B-A3B routing of the
+drafted tokens and of the true continuation (index 0 = anchor). Here: build a set of S experts per layer from
+different sources and measure how well it covers the experts the TRUE tokens route to.
+
+Comparison on the second half of each block (true tokens 8..15), where all predictors are available:
+  stale     top-S of the true tokens 0..7 (the previous 8 tokens: today's design with n=8)
+  draft     top-S of the drafted tokens 8..15 routed by the target (upper bound for a perfect draft->routing head)
+  oracle    top-S of the true tokens 8..15 themselves (best possible set of size S)
+and on the full block (true 0..15): draft 0..15 vs oracle.
+Coverage = share of the true tokens' (token, expert) picks that fall inside the set; also the share of tokens
+whose whole top-k is inside. Split by accepted length (draft quality).
+
+  python scripts/exp50_draftsets.py --routing /scratch-shared/$USER/hspec_moe/routing.pt
+"""
+
+from __future__ import annotations
+
+import argparse
+
+import torch
+
+
+def topS(counts, S):
+    g = torch.Generator().manual_seed(0)
+    noise = torch.rand(counts.shape, generator=g) * 1e-3                 # break count ties deterministically
+    keep = torch.zeros(counts.shape, dtype=torch.bool)
+    keep.scatter_(-1, (counts + noise).topk(S, -1).indices, True)
+    return keep                                                          # [n, L, E]
+
+
+def counts_of(rout, E):
+    """rout [n, L, t, k] -> [n, L, E] number of picks per expert."""
+    n, L = rout.shape[:2]
+    c = torch.zeros(n, L, E)
+    c.scatter_add_(2, rout.reshape(n, L, -1), torch.ones(n, L, rout.shape[2] * rout.shape[3]))
+    return c
+
+
+def coverage(keep, target):
+    """keep [n, L, E] bool, target [n, L, t, k] -> (pick coverage [n], whole-token coverage [n])."""
+    inside = keep.gather(2, target.reshape(*target.shape[:2], -1)).reshape(target.shape)   # [n, L, t, k]
+    return inside.float().mean((1, 2, 3)), inside.all(-1).float().mean((1, 2))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--routing", required=True)
+    ap.add_argument("--sets", nargs="+", type=int, default=[8, 12, 16, 24, 32])
+    args = ap.parse_args()
+
+    d = torch.load(args.routing)
+    A = d["A"].long()
+    dr, tr = d["draft_rout"].long(), d["true_rout"].long()               # [n, L, 16, k]
+    n, L, T, k = dr.shape
+    E = int(max(dr.max(), tr.max())) + 1
+    print(f"{n} blocks, {L} layers, {E} experts, top-{k}; mean accepted {A.float().mean():.2f}")
+
+    h = T // 2
+    tgt2, tgt = tr[:, :, h:], tr
+    src = {"stale (true 0..7)": counts_of(tr[:, :, :h], E),
+           "draft (drafted 8..15)": counts_of(dr[:, :, h:], E),
+           "stale + draft": counts_of(tr[:, :, :h], E) + counts_of(dr[:, :, h:], E),
+           "oracle (true 8..15)": counts_of(tgt2, E)}
+    buckets = {"all": torch.ones(n, dtype=torch.bool), "A<=3": A <= 3, "4<=A<=9": (A >= 4) & (A <= 9), "A>=10": A >= 10}
+
+    print("\n== second half of the block (true tokens 8..15): share of expert picks inside the set "
+          "(share of tokens fully inside) ==")
+    print(f"{'S':>3s} {'source':24s} " + " ".join(f"{b:>15s}" for b in buckets))
+    for S in args.sets:
+        for name, c in src.items():
+            pc, tc = coverage(topS(c, S), tgt2)
+            print(f"{S:3d} {name:24s} " + " ".join(f"{float(pc[m].mean()):6.3f} ({float(tc[m].mean()):5.3f})"
+                                                     for m in buckets.values()))
+        print()
+
+    print("== full block (anchor + 15, true tokens 0..15) ==")
+    full = {"draft (anchor + drafted)": counts_of(dr, E), "oracle (true 0..15)": counts_of(tgt, E)}
+    print(f"{'S':>3s} {'source':24s} " + " ".join(f"{b:>15s}" for b in buckets))
+    for S in args.sets:
+        for name, c in full.items():
+            pc, tc = coverage(topS(c, S), tgt)
+            print(f"{S:3d} {name:24s} " + " ".join(f"{float(pc[m].mean()):6.3f} ({float(tc[m].mean()):5.3f})"
+                                                     for m in buckets.values()))
+        print()
+    print("blocks per bucket: " + ", ".join(f"{b} {int(m.sum())}" for b, m in buckets.items()))
+
+
+if __name__ == "__main__":
+    main()
