@@ -32,7 +32,7 @@ export HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 D=${LAGFT_DIR:-/scratch-shared/$USER/hspec_lagft}/data
 for MT in "Qwen/Qwen3-30B-A3B 2" "Qwen/Qwen3-8B 1"; do
   set -- $MT
-  python scripts/bench_vllm.py --model $1 --tp $2 --ctx 512 --n 64 --qs 1 2 4 8 16 --batches 1 4 16 --seqs 3 \
+  python scripts/bench_vllm.py --model $1 --tp $2 --ctx 512 --n 64 --qs 1 2 4 8 16 --batches 1 4 16 --seqs 7 \
     --data "$D" --out results/bench_vllm_moe.json 2>&1 | grep -v -i warn | grep "verify cost\|decode step\|Error\|error" 
 done
 cat results/bench_vllm_moe.json

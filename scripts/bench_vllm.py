@@ -85,12 +85,17 @@ def main():
     if args.data:
         import torch
         need = sum(B for B in args.batches) * len(args.qs) * args.seqs
-        seqs = []
+        win = args.ctx + max(args.qs) + 1
+        stream, seqs = [], []
         for f in sorted(Path(args.data).glob("shard*.pt")):
-            seqs += [d["ids"].tolist() for d in torch.load(f) if len(d["ids"]) >= args.ctx + max(args.qs) + 1]
+            for d in torch.load(f):
+                stream += d["ids"].tolist()                    # real text, documents concatenated
+            while len(stream) >= win and len(seqs) < need:
+                seqs.append(stream[:win])
+                stream = stream[win:]
             if len(seqs) >= need:
                 break
-        assert len(seqs) >= need, f"need {need} sequences of length >= {args.ctx + max(args.qs) + 1}, got {len(seqs)}"
+        assert len(seqs) >= need, f"need {need} windows of {win} tokens, got {len(seqs)}"
         nxt = [0]
 
         def take(B):
