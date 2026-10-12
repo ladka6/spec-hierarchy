@@ -142,6 +142,9 @@ def main():
     ap.add_argument("--blocks", default="", help="exp41 --save-blocks file")
     ap.add_argument("--curves", default="", help="reuse a saved cost-curve json instead of measuring")
     ap.add_argument("--t-draft-frac", type=float, default=0.2, help="drafter time / 1-token verify time")
+    ap.add_argument("--bytes-model", action="store_true",
+                    help="replace measured MoE times by weights read per verify (memory-bound kernels): "
+                         "non-expert params + layers x measured experts/layer x expert params")
     ap.add_argument("--out", default="exp42_moe_cost")
     args = ap.parse_args()
 
@@ -163,6 +166,30 @@ def main():
     print_table(rows, ["model", "tokens", "verify_ms", "rel_to_1", "experts_per_layer"],
                 "verify-pass time after a cached prefix vs number of query tokens (median over sequences x reps)")
     out = {"args": vars(args), "cost": rows}
+
+    if args.bytes_model:
+        from transformers import AutoConfig
+        brows = []
+        for m in args.models:
+            name = m.split("/")[-1]
+            mr = [r for r in rows if r["model"] == name]
+            if not mr or mr[0]["experts_per_layer"] is None:
+                continue
+            c = AutoConfig.from_pretrained(m)
+            H, L, hd = c.hidden_size, c.num_hidden_layers, c.head_dim
+            attn = H * hd * (2 * c.num_attention_heads + 2 * c.num_key_value_heads)
+            non_expert = L * (attn + H * c.num_experts) + c.vocab_size * H          # + LM head
+            expert = 3 * H * c.moe_intermediate_size
+            for r in mr:
+                gp = (non_expert + L * r["experts_per_layer"] * expert) / 1e9
+                brows.append({**r, "verify_ms": gp, "rel_to_1": None, "params_read_B": gp})
+            base = brows[-len(mr)]["params_read_B"]
+            for r in brows[-len(mr):]:
+                r["rel_to_1"] = r["params_read_B"] / base
+        print_table(brows, ["model", "tokens", "params_read_B", "rel_to_1", "experts_per_layer"],
+                    "memory-bound cost model: billions of weights read per verify pass (time units below)")
+        rows = [r for r in rows if r["model"] not in {b["model"] for b in brows}] + brows
+        out["bytes_cost"] = brows
 
     if args.blocks:
         blocks = torch.load(args.blocks)
