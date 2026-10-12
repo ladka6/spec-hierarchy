@@ -76,6 +76,11 @@ def routed_forward(self, hidden_states):
                     keep = torch.zeros(E, dtype=torch.bool, device=probs.device)
                     keep[probs[(b - 1) * n : b * n].sum(0).topk(S).indices] = True
                     allowed[b * n : (b + 1) * n] = keep
+            elif route == "cur":                    # upper bound for drafter-informed sets: block b uses its OWN top-S
+                for b in range(1, (T + n - 1) // n):     # (not causal; inputs are true text = a perfect draft)
+                    keep = torch.zeros(E, dtype=torch.bool, device=probs.device)
+                    keep[probs[b * n : (b + 1) * n].sum(0).topk(S).indices] = True
+                    allowed[b * n : (b + 1) * n] = keep
             elif route == "seq":                    # baseline: one set for the whole sequence, from block 0
                 keep = torch.zeros(E, dtype=torch.bool, device=probs.device)
                 keep[probs[:n].sum(0).topk(S).indices] = True
@@ -227,8 +232,8 @@ def main():
     ap.add_argument("--steps", type=int, default=1500)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--lr", type=float, default=0.0, help="0 = 1e-3 routers / 5e-4 attention LoRA")
-    ap.add_argument("--route", choices=["block", "seq", "topk"], default="block",
-                    help="block = causal block-shared sets (ours); seq = one set per sequence; topk = fewer experts/token")
+    ap.add_argument("--route", choices=["block", "cur", "seq", "topk"], default="block",
+                    help="block = causal block-shared sets (ours); cur = a block's own top-S (upper bound); seq = one set per sequence; topk = fewer experts/token")
     ap.add_argument("--k", type=int, default=2, help="experts per token for --route topk")
     ap.add_argument("--expert-rank", type=int, default=8)
     ap.add_argument("--expert-impl", choices=["grouped", "loop"], default="grouped")
