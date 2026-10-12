@@ -39,22 +39,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from exp47_blockroute import weights_per_token  # noqa: E402
 
-STATE = {"S": None, "n": None, "teacher": False, "rec": None, "route": "block", "k": None}
+STATE = {"S": None, "n": None, "teacher": False, "rec": None, "route": "block", "k": None, "kin": 0}
 
 
-def window_unions(rec, E, n):
+def window_unions(rec, E, n, win=None):
     """rec: per-layer bool masks [T, E] of the experts each token uses (nonzero weight). Mean over layers of the distinct experts in n-token windows that start
     inside the constrained region (t >= n): (sum over aligned windows, count, sum over all windows, count)."""
     ua = na = uu = nu = 0.0
     for idx in rec:
         T = idx.shape[0]
-        if T < 2 * n:
+        if T < n + (win or n):
             continue
         m = idx.float()                                                       # [T, E]
         cs = torch.cat([torch.zeros(1, E, device=m.device), m.cumsum(0)])
-        st = torch.arange(n, T - n + 1, device=m.device)
-        u = ((cs[st + n] - cs[st]) > 0).sum(-1).float()                       # [windows]
-        al = st % n == 0
+        win = win or n
+        st = torch.arange(n, T - win + 1, device=m.device)
+        u = ((cs[st + win] - cs[st]) > 0).sum(-1).float()                     # [windows]
+        al = (st % n) <= n - win                                              # window inside one routing block
         ua += float(u[al].sum()); na += float(al.sum())
         uu += float(u.sum()); nu += len(u)
     L = len(rec)
@@ -97,6 +98,10 @@ def routed_forward(self, hidden_states):
                 kk = torch.zeros_like(allowed)
                 kk.scatter_(1, probs.topk(STATE["k"], -1).indices, True)
                 allowed[n:] = kk[n:]
+            if STATE["kin"]:                        # fewer experts per token inside the allowed set
+                kk = torch.zeros_like(allowed)
+                kk.scatter_(1, probs.masked_fill(~allowed, 0.0).topk(STATE["kin"], -1).indices, True)
+                allowed[n:] &= kk[n:]
         probs = probs.masked_fill(~allowed, 0.0)
     top_v, top_i = torch.topk(probs, self.top_k, dim=-1)
     if STATE["rec"] is not None:
@@ -244,13 +249,15 @@ def main():
     ap.add_argument("--route", choices=["block", "cur", "seq", "topk"], default="block",
                     help="block = causal block-shared sets (ours); cur = a block's own top-S (upper bound); seq = one set per sequence; topk = fewer experts/token")
     ap.add_argument("--k", type=int, default=2, help="experts per token for --route topk")
+    ap.add_argument("--kin", type=int, default=0, help="experts per token inside the block set (0 = model top-k)")
+    ap.add_argument("--win", type=int, default=16, help="verification window for the expert-union measurement")
     ap.add_argument("--expert-rank", type=int, default=8)
     ap.add_argument("--expert-impl", choices=["grouped", "loop"], default="grouped")
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     torch.manual_seed(0)
-    STATE.update(route=args.route, k=args.k)
+    STATE.update(route=args.route, k=args.k, kin=args.kin)
 
     ttok = AutoTokenizer.from_pretrained(args.text_tokenizer)
     tok = AutoTokenizer.from_pretrained(args.model)
@@ -263,7 +270,7 @@ def main():
     seqs = []
     for d in data:
         ids = tok(ttok.decode(d["ids"], skip_special_tokens=True), return_tensors="pt").input_ids[0, : args.max_len]
-        if len(ids) > 2 * args.n:
+        if len(ids) > 2 * args.win:
             seqs.append(ids)
         if len(seqs) >= args.train_seqs + args.val_seqs:
             break
@@ -285,7 +292,7 @@ def main():
                 if hasattr(m, "lA_gu"):
                     m.forward = types.MethodType(lora_experts_forward, m)
     n_params = sum(p.numel() for g in groups for p in g["params"])
-    print(f"[{args.mode}] {len(routers)} routers, {n_params / 1e6:.1f} M trainable params, route={args.route} S={args.S} k={args.k} n={args.n}",
+    print(f"[{args.mode}] {len(routers)} routers, {n_params / 1e6:.1f} M trainable params, route={args.route} S={args.S} k={args.k} kin={args.kin} n={args.n}",
           flush=True)
     opt = torch.optim.AdamW(groups, weight_decay=0.0)
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -322,11 +329,11 @@ def main():
             s = s.cuda()
             STATE["rec"] = []
             ref = teacher_lp(s)
-            for i, v in enumerate(window_unions(STATE["rec"], E, args.n)):
+            for i, v in enumerate(window_unions(STATE["rec"], E, args.n, args.win)):
                 un["free"][i] += v
             STATE["rec"] = []
             lp = F.log_softmax(model(s[None]).logits[0].float(), -1)
-            for i, v in enumerate(window_unions(STATE["rec"], E, args.n)):
+            for i, v in enumerate(window_unions(STATE["rec"], E, args.n, args.win)):
                 un["block"][i] += v
             STATE["rec"] = None
             m = slice(args.n, len(s) - 1)
@@ -342,8 +349,8 @@ def main():
             rec[f"union_{nm}_any"] = uu / max(nu, 1)
         history.append(rec)
         print(f"[eval step {step}] KL {rec['KL']:.4f} agree {rec['agree']:.4f} ppl {rec['ppl']:.3f} "
-              f"(original {rec['ppl_orig']:.3f})", flush=True)
-        print(f"[eval step {step}] experts/layer in {args.n}-token windows (cost vs 1 token): "
+              f"(original {rec['ppl_orig']:.3f}, ratio {rec['ppl'] / rec['ppl_orig']:.3f})", flush=True)
+        print(f"[eval step {step}] experts/layer in {args.win}-token windows (cost vs 1 token): "
               f"block-routed aligned {rec['union_block_aligned']:.1f} ({cost(rec['union_block_aligned']):.2f}x), "
               f"any offset {rec['union_block_any']:.1f} ({cost(rec['union_block_any']):.2f}x); "
               f"free routing {rec['union_free_any']:.1f} ({cost(rec['union_free_any']):.2f}x)", flush=True)
