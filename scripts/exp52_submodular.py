@@ -130,37 +130,41 @@ def main():
         groups = [torch.tensor(rng.sample(range(n), B)) for _ in range(args.groups)]
         plain = sum(ne + ex * float(cum[g][:, :, 0].any(0).sum()) for g in groups) / len(groups)
 
-        def run(policy, param):
-            tok = cost = 0.0
-            for g in groups:
-                cg, Gg, Ag, qg = cum[g], G[g], A[g], q[g]                 # cg [B, L, T, E]
-                if policy == "fixed":
-                    ell = param[g] if torch.is_tensor(param) else torch.full((B,), param)
-                    sel = cg.gather(2, ell.view(-1, 1, 1, 1).expand(-1, L, 1, E)).squeeze(2)
-                    c = t_draft + ne + ex * float(sel.any(0).sum())
-                else:                                                     # layer-wise greedy for the batch
-                    lam = param
-                    ell = torch.full((B,), T - 1)
-                    c = t_draft + ne
-                    for l in range(L):
-                        for _ in range(2):
-                            for b in range(B):
-                                others = cg[torch.arange(B) != b, l].gather(
-                                    1, ell[torch.arange(B) != b].view(-1, 1, 1).expand(-1, 1, E)).squeeze(1).any(0)
-                                u = (cg[b, l, : ell[b] + 1] | others).sum(-1).float()    # [ell_b + 1]
-                                val = Gg[b, : ell[b] + 1] - lam * ex * (L - l) * u
-                                ell[b] = int(val.argmax())
-                        sel = cg[:, l].gather(1, ell.view(-1, 1, 1).expand(-1, 1, E)).squeeze(1)
-                        c += ex * float(sel.any(0).sum())
-                tok += float((torch.minimum(Ag, ell) + 1).sum())
-                cost += c
-            return tok / cost / (B / plain), tok / len(groups) / B
+        gi = torch.stack(groups)                                          # [Gn, B]
+        Gn = len(groups)
+        ar = torch.arange(T)
+
+        def run(policy, param):                                           # all batches at once
+            Ag, Gg = A[gi], G[gi]                                         # [Gn, B], [Gn, B, T]
+            c = torch.full((Gn,), t_draft + ne)
+            if policy == "fixed":
+                ell = param[gi] if torch.is_tensor(param) else torch.full((Gn, B), param)
+                for l in range(L):
+                    sel = cum[gi, l].gather(2, ell[..., None, None].expand(-1, -1, 1, E)).squeeze(2)   # [Gn, B, E]
+                    c += ex * sel.any(1).sum(-1).float()
+            else:                                                         # layer-wise greedy for the batch
+                lam = param
+                ell = torch.full((Gn, B), T - 1)
+                for l in range(L):
+                    cl = cum[gi, l]                                       # [Gn, B, T, E]
+                    for _ in range(2):
+                        for b in range(B):
+                            sel = cl.gather(2, ell[..., None, None].expand(-1, -1, 1, E)).squeeze(2)   # [Gn, B, E]
+                            sel[:, b] = False
+                            u = (cl[:, b] | sel.any(1)[:, None, :]).sum(-1).float()                 # [Gn, T]
+                            val = Gg[:, b] - lam * ex * (L - l) * u
+                            val = val.masked_fill(ar[None] > ell[:, b, None], -1e30)
+                            ell[:, b] = val.argmax(1)
+                    sel = cl.gather(2, ell[..., None, None].expand(-1, -1, 1, E)).squeeze(2)
+                    c += ex * sel.any(1).sum(-1).float()
+            tok = float((torch.minimum(Ag, ell) + 1).sum())
+            return tok / float(c.sum()) / (B / plain), tok / Gn / B
 
         conf = {c: (q >= c).long().sum(1) for c in (0.1, 0.3, 0.5)}
         res = {"DFlash (l=15)": run("fixed", T - 1)}
         for c, lc in conf.items():
             res[f"confidence >= {c}"] = run("fixed", lc)
-        for x in (0.05, 0.1, 0.2, 0.3, 0.5):
+        for x in (0.25, 0.5, 1.0, 2.0, 4.0, 8.0):
             res[f"layer-wise greedy lam={x}"] = run("layer", x / ar1)
         res["oracle (l=A)"] = run("fixed", A)
         print(f"\n== batch {B} ({args.groups} random batches) ==")
