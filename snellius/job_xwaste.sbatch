@@ -18,5 +18,7 @@ source "${HSPEC_VENV:-$HOME/venvs/hspec}/bin/activate"
 export HF_HOME=${HF_HOME:-/scratch-shared/$USER/hf}
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export HSPEC_RESULTS="$SLURM_SUBMIT_DIR/results/horizon"
-python scripts/exp45_expert_waste.py --data "${LAGFT_DIR:-/scratch-shared/$USER/hspec_lagft}/data" ${XW_ARGS:-} \
+mkdir -p /scratch-shared/$USER/hspec_moe
+python scripts/exp45_expert_waste.py --data "${LAGFT_DIR:-/scratch-shared/$USER/hspec_lagft}/data" \
+  --save /scratch-shared/$USER/hspec_moe/routing.pt ${XW_ARGS:-} \
   2>&1 | grep --line-buffered -v -i warn
