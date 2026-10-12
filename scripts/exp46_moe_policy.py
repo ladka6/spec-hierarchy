@@ -38,11 +38,13 @@ def main():
     ne, ex = float(d["non_expert"]), float(d["expert"])
     mask = torch.zeros(n, L, T, E, dtype=torch.bool)
     mask.scatter_(3, rout, True)
-    cum = mask.cummax(dim=2).values                                 # cum[:, :, i] = experts of tokens 0..i
+    for t in range(1, T):                                           # in place: mask[:, :, i] = experts of tokens 0..i
+        mask[:, :, t] |= mask[:, :, t - 1]
+    cum = mask                                                      # (index 0 is still the anchor alone)
     ar1 = ne + ex * float(mask[:, :, 0].sum((1, 2)).float().mean())  # batch-1 plain step (anchor only)
     t_draft = args.t_draft_frac * ar1
     print(f"{n} blocks, {L} layers, {E} experts, top-{k}; mean accepted {A.float().mean():.2f}; "
-          f"plain step = {ar1 / 1e9:.2f}B weights, drafter = {t_draft / 1e9:.2f}B-equivalent")
+          f"plain step = {ar1 / 1e9:.2f}B weights, drafter = {t_draft / 1e9:.2f}B-equivalent", flush=True)
 
     pols = {f"fixed L={l}": torch.full((n,), l) for l in (2, 4, 6, 8, 10, 12, 15)}
     for c in (0.1, 0.3, 0.5, 0.7):
@@ -83,7 +85,7 @@ def main():
         for r in rows:
             if r["B"] == B:
                 print(f"{r['policy']:22s} {r['tau']:6.2f} {r['speedup_moe']:8.2f} {r['eta_moe']:6.3f} "
-                      f"{r['wasted_expert_loads']:6.1%} {r['vs_dflash']:9.3f} {r['speedup_dense_equiv']:11.2f}")
+                      f"{r['wasted_expert_loads']:6.1%} {r['vs_dflash']:9.3f} {r['speedup_dense_equiv']:11.2f}", flush=True)
 
 
 if __name__ == "__main__":
