@@ -81,6 +81,14 @@ def routed_forward(self, hidden_states):
                     keep = torch.zeros(E, dtype=torch.bool, device=probs.device)
                     keep[probs[b * n : (b + 1) * n].sum(0).topk(S).indices] = True
                     allowed[b * n : (b + 1) * n] = keep
+            elif route == "fixed":                  # exp51: sets given per layer and block in STATE["fixed"][layer]
+                sets = STATE["fixed"].setdefault(self.layer_idx, {})
+                for b in range(1, (T + n - 1) // n):     # a block with no stored set takes its own top-S and stores it
+                    if b not in sets:
+                        keep = torch.zeros(E, dtype=torch.bool, device=probs.device)
+                        keep[probs[b * n : (b + 1) * n].sum(0).topk(S).indices] = True
+                        sets[b] = keep
+                    allowed[b * n : (b + 1) * n] = sets[b]
             elif route == "seq":                    # baseline: one set for the whole sequence, from block 0
                 keep = torch.zeros(E, dtype=torch.bool, device=probs.device)
                 keep[probs[:n].sum(0).topk(S).indices] = True
@@ -193,7 +201,8 @@ def add_expert_lora(model, r=8, alpha=16.0, impl="grouped"):
 def add_adapters(model, mode, lr=0.0, rank=8, impl="grouped"):
     """Patch routers (block-shared, trainable) and add the LoRAs `mode` asks for. Returns (routers, groups, extra)."""
     routers = [m for m in model.modules() if type(m).__name__.endswith("TopKRouter")]
-    for r in routers:
+    for i, r in enumerate(routers):
+        r.layer_idx = i
         r.register_buffer("orig_weight", r.weight.detach().clone())
         r.forward = types.MethodType(routed_forward, r)
         r.weight.data = r.weight.data.float()
