@@ -127,7 +127,38 @@ def lora_experts_forward(self, hidden_states, top_k_index, top_k_weights):
     return final
 
 
-def add_expert_lora(model, r=8, alpha=16.0):
+def lora_experts_forward_grouped(self, hidden_states, top_k_index, top_k_weights):
+    """Same as lora_experts_forward, vectorised: tokens sorted by expert, one grouped matmul per projection for the
+    base weights and for each LoRA factor (transformers' grouped_mm path), instead of a Python loop over experts."""
+    from transformers.integrations.moe import _grouped_linear
+    k = top_k_index.size(-1)
+    T, H = hidden_states.shape
+    eid, perm = torch.sort(top_k_index.reshape(-1))
+    x = hidden_states[perm // k]
+    w = top_k_weights.reshape(-1)[perm]
+    hin = eid.float() if hidden_states.device.type == "cpu" else eid.int()
+    offs = torch.cumsum(torch.histc(hin, bins=self.num_experts, min=0, max=self.num_experts - 1), 0, dtype=torch.int32)
+    on = not STATE["teacher"]
+    dt = self.gate_up_proj.dtype
+
+    def lora(inp, A, B):
+        return _grouped_linear(_grouped_linear(inp.to(dt), A.to(dt), offs), B.to(dt), offs) * self.lscale
+
+    gu = _grouped_linear(x, self.gate_up_proj, offs)
+    if on:
+        gu = gu + lora(x, self.lA_gu, self.lB_gu)
+    gate, up = gu.chunk(2, dim=-1)
+    h = self.act_fn(gate) * up
+    y = _grouped_linear(h, self.down_proj, offs)
+    if on:
+        y = y + lora(h, self.lA_d, self.lB_d)
+    y = y * w.unsqueeze(-1).to(y.dtype)
+    inv = torch.empty_like(perm)
+    inv[perm] = torch.arange(perm.numel(), device=perm.device)
+    return y[inv].view(T, k, H).float().sum(1).to(hidden_states.dtype)
+
+
+def add_expert_lora(model, r=8, alpha=16.0, impl="grouped"):
     mods = [m for m in model.modules() if hasattr(m, "gate_up_proj") and hasattr(m, "down_proj")
             and m.gate_up_proj.dim() == 3]
     params = []
@@ -140,12 +171,12 @@ def add_expert_lora(model, r=8, alpha=16.0):
         m.lA_d = torch.nn.Parameter(torch.randn(E, r, I, device=dev) / math.sqrt(I))
         m.lB_d = torch.nn.Parameter(torch.zeros(E, H, r, device=dev))
         m.lscale = alpha / r
-        m.forward = types.MethodType(lora_experts_forward, m)
+        m.forward = types.MethodType(lora_experts_forward_grouped if impl == "grouped" else lora_experts_forward, m)
         params += [m.lA_gu, m.lB_gu, m.lA_d, m.lB_d]
     return mods, params
 
 
-def add_adapters(model, mode, lr=0.0, rank=8):
+def add_adapters(model, mode, lr=0.0, rank=8, impl="grouped"):
     """Patch routers (block-shared, trainable) and add the LoRAs `mode` asks for. Returns (routers, groups, extra)."""
     routers = [m for m in model.modules() if type(m).__name__.endswith("TopKRouter")]
     for r in routers:
@@ -166,7 +197,7 @@ def add_adapters(model, mode, lr=0.0, rank=8):
         groups.append({"params": p, "lr": lr or 5e-4})
         extra["attn"] = p
     if "experts" in mode:                                       # one LoRA per expert, off for the teacher
-        mods, p = add_expert_lora(model, r=rank)
+        mods, p = add_expert_lora(model, r=rank, impl=impl)
         assert mods, "no 3D expert tensors found (expects OLMoE-style experts)"
         groups.append({"params": p, "lr": lr or 5e-4})
         extra["experts"] = p
@@ -188,6 +219,7 @@ def main():
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--lr", type=float, default=0.0, help="0 = 1e-3 routers / 5e-4 attention LoRA")
     ap.add_argument("--expert-rank", type=int, default=8)
+    ap.add_argument("--expert-impl", choices=["grouped", "loop"], default="grouped")
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -213,7 +245,18 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, device_map="cuda")
     model.requires_grad_(False)
-    routers, groups, extra = add_adapters(model, args.mode, args.lr, args.expert_rank)
+    routers, groups, extra = add_adapters(model, args.mode, args.lr, args.expert_rank, args.expert_impl)
+    if "experts" in args.mode and args.expert_impl == "grouped":     # check the grouped kernels run here, else loop
+        try:
+            STATE.update(S=args.S, n=args.n)
+            model(train[0][: 4 * args.n].cuda()[None]).logits.float().mean().backward()
+            model.zero_grad(set_to_none=True)
+            print("expert LoRA: grouped_mm path", flush=True)
+        except RuntimeError as e:
+            print(f"expert LoRA: grouped path failed ({str(e)[:120]}), using the loop", flush=True)
+            for m in model.modules():
+                if hasattr(m, "lA_gu"):
+                    m.forward = types.MethodType(lora_experts_forward, m)
     n_params = sum(p.numel() for g in groups for p in g["params"])
     print(f"[{args.mode}] {len(routers)} routers, {n_params / 1e6:.1f} M trainable params, S={args.S} n={args.n}",
           flush=True)
