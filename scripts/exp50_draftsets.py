@@ -13,6 +13,17 @@ and on the full block (true 0..15): draft 0..15 vs oracle.
 Coverage = share of the true tokens' (token, expert) picks that fall inside the set; also the share of tokens
 whose whole top-k is inside. Split by accepted length (draft quality).
 
+Part 2 (what matters for committed tokens): the committed outputs of a round are computed on inputs that are the
+anchor and the ACCEPTED drafts (positions 0..A), whose routing the draft gives exactly; rejected inputs only matter
+through which experts they pull into the set. So: coverage of positions 0..A only, for sets built from all drafts,
+from drafts weighted by the drafter's confidence (cumulative product, ~ P(still accepted)), and the best set of size
+S for those positions. Then the LOSSLESS variant: verify with set S (built from the confident draft) plus "escaped"
+tokens that use their own top-k (anchor always; drafts with cumulative confidence >= c). A position computed with all
+its picks inside the set (or escaped) in every layer is computed exactly as by the original model, and the router can
+check this at runtime, so the round commits tokens up to the first accepted position that is not exact. Cost per
+layer = |set U experts of escaped tokens|. Speedup at batch 1 in the weights-read model of exp46 (drafter 0.2 step);
+S=0 is pure confidence truncation, "escape all" is DFlash.
+
   python scripts/exp50_draftsets.py --routing /scratch-shared/$USER/hspec_moe/routing.pt
 """
 
@@ -86,6 +97,61 @@ def main():
                                                      for m in buckets.values()))
         print()
     print("blocks per bucket: " + ", ".join(f"{b} {int(m.sum())}" for b, m in buckets.items()))
+    part2(d, args, buckets)
+
+
+def part2(d, args, buckets):
+    A, dprob = d["A"].long(), d["dprob"].float()
+    dr, tr = d["draft_rout"].long(), d["true_rout"].long()
+    n, L, T, k = dr.shape
+    E = int(max(dr.max(), tr.max())) + 1
+    pos = torch.arange(T)
+    need = pos[None] <= A[:, None]                                       # [n, 16] inputs of committed outputs
+    same = (dr == tr).all(-1).all(1)[need].float().mean()
+    print(f"\n== part 2: committed tokens only (positions 0..A) ==\nsanity: draft routing == true routing on accepted "
+          f"positions for {float(same):.1%} of them (differences = numerics)")
+    tok = torch.zeros(n, L, T, E, dtype=torch.bool)
+    tok.scatter_(3, dr, True)                                            # what the verify pass actually computes
+    w = torch.cat([torch.ones(n, 1), dprob.cumprod(1)], 1)               # [n, 16] ~ P(position still accepted)
+    srcs = {"draft, all 16": torch.ones(n, T), "draft, confidence-weighted": w, "best set for 0..A": need.float()}
+    print(f"{'S':>3s} {'set built from':28s} " + " ".join(f"{b:>22s}" for b in buckets))
+    print(f"{'':32s}" + " ".join(f"{'picks / tok-layer / tok-all':>22s}" for _ in buckets))
+    for S in args.sets:
+        for name, wt in srcs.items():
+            keep = topS(torch.einsum("nt,nlte->nle", wt, tok.float()), S)
+            inside = keep[:, :, None, :] | ~tok                          # [n, L, T, E]: pick inside or not a pick
+            pick = (tok & keep[:, :, None, :]).sum(-1).float() / k       # [n, L, T]
+            full = inside.all(-1)                                        # [n, L, T]
+            cells = []
+            for m in buckets.values():
+                nm = need & m[:, None]
+                cells.append(f"{float(pick.mean(1)[nm].mean()):.3f}/{float(full.float().mean(1)[nm].mean()):.3f}/"
+                              f"{float(full.all(1)[nm].float().mean()):.3f}")
+            print(f"{S:3d} {name:28s} " + " ".join(f"{c:>22s}" for c in cells))
+        print()
+
+    ne, ex = float(d["non_expert"]), float(d["expert"])
+    ar1 = ne + ex * float(tok[:, :, 0].sum((1, 2)).float().mean())
+    t_draft = 0.2 * ar1
+    print("== lossless verification with a draft-built expert set + escaped tokens (batch 1, weights-read model) ==")
+    print(f"{'S':>3s} {'escape':>10s} {'committed':>9s} {'vs A+1':>7s} {'experts/layer':>13s} {'speedup':>8s}")
+    rows = [(0, "all")] + [(S, c) for S in [0] + args.sets for c in (0.9, 0.5, 0.1, "anchor")]
+    for S, c in rows:
+        keep = topS(torch.einsum("nt,nlte->nle", w, tok.float()), S) if S else torch.zeros(n, L, E, dtype=torch.bool)
+        esc = torch.ones(n, T, dtype=torch.bool) if c == "all" else (w >= (2.0 if c == "anchor" else c))
+        esc[:, 0] = True
+        exact = esc | (keep[:, :, None, :] | ~tok).all(-1).all(1)        # [n, 16] position computed exactly
+        bad = ~exact & need
+        committed = torch.where(bad.any(1), bad.float().argmax(1), A + 1)
+        u = (keep | (tok & esc[:, None, :, None]).any(2)).sum(-1).float()  # [n, L]
+        cost = t_draft + ne + ex * u.sum(1)
+        sp = float(committed.sum()) / float(cost.sum()) * ar1
+        lab = "DFlash" if c == "all" else str(c)
+        print(f"{S:3d} {lab:>10s} {float(committed.float().mean()):9.2f} {float((committed.float() / (A + 1)).mean()):7.3f} "
+              f"{float(u.mean()):13.1f} {sp:8.2f}")
+    need_u = (tok & need[:, None, :, None]).any(2).sum(-1).float()
+    sp = float((A + 1).sum()) / float((t_draft + ne + ex * need_u.sum(1)).sum()) * ar1
+    print(f"oracle truncation (load exactly the experts of 0..A): {float(need_u.mean()):.1f} experts/layer, speedup {sp:.2f}")
 
 
 if __name__ == "__main__":
