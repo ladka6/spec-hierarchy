@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=18
 #SBATCH --time=02:30:00
-#SBATCH --output=copytrain-%j.out
+#SBATCH --output=copytaps-%j.out
 # exp55 tap-layer copies: only the layers DFlash reads (8 layers) and taps + bridge layers (12), trained with the
 # speculation objective (teacher from job_copytrain), then exp27 on both and on the untrained 8-layer copy.
 set -uo pipefail

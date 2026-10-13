@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=18
 #SBATCH --time=00:45:00
-#SBATCH --output=copytrain-%j.out
+#SBATCH --output=copyref-%j.out
 # exp55 reference: the same held-out agreement metrics for the 4-bit copy (no training).
 set -uo pipefail
 cd "$SLURM_SUBMIT_DIR"
