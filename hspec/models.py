@@ -76,6 +76,17 @@ def load_mid(spec: str, device: str = "cuda"):
             or a pre-quantized AWQ/GPTQ checkpoint whose kernels are installed)
     """
     kind, model_id = spec.split(":", 1)
+    if kind == "lora":
+        # a copy trained for speculation (exp55): base copy spec from meta.json + merged low-rank update
+        import json as _json
+        from pathlib import Path as _Path
+
+        from hspec.copylora import merge_lora_
+
+        base = _json.loads((_Path(model_id) / "meta.json").read_text())["base"]
+        model = load_mid(base, device)
+        merge_lora_(model, model_id)
+        return model.eval()
     kwargs = {"attn_implementation": "sdpa"}
     if kind == "bnb4":
         kwargs["quantization_config"] = BitsAndBytesConfig(
