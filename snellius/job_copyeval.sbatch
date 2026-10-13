@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=18
-#SBATCH --time=04:30:00
+#SBATCH --time=06:00:00
 #SBATCH --output=copyeval-%j.out
 # exp27 (offline refresh, T=0) with the trained copies and the untrained 18-layer copy (untrained rtn2/rtn4: results/lowbit).
 set -uo pipefail
@@ -21,7 +21,7 @@ mkdir -p "$HSPEC_RESULTS"
 F="grep --line-buffered -v -i warn"
 W=/scratch-shared/$USER/hspec_copytrain
 mkdir -p $W
-for P in lora:$W/copy_rtn2 lora:$W/copy_keep18 keep18:Qwen/Qwen3-8B; do
+for P in lora:$W/copy_rtn2 lora:$W/copy_keep18 lora:$W/copy_keep0-1-8-9-16-17-24-25-32-33-34-35 keep18:Qwen/Qwen3-8B; do
   N=$(basename ${P#*:}); [ "$P" = keep18:Qwen/Qwen3-8B ] && N=keep18_untrained
   python scripts/exp27_refresh.py --no-tokens --no-fresh --proxies $P --out exp27_$N 2>&1 | $F
 done

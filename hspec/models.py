@@ -50,9 +50,10 @@ def kept_layers(n_layers: int, keep: int, last: int = 33) -> list[int]:
 
 
 @torch.no_grad()
-def skip_layers_(model, keep: int, last: int = 33):
-    """Turn every decoder layer not in kept_layers into identity by zeroing its output projections."""
-    keep_ids = set(kept_layers(len(model.model.layers), keep, last))
+def skip_layers_(model, keep, last: int = 33):
+    """Turn every decoder layer not kept into identity by zeroing its output projections.
+    keep: a number (spread evenly over 0..last) or an explicit list of layer indices."""
+    keep_ids = set(keep) if isinstance(keep, (list, tuple, set)) else set(kept_layers(len(model.model.layers), keep, last))
     for i, layer in enumerate(model.model.layers):
         if i not in keep_ids:
             layer.self_attn.o_proj.weight.zero_()
@@ -69,7 +70,8 @@ def load_mid(spec: str, device: str = "cuda"):
       ao4   4-bit weight-only (torchao, group 128). Fast small-batch kernel.
       ao8   8-bit weight-only (torchao).
       tao4 / tao8  torchao int4 / int8 weight-only via quantize_ on the decoder layers (fast at batch 1)
-      keepN layer-skipped target, N layers kept evenly over 0..33 (others identity): quality only
+      keepN layer-skipped target, N layers kept evenly over 0..33 (others identity): quality only;
+            keepA-B-C...: exactly layers A, B, C ... kept
       rtnN  simulated N-bit round-to-nearest weights (group 64), bf16 storage: quality only
       hqqN  N-bit HQQ (N = 2, 3, 4; needs `pip install hqq`). Quality test only: default backend is slow.
       hf    plain bf16 checkpoint (e.g. a smaller model of the same family,
@@ -127,7 +129,8 @@ def load_mid(spec: str, device: str = "cuda"):
         # passes through). bf16 storage: quality test of a pruned feature generator, no speed benefit
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, device_map=device,
                                                      attn_implementation="sdpa")
-        skip_layers_(model, int(kind[4:]))
+        arg = kind[4:]
+        skip_layers_(model, [int(x) for x in arg.split("-")] if "-" in arg else int(arg))
         return model.eval()
     elif kind.startswith("rtn"):
         # simulated N-bit weight quantization (round-to-nearest, asymmetric, group 64) of the
