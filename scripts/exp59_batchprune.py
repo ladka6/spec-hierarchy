@@ -237,7 +237,9 @@ def load_curves(path, model_substr):
     if not path:
         return None
     rows = json.loads(Path(path).read_text())["rows"]
-    row = next((r for r in rows if model_substr.lower() in r["model"].lower()), None)
+    want_awq = "awq" in model_substr.lower()
+    row = next((r for r in rows if model_substr.lower() in r["model"].lower()
+                and ("awq" in r["model"].lower()) == want_awq), None)
     if row is None:
         raise SystemExit(f"no row for '{model_substr}' in {path}: {[r['model'] for r in rows]}")
     curves = {}
@@ -396,7 +398,7 @@ def main():
     r.add_argument("--top", type=int, default=12)
     r.add_argument("--out", default="exp59_replay")
     args = ap.parse_args()
-    if args.target_model and "AWQ" in args.target_model.upper() and args.phase == "replay":
+    if args.phase == "replay" and "AWQ" in args.target_model.upper():
         raise SystemExit("--target-model must not match the AWQ row")
     (collect if args.phase == "collect" else replay)(args)
 

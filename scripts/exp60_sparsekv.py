@@ -174,7 +174,7 @@ def main():
     for b in args.budgets:
         views[f"sparse{b}"] = (args.sinks, args.window, b)
 
-    rec = defaultdict(list)
+    pools, evalq = {}, {}
     for d in args.datasets:
         qs = load_prompts(d, args.pool + args.n)
         pool = []
@@ -184,34 +184,82 @@ def main():
                       return_tensors="pt", add_special_tokens=False)["input_ids"].to("cuda")
             r = two_stage_generate(draft, target, target, target, ids, args.pool_new, stops)
             pool.append((q, tok.decode(r.generated, skip_special_tokens=True)))
+        pools[d], evalq[d] = pool, qs[args.pool :]
         print(f"[{d}] history pool: {len(pool)} answers", flush=True)
-        for ctx in args.ctx:
-            for q in qs[args.pool :]:
-                text, nturns = build_history(tok, pool, q, ctx, kw)
+
+    rec = defaultdict(list)
+    # shortest context first; results are saved after every context length, and a prompt that runs out of memory
+    # is skipped (logged) instead of ending the job
+    for ctx in sorted(args.ctx):
+        oom = 0
+        for d in args.datasets:
+            for q in evalq[d]:
+                text, nturns = build_history(tok, pools[d], q, ctx, kw)
                 ids = tok(text, return_tensors="pt", add_special_tokens=False)["input_ids"].to("cuda")
                 n0 = ids.shape[1]
-                x = two_stage_generate(draft, target, target, target, ids, args.max_new, stops).output_ids[0]
-                feats, tcache = prefill_features(target, x, draft.target_layer_ids, args.chunk)
-                anchors = list(range(n0, len(x) - 2 * bs - 1, args.stride))[: args.anchors]
-                for s in anchors:
-                    for key, val in eval_anchor(draft, target, copies, feats, tcache, x, s, bs, views, args.probe).items():
-                        rec[(ctx, d) + key].append(val)
+                feats = tcache = None
+                try:
+                    x = greedy_long(target, ids[0], args.max_new, stops, args.chunk)
+                    feats, tcache = prefill_features(target, x, draft.target_layer_ids, args.chunk)
+                    anchors = list(range(n0, len(x) - 2 * bs - 1, args.stride))[: args.anchors]
+                    got = defaultdict(list)
+                    for s in anchors:
+                        for key, val in eval_anchor(draft, target, copies, feats, tcache, x, s, bs, views,
+                                                    args.probe).items():
+                            got[(ctx, d) + key].append(val)
+                    for k, vs in got.items():                  # only whole prompts enter the averages
+                        rec[k] += vs
+                    print(f"[{d} ctx={ctx}] prompt {n0} tokens ({nturns} history turns), {len(anchors)} anchors, "
+                          f"{len(x) - n0} generated, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GB",
+                          flush=True)
+                except torch.OutOfMemoryError:
+                    oom += 1
+                    print(f"[{d} ctx={ctx}] prompt {n0} tokens: OUT OF MEMORY, skipped", flush=True)
                 del feats, tcache
                 torch.cuda.empty_cache()
-                print(f"[{d} ctx={ctx}] prompt {n0} tokens ({nturns} history turns), {len(anchors)} anchors, "
-                      f"{len(x) - n0} generated", flush=True)
+                torch.cuda.reset_peak_memory_stats()
+        rows = summarize(rec, args, bs)
+        print_table([r for r in rows if r["ctx"] == ctx],
+                    ["ctx", "copy", "view", "tau", "nodes", "agree", "cos", "kv_read", "x_vs_dflash", "anchors"],
+                    f"ctx {ctx}: KV-sparse copies (sinks {args.sinks}, window {args.window}, probe {args.probe}; "
+                    f"speed from the bytes model, see header; {oom} prompts skipped for memory)")
+        save_json(args.out, {"args": vars(args), "rows": rows})
 
+
+@torch.inference_mode()
+def greedy_long(model, ids, max_new, stops, chunk):
+    """Greedy decoding with a chunked prefill (no hidden states kept): the target's own trajectory at long context."""
+    from transformers import DynamicCache
+
+    cache = DynamicCache()
+    T = len(ids)
+    for a in range(0, T, chunk):
+        out = model(ids[None, a : a + chunk], position_ids=torch.arange(a, min(a + chunk, T), device=ids.device)[None],
+                    past_key_values=cache, use_cache=True, logits_to_keep=1)
+    nxt = out.logits[0, -1].argmax()
+    gen = [int(nxt)]
+    while len(gen) < max_new and gen[-1] not in stops:
+        p = T + len(gen) - 1
+        out = model(nxt.view(1, 1), position_ids=torch.tensor([[p]], device=ids.device), past_key_values=cache,
+                    use_cache=True, logits_to_keep=1)
+        nxt = out.logits[0, -1].argmax()
+        gen.append(int(nxt))
+    del cache
+    return torch.cat([ids, torch.tensor(gen, device=ids.device)])
+
+
+def summarize(rec, args, bs):
     rows = []
-    for ctx in args.ctx:
+    for ctx in sorted(args.ctx):
         keys = sorted({k[2:] for k in rec if k[0] == ctx}, key=lambda k: (k[0] != "block1", k[0], k[1]))
         for cname, vname in keys:
-            vals = [v_ for k, vs in rec.items() if k[0] == ctx and k[2:] == (cname, vname) for v_ in vs]
+            vals = rec_all(rec, ctx, (cname, vname))
             if not vals:
                 continue
             tau, nodes = mean(x_[0] for x_ in vals), mean(x_[1] for x_ in vals)
             nread = mean(x_[4] for x_ in vals)
             kv = args.kv_ms_per_ktoken
-            # bytes model: a pass = weights + width overhead (exp29 table, relative to 1 token) + KV read
+            # bytes model: a pass = weights + width overhead (exp29 table) + KV read
             base_tau = mean(x_[0] for x_ in rec_all(rec, ctx, ("block1", "-")))
             base_ms = args.drafter_ms + v(16) + kv * ctx / 1000
             if cname == "block1":
@@ -225,10 +273,7 @@ def main():
                          "agree": mean(x_[2] for x_ in vals), "cos": mean(x_[3] for x_ in vals),
                          "kv_read": nread / max(ctx, 1), "x_vs_dflash": (tau / ms) / (base_tau / base_ms),
                          "anchors": len(vals)})
-    print_table(rows, ["ctx", "copy", "view", "tau", "nodes", "agree", "cos", "kv_read", "x_vs_dflash", "anchors"],
-                f"KV-sparse copies at long context (sinks {args.sinks}, window {args.window}, probe {args.probe}; "
-                f"speed from the bytes model, see header)")
-    save_json(args.out, {"args": vars(args), "rows": rows})
+    return rows
 
 
 def rec_all(rec, ctx, key):

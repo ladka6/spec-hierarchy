@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from test_cpu import V, tiny_draft, tiny_target  # noqa: E402
 
 from dflash.model import extract_context_feature  # noqa: E402
-from exp60_sparsekv import eval_anchor  # noqa: E402
+from exp60_sparsekv import eval_anchor, greedy_long  # noqa: E402
 from hspec.pipeline import ar_generate  # noqa: E402
 from hspec.sparsekv import attention_scores, prefill_features, prefix_cache, select_indices, sparse_cache  # noqa: E402
 
@@ -95,6 +95,13 @@ def main():
     ok = a[:2] == b[:2] and abs(a[2] - b[2]) < 1e-6 and abs(a[3] - 1.0) < 1e-4 and b[4] == s and c[4] == 2 + 4 + 3
     print(f"eval_anchor: full {a}, all-positions {b}, sparse {c}: consistent {ok}")
     failures += not ok
+    # greedy_long (chunked prefill + greedy) == plain AR greedy, with and without a stop token
+    for stops in ([V + 10], [int(x[20])]):
+        ref = ar_generate(target, ids, 40, stops).output_ids[0]
+        got = greedy_long(target, ids[0], 40, stops, chunk=3)
+        ok = torch.equal(ref, got)
+        print(f"greedy_long == AR greedy (stops {stops}): {ok} ({len(got)} tokens)")
+        failures += not ok
     print("ALL PASSED" if not failures else f"{failures} FAILURES")
 
 

@@ -19,6 +19,7 @@ module load 2024 2>/dev/null && module load Python/3.12.3-GCCcore-13.3.0 2>/dev/
 source "${HSPEC_VENV:-$HOME/venvs/hspec}/bin/activate"
 export HF_HOME=${HF_HOME:-/scratch-shared/$USER/hf}
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HSPEC_RESULTS="$SLURM_SUBMIT_DIR/results/sparsekv"
 mkdir -p "$HSPEC_RESULTS"
 F="grep --line-buffered -v -i warn"
