@@ -27,6 +27,9 @@ from hspec.pipeline import crop  # noqa: E402
 from hspec.utils import print_table, save_json  # noqa: E402
 
 
+KEEP = []
+
+
 def timed(fn, reps=30):
     out = []
     for i in range(reps + 5):
@@ -64,6 +67,7 @@ def capture_model(model, ctx, q):
     with torch.cuda.graph(g):
         model(ids, position_ids=pos, past_key_values=cache, use_cache=True, logits_to_keep=q)
     crop(cache, ctx)
+    KEEP.extend([ids, pos, cache])          # a graph reads its inputs from fixed addresses: keep them alive
     return g, cache
 
 
@@ -90,6 +94,7 @@ def capture_draft(draft, target, ctx_feat=64, batch=1):
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         step()
+    KEEP.extend([h, noise, pos])
     return g
 
 
