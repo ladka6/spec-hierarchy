@@ -38,7 +38,7 @@ from dflash.model import extract_context_feature  # noqa: E402
 from hspec.lagtrain import draft_logits_lagged  # noqa: E402
 from hspec.models import load_draft, load_target, load_tokenizer  # noqa: E402
 
-VIEWS = ["prefix", "preview", "greedy", "future", "final"]
+VIEWS = ["prefix", "preview", "greedy", "future", "future48", "final"]
 
 
 def last_number(text):
@@ -69,6 +69,8 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--max-new", type=int, default=400)
     ap.add_argument("--checkpoints", nargs="+", type=int, default=[32, 64, 128])
+    ap.add_argument("--scorers", nargs="+", default=["prm_last", "prm_min"], help="prm_last, prm_min, self")
+    ap.add_argument("--prm", default="Qwen/Qwen2.5-Math-PRM-7B")
     ap.add_argument("--out", default="exp54_foresight.json")
     args = ap.parse_args()
     from datasets import load_dataset
@@ -91,7 +93,7 @@ def main():
                                        add_generation_prompt=True, enable_thinking=False)
 
     @torch.inference_mode()
-    def judge(problem, partials):
+    def judge_self(problem, partials):
         texts = [chat(f"Problem:\n{problem}\n\nPartial solution (may be cut off mid-sentence):\n{p}\n\n"
                       "Is the partial solution correct so far, with no mistakes in what it says? "
                       "Answer with Yes or No only.") for p in partials]
@@ -102,6 +104,39 @@ def main():
             lp = torch.log_softmax(logits[:, [yes_id, no_id]], -1)
             out += lp[:, 0].exp().tolist()
         return out
+
+    prm = prm_tok = None
+    if any(sc.startswith("prm") for sc in args.scorers):
+        from transformers import AutoModel, AutoTokenizer
+        prm_tok = AutoTokenizer.from_pretrained(args.prm, trust_remote_code=True)
+        prm = AutoModel.from_pretrained(args.prm, dtype=torch.bfloat16, device_map="cuda",
+                                        trust_remote_code=True).eval()
+        sep_id = prm_tok.encode("<extra_0>")[0]
+
+    @torch.inference_mode()
+    def judge_prm(problem, partials):
+        """Qwen2.5-Math-PRM: steps split at blank lines, a step reward at every <extra_0>; (last, min)."""
+        last, mn = [], []
+        for p in partials:
+            steps = [x for x in re.split(r"\n\s*\n", p.strip()) if x.strip()] or [p]
+            msgs = [{"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
+                    {"role": "user", "content": problem},
+                    {"role": "assistant", "content": "<extra_0>".join(steps) + "<extra_0>"}]
+            ids = prm_tok(prm_tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False),
+                          return_tensors="pt").input_ids.to("cuda")
+            logits = prm(input_ids=ids)[0][0].float()                      # [T, 2]
+            r = torch.softmax(logits[ids[0] == sep_id], -1)[:, 1]
+            last.append(float(r[-1]))
+            mn.append(float(r.min()))
+        return last, mn
+
+    def judge(problem, partials):
+        out = {}
+        if "self" in args.scorers:
+            out["self"] = judge_self(problem, partials)
+        if prm is not None:
+            out["prm_last"], out["prm_min"] = judge_prm(problem, partials)
+        return {k: v for k, v in out.items() if k in args.scorers}
 
     @torch.inference_mode()
     def preview(ids):
@@ -118,8 +153,8 @@ def main():
     tok.padding_side = "left"
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    per_ck = {t: {v: [] for v in VIEWS} for t in args.checkpoints}
-    prune = {t: {v: [0, 0] for v in VIEWS} for t in args.checkpoints}
+    per_ck = {sc: {t: {v: [] for v in VIEWS} for t in args.checkpoints} for sc in args.scorers}
+    prune = {sc: {t: {v: [0, 0] for v in VIEWS} for t in args.checkpoints} for sc in args.scorers}
     acc_all, used = [], 0
     for pi, r in enumerate(rows):
         gold = float(r["answer"].split("####")[-1].strip().replace(",", ""))
@@ -143,7 +178,7 @@ def main():
             continue
         used += 1
         for t in args.checkpoints:
-            idx = [i for i, rr in enumerate(resps) if len(rr) > t + bs]
+            idx = [i for i, rr in enumerate(resps) if len(rr) > t + 48]
             lab = [correct[i] for i in idx]
             if len(set(lab)) < 2:
                 continue
@@ -157,29 +192,33 @@ def main():
                 texts["preview"].append(dec(rr[:t] + preview(full_prefix).tolist()))
                 texts["greedy"].append(dec(rr[:t] + greedy(full_prefix, bs - 1).tolist()))
                 texts["future"].append(dec(rr[: t + bs - 1]))
+                texts["future48"].append(dec(rr[: t + 47]))
                 texts["final"].append(dec(rr))
             for v in VIEWS:
-                sc = judge(r["question"], texts[v])
-                a = auc(sc, lab)
-                if a is not None:
-                    per_ck[t][v].append(a)
-                keep = sorted(range(len(sc)), key=lambda j: -sc[j])[: max(1, len(sc) // 2)]
-                prune[t][v][0] += sum(lab[j] for j in keep)
-                prune[t][v][1] += len(keep)
+                for sname, sc in judge(r["question"], texts[v]).items():
+                    a = auc(sc, lab)
+                    if a is not None:
+                        per_ck[sname][t][v].append(a)
+                    keep = sorted(range(len(sc)), key=lambda j: -sc[j])[: max(1, len(sc) // 2)]
+                    prune[sname][t][v][0] += sum(lab[j] for j in keep)
+                    prune[sname][t][v][1] += len(keep)
         print(f"{pi + 1}/{len(rows)}: {sum(correct)}/{len(correct)} correct, scored", flush=True)
 
     print(f"\nsample accuracy {sum(acc_all) / len(acc_all):.3f}; {used} problems with mixed outcomes used")
-    print("\nwithin-problem AUC of the judge score for final correctness (0.5 = chance)")
-    print(f"{'checkpoint':>10s} " + " ".join(f"{v:>9s}" for v in VIEWS) + "   problems")
     res = {}
-    for t in args.checkpoints:
-        m = {v: (sum(x) / len(x) if x else float("nan")) for v, x in per_ck[t].items()}
-        res[t] = {"auc": m, "n": len(per_ck[t]["prefix"]),
-                  "kept_acc": {v: c / max(n, 1) for v, (c, n) in prune[t].items()}}
-        print(f"{t:10d} " + " ".join(f"{m[v]:9.3f}" for v in VIEWS) + f"   {len(per_ck[t]['prefix'])}")
-    print("\naccuracy of the samples kept when keeping the top half by score (mixed problems)")
-    for t in args.checkpoints:
-        print(f"{t:10d} " + " ".join(f"{res[t]['kept_acc'][v]:9.3f}" for v in VIEWS))
+    for sname in args.scorers:
+        print(f"\n== scorer {sname}: within-problem AUC for final correctness (0.5 = chance)")
+        print(f"{'checkpoint':>10s} " + " ".join(f"{v:>9s}" for v in VIEWS) + "   problems")
+        res[sname] = {}
+        for t in args.checkpoints:
+            pc = per_ck[sname][t]
+            m = {v: (sum(x) / len(x) if x else float("nan")) for v, x in pc.items()}
+            res[sname][t] = {"auc": m, "n": len(pc["prefix"]),
+                             "kept_acc": {v: c / max(n, 1) for v, (c, n) in prune[sname][t].items()}}
+            print(f"{t:10d} " + " ".join(f"{m[v]:9.3f}" for v in VIEWS) + f"   {len(pc['prefix'])}")
+        print("accuracy of the samples kept when keeping the top half by score")
+        for t in args.checkpoints:
+            print(f"{t:10d} " + " ".join(f"{res[sname][t]['kept_acc'][v]:9.3f}" for v in VIEWS))
     Path(args.out).write_text(json.dumps({"args": vars(args), "results": res}, indent=1))
 
 

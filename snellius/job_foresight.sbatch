@@ -19,4 +19,4 @@ export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export HSPEC_RESULTS="$SLURM_SUBMIT_DIR/results/horizon"
 mkdir -p "$HSPEC_RESULTS"
 python scripts/exp54_foresight.py --problems 250 --samples 8 --temperature 1.0 \
-  --out "$HSPEC_RESULTS/exp54_foresight.json" 2>&1 | grep --line-buffered -v -i warn
+  --scorers prm_last prm_min --out "$HSPEC_RESULTS/exp54_foresight_prm.json" 2>&1 | grep --line-buffered -v -i warn
