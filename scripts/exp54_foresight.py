@@ -60,6 +60,50 @@ def auc(scores, labels):
     return wins / (len(pos) * len(neg))
 
 
+def load_prm(name):
+    """Qwen2.5-Math-PRM without its remote code (written for transformers 4): the native Qwen2Model backbone plus
+    the score head rebuilt from the checkpoint (Linear, ReLU, Linear)."""
+    from huggingface_hub import snapshot_download
+    from safetensors import safe_open
+    from transformers import AutoTokenizer, Qwen2Config, Qwen2Model
+
+    path = Path(snapshot_download(name))
+    tok_ = AutoTokenizer.from_pretrained(path)
+    cfg = Qwen2Config.from_pretrained(path)
+    if getattr(cfg, "pad_token_id", None) is None:
+        cfg.pad_token_id = tok_.pad_token_id if tok_.pad_token_id is not None else tok_.eos_token_id
+    base = Qwen2Model.from_pretrained(path, config=cfg, dtype=torch.bfloat16, device_map="cuda").eval()
+    index = path / "model.safetensors.index.json"
+    files = (json.loads(index.read_text())["weight_map"] if index.exists()
+             else {k: "model.safetensors" for k in safe_open(path / "model.safetensors", "pt").keys()})
+    keys = [k for k in files if k.startswith("score.")]
+    tens = {}
+    for f in {files[k] for k in keys}:
+        with safe_open(path / f, "pt") as sf:
+            for k in keys:
+                if files[k] == f:
+                    tens[k] = sf.get_tensor(k)
+    ids = sorted({int(k.split(".")[1]) for k in keys})
+    mods = []
+    for j, i in enumerate(ids):
+        w = tens[f"score.{i}.weight"]
+        lin = torch.nn.Linear(w.shape[1], w.shape[0], bias=f"score.{i}.bias" in tens)
+        lin.weight.data.copy_(w)
+        if lin.bias is not None:
+            lin.bias.data.copy_(tens[f"score.{i}.bias"])
+        mods.append(lin)
+        if j < len(ids) - 1:
+            mods.append(torch.nn.ReLU())
+    head = torch.nn.Sequential(*mods).to("cuda", torch.bfloat16).eval()
+    print(f"PRM: backbone {sum(p.numel() for p in base.parameters()) / 1e9:.2f}B, score head {[tuple(tens[f'score.{i}.weight'].shape) for i in ids]}",
+          flush=True)
+
+    def run(input_ids):
+        return head(base(input_ids=input_ids).last_hidden_state)
+
+    return tok_, run
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
@@ -107,15 +151,7 @@ def main():
 
     prm = prm_tok = None
     if any(sc.startswith("prm") for sc in args.scorers):
-        from transformers import AutoConfig, AutoModel, AutoTokenizer
-        prm_tok = AutoTokenizer.from_pretrained(args.prm, trust_remote_code=True)
-        pcfg = AutoConfig.from_pretrained(args.prm, trust_remote_code=True)
-        for k in ("pad_token_id", "bos_token_id", "eos_token_id"):       # remote code predates transformers 5
-            if not hasattr(pcfg, k) or getattr(pcfg, k, None) is None:
-                setattr(pcfg, k, getattr(prm_tok, k, None) if getattr(prm_tok, k, None) is not None
-                        else prm_tok.eos_token_id)
-        prm = AutoModel.from_pretrained(args.prm, config=pcfg, dtype=torch.bfloat16, device_map="cuda",
-                                        trust_remote_code=True).eval()
+        prm_tok, prm = load_prm(args.prm)
         sep_id = prm_tok.encode("<extra_0>")[0]
 
     @torch.inference_mode()
@@ -129,7 +165,7 @@ def main():
                     {"role": "assistant", "content": "<extra_0>".join(steps) + "<extra_0>"}]
             ids = prm_tok(prm_tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False),
                           return_tensors="pt").input_ids.to("cuda")
-            logits = prm(input_ids=ids)[0][0].float()                      # [T, 2]
+            logits = prm(ids)[0].float()                                     # [T, 2]
             r = torch.softmax(logits[ids[0] == sep_id], -1)[:, 1]
             last.append(float(r[-1]))
             mn.append(float(r.min()))
