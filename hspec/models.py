@@ -89,6 +89,17 @@ def load_mid(spec: str, device: str = "cuda"):
         model = load_mid(base, device)
         merge_lora_(model, model_id)
         return model.eval()
+    if kind == "bridge":
+        # kept target layers + trained bridges replacing the removed spans (exp57)
+        import json as _json
+        from pathlib import Path as _Path
+
+        from hspec.bridges import load_bridged
+
+        base_id = _json.loads((_Path(model_id) / "meta.json").read_text())["target"]
+        model = AutoModelForCausalLM.from_pretrained(base_id, dtype=torch.bfloat16, device_map=device,
+                                                     attn_implementation="sdpa")
+        return load_bridged(model, model_id).eval()
     kwargs = {"attn_implementation": "sdpa"}
     if kind == "bnb4":
         kwargs["quantization_config"] = BitsAndBytesConfig(
