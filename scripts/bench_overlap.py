@@ -63,6 +63,7 @@ def capture_model(model, ctx, q):
         for _ in range(3):
             step()
     torch.cuda.current_stream().wait_stream(s)
+    KEEP.append([(layer.keys, layer.values) for layer in cache.layers])   # the prefix KV the graph will read
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         model(ids, position_ids=pos, past_key_values=cache, use_cache=True, logits_to_keep=q)
