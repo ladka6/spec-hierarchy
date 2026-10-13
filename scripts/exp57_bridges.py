@@ -58,6 +58,8 @@ def main():
     ap.add_argument("--rank", type=int, default=2048)
     ap.add_argument("--fit-seqs", type=int, default=256, help="sequences for the closed-form affine fit (0: no fit)")
     ap.add_argument("--ridge", type=float, default=1e-3)
+    ap.add_argument("--fit-mode", choices=["indep", "seq"], default="indep",
+                    help="seq: each span fitted on the copy's own inputs (earlier bridges on), see fit_linear_")
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--lr-lin", type=float, default=3e-5, help="the fitted affine parts move slower")
@@ -89,8 +91,9 @@ def main():
 
     if args.fit_seqs:
         t0 = time.time()
-        fit_linear_(model, bridges, [d["ids"].long() for d in train[: args.fit_seqs]], args.ridge, dev)
-        print(f"[fit] closed-form affine parts from {args.fit_seqs} sequences in {time.time() - t0:.0f}s", flush=True)
+        fit_linear_(model, bridges, [d["ids"].long() for d in train[: args.fit_seqs]], args.ridge, dev,
+                    sequential=args.fit_mode == "seq")
+        print(f"[fit] closed-form affine parts ({args.fit_mode}) from {args.fit_seqs} sequences in {time.time() - t0:.0f}s", flush=True)
 
     # hidden-state indices to match: span ends (input of the next kept layer) and the drafter's tap features
     hid_idx = sorted({b + 1 for _, b in spans if b + 1 < n_layers} | {l + 1 for l in lids})

@@ -118,35 +118,47 @@ def attach_bridges(model, kept: list[int], kind: str = "mlp", rank: int = 2048) 
 
 
 @torch.no_grad()
-def fit_linear_(model, bridges, seqs, ridge: float = 1e-3, device="cuda"):
-    """Closed-form affine part of every bridge: ridge regression of the span's update hs[b+1] - hs[a] on hs[a]
-    (target activations, bridges off), each span fitted independently. Rows are weighted by 1 / mean(x^2) so the
-    attention-sink tokens with huge norms do not dominate. seqs: list of 1-D id tensors."""
+def fit_linear_(model, bridges, seqs, ridge: float = 1e-3, device="cuda", sequential: bool = False):
+    """Closed-form affine part of every bridge: ridge regression of the span's update (target hs[b+1] - x) on its
+    input x. Rows are weighted by 1 / mean(x^2) so the attention-sink tokens with huge norms do not dominate.
+      independent  x = the target's hs[a] (bridges off), every span on clean inputs (Ghosted Layers / SHIFT-LLM)
+      sequential   x = the COPY's hs[a] with the earlier bridges already fitted: each bridge also corrects the
+                   error that reaches it from the spans before (removed spans compound in a deep cut)
+    seqs: list of 1-D id tensors."""
     spans = spans_of(model.kept_layers, len(model.model.layers))
     H = model.config.hidden_size
-    acc = {b: (torch.zeros(H + 1, H + 1, dtype=torch.float64, device=device),
-               torch.zeros(H + 1, H, dtype=torch.float64, device=device)) for _, b in spans}
-    BRIDGE["on"] = False
-    try:
-        for ids in seqs:
-            hs = model(ids.to(device)[None], output_hidden_states=True, logits_to_keep=1).hidden_states
-            for a, b in spans:
-                x = hs[a][0].double()
-                d = hs[b + 1][0].double() - x
-                w = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
-                xa = torch.cat([x, torch.ones_like(x[:, :1])], -1) * w
-                xtx, xtd = acc[b]
-                xtx += xa.T @ xa
-                xtd += xa.T @ (d * w)
-    finally:
-        BRIDGE["on"] = True
-    for a, b in spans:
-        xtx, xtd = acc[b]
+
+    def solve(xtx, xtd, m):
         lam = ridge * xtx.diagonal().mean()
         sol = torch.linalg.solve(xtx + lam * torch.eye(H + 1, dtype=xtx.dtype, device=xtx.device), xtd)
-        m = bridges[str(b)]
         m.lin.weight.copy_(sol[:H].T.float())
         m.lin.bias.copy_(sol[H].float())
+
+    def accumulate(acc, x, y):
+        x, d = x.double(), y.double() - x.double()
+        w = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
+        xa = torch.cat([x, torch.ones_like(x[:, :1])], -1) * w
+        acc[0].add_(xa.T @ xa)
+        acc[1].add_(xa.T @ (d * w))
+
+    def hidden(ids, on):
+        BRIDGE["on"] = on
+        try:
+            return model(ids.to(device)[None], output_hidden_states=True, logits_to_keep=1).hidden_states
+        finally:
+            BRIDGE["on"] = True
+
+    groups = [spans[k:k + 1] for k in range(len(spans))] if sequential else [spans]
+    for group in groups:
+        acc = {b: (torch.zeros(H + 1, H + 1, dtype=torch.float64, device=device),
+                   torch.zeros(H + 1, H, dtype=torch.float64, device=device)) for _, b in group}
+        for ids in seqs:
+            t = hidden(ids, False)
+            x_src = hidden(ids, True) if sequential else t
+            for a, b in group:
+                accumulate(acc[b], x_src[a][0], t[b + 1][0])
+        for a, b in group:
+            solve(*acc[b], bridges[str(b)])
 
 
 def save_bridges(out: str | Path, bridges, meta: dict):
