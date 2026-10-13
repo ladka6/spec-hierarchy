@@ -107,9 +107,14 @@ def main():
 
     prm = prm_tok = None
     if any(sc.startswith("prm") for sc in args.scorers):
-        from transformers import AutoModel, AutoTokenizer
+        from transformers import AutoConfig, AutoModel, AutoTokenizer
         prm_tok = AutoTokenizer.from_pretrained(args.prm, trust_remote_code=True)
-        prm = AutoModel.from_pretrained(args.prm, dtype=torch.bfloat16, device_map="cuda",
+        pcfg = AutoConfig.from_pretrained(args.prm, trust_remote_code=True)
+        for k in ("pad_token_id", "bos_token_id", "eos_token_id"):       # remote code predates transformers 5
+            if not hasattr(pcfg, k) or getattr(pcfg, k, None) is None:
+                setattr(pcfg, k, getattr(prm_tok, k, None) if getattr(prm_tok, k, None) is not None
+                        else prm_tok.eos_token_id)
+        prm = AutoModel.from_pretrained(args.prm, config=pcfg, dtype=torch.bfloat16, device_map="cuda",
                                         trust_remote_code=True).eval()
         sep_id = prm_tok.encode("<extra_0>")[0]
 

@@ -156,6 +156,8 @@ def main():
               flush=True)
 
     evaluate(0)
+    if args.epochs == 0:                                    # evaluation only (reference copies, e.g. bnb4)
+        return
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
     total = args.epochs * len(train)
     sched = torch.optim.lr_scheduler.LambdaLR(
