@@ -36,6 +36,8 @@ from exp27_refresh import blocks_logits, matched, tree_nodes  # noqa: E402
 
 from hspec.data import encode, load_prompts, stop_ids  # noqa: E402
 from hspec.lagtrain import draft_logits_lagged  # noqa: E402
+from transformers import DynamicCache  # noqa: E402
+
 from hspec.models import load_draft, load_mid, load_target, load_tokenizer  # noqa: E402
 from hspec.pipeline import two_stage_generate  # noqa: E402
 from hspec.utils import mean, print_table, save_json  # noqa: E402
@@ -72,6 +74,9 @@ def main():
     ap.add_argument("--drafter-ms", type=float, default=2.6)
     ap.add_argument("--copy-ms", nargs="+", type=float, default=[1.5, 3.0, 4.5])
     ap.add_argument("--restart-ms", type=float, default=1.0, help="the batched restart drafter call")
+    ap.add_argument("--kv", choices=["own", "target"], default="own",
+                    help="own: the copy computes the whole prefix with its own weights; target: the copy attends to "
+                         "the TARGET's KV cache for the committed prefix and only computes the drafted block itself")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="exp56_wide")
     args = ap.parse_args()
@@ -85,6 +90,7 @@ def main():
     bs = draft.block_size
     D = bs - 1
     rec = defaultdict(list)
+    agree = []
     for d in args.datasets:
         for p in load_prompts(d, args.n):
             ids = encode(tok, p)
@@ -94,19 +100,32 @@ def main():
                                     top_p=1.0, top_k=0, eos_token_id=stops)[0]
             else:
                 x = two_stage_generate(draft, target, target, target, ids, args.max_new, stops).output_ids[0]
-            feats = extract_context_feature(target(x[None], output_hidden_states=True, logits_to_keep=1).hidden_states,
-                                            draft.target_layer_ids)
+            tout = target(x[None], output_hidden_states=True, logits_to_keep=1, use_cache=True)
+            feats = extract_context_feature(tout.hidden_states, draft.target_layer_ids)
+            tcache = tout.past_key_values
+            del tout
+
+            def prefix_cache(n):
+                return DynamicCache(ddp_cache_data=[(l.keys[:, :, :n], l.values[:, :, :n]) for l in tcache.layers])
             for s in range(n0, len(x) - 2 * bs - 1, args.stride):
                 truth = x[s + 1 : s + 2 * bs].tolist()
                 pr = torch.softmax(draft_logits_lagged(draft, target, feats, x, s, 0, bs).float(), -1)
                 conf, y = pr.max(-1)
                 y, conf = y.tolist(), conf.tolist()
                 z = torch.cat([x[: s + 1], torch.tensor(y, device=x.device)])
-                po = copy(z[None], output_hidden_states=True, logits_to_keep=bs)
-                pz = extract_context_feature(po.hidden_states, draft.target_layer_ids).to(feats.dtype)
+                if args.kv == "own":
+                    po = copy(z[None], output_hidden_states=True, logits_to_keep=bs)
+                    pz = extract_context_feature(po.hidden_states, draft.target_layer_ids).to(feats.dtype)[:, s : s + bs]
+                else:
+                    po = copy(z[None, s:], past_key_values=prefix_cache(s), use_cache=True, output_hidden_states=True,
+                              logits_to_keep=bs)
+                    pz = extract_context_feature(po.hidden_states, draft.target_layer_ids).to(feats.dtype)
                 top3 = po.logits[0].float().topk(3, -1).indices.tolist()          # predictions for s+1 .. s+16
                 del po
-                full = torch.cat([feats[:, :s], pz[:, s : s + bs]], 1)
+                # the target's own next tokens on the same drafted inputs: how often the copy agrees with them
+                tl = target(z[None, s:], past_key_values=prefix_cache(s), use_cache=True, logits_to_keep=bs).logits[0]
+                agree.append(float((tl.argmax(-1).cpu() == torch.tensor([t[0] for t in top3])).float().mean()))
+                full = torch.cat([feats[:, :s], pz], 1)
                 dis = [k for k in range(D) if top3[k][0] != y[k]][:3]
 
                 def restart(jj, t):
@@ -127,7 +146,7 @@ def main():
                     run *= conf[i - 1]
                     post[i] = run * (1.0 - conf[i]) if i < D else run
                 cpos = sorted(post, key=lambda i: -post[i])[:4]
-                mix = torch.cat([feats[:, :s], pz[:, s : s + D]], 1)
+                mix = torch.cat([feats[:, :s], pz[:, :D]], 1)
                 Lc = blocks_logits(draft, target, mix, z, [(s + i, 0) for i in cpos], bs)
                 for r, i in enumerate(cpos):
                     ch[f"c{r + 1}"] = y[:i] + Lc[r].argmax(-1).tolist()
@@ -148,10 +167,11 @@ def main():
             ms = base_ms if pol == "block1" else args.drafter_ms + cm + args.restart_ms + v(nodes + 1)
             row[f"x@copy{cm:g}ms"] = (tau / ms) / (base_tau / base_ms)
         rows.append(row)
-    print_table(rows, list(rows[0]), f"one wide refresh step, copy {args.copy}, T={args.temp}: accepted per verify, "
+    print(f"copy-target next-token agreement on drafted blocks (kv={args.kv}): {mean(agree):.4f}", flush=True)
+    print_table(rows, list(rows[0]), f"one wide refresh step, copy {args.copy}, kv={args.kv}, T={args.temp}: accepted per verify, "
                                      f"tree nodes, projected speed vs DFlash (vLLM costs, drafter {args.drafter_ms} ms, "
                                      f"restart call {args.restart_ms} ms)")
-    save_json(args.out, {"args": vars(args), "rows": rows})
+    save_json(args.out, {"args": vars(args), "rows": rows, "copy_target_agreement": mean(agree)})
 
 
 if __name__ == "__main__":
