@@ -123,25 +123,19 @@ The copy and drafter work of the next round can run on a second CUDA stream whil
 
 ## 8. Analysis: how cheap can the copy be
 
-The copy cost is the main overhead, so we studied whether a cheaper copy can give the same features. The table gives the accepted length with each copy in three restart settings. In all three, the drafter first drafts a block from the real features, the copy runs once over it, and the target verifies the block together with the restarted continuations as one tree.
+The copy cost is the main overhead, so we studied whether a cheaper copy can give the same features. In this test the drafter drafts a block, the copy runs over it, the drafter redrafts from the two positions where it is most likely to fail using the copy's features, and the target checks everything in one pass. The table gives the accepted length for each copy, and how much of the 4-bit copy's result it keeps.
 
-- **Two confidence restarts** (about 40 tree nodes): the drafter restarts at the two positions where it is most likely to stop, judged from its own confidence, with the copy's features as context. The copy's token predictions are not used, so this column measures the quality of the copy's features alone.
-- **Restart at every position** (about 180 tree nodes): one restart at each of the 15 positions of the block. This is too large a tree to be practical, but it is an upper bound on what the copy's features allow.
-- **Correction + two confidence restarts** (about 56 tree nodes): the correction restart (the copy's token at its first disagreement, then the drafter continues with the copy's features) plus the two confidence restarts. This column also depends on how good the copy's token predictions are.
+| Copy | Accepted length | Share of 4-bit |
+|---|---|---|
+| 4-bit, no training | 11.90 | 100% |
+| 2-bit, no training | 8.34 | 70% |
+| 2-bit, trained | 11.19 | 94% |
+| 18 of 36 layers, trained | 10.45 | 88% |
+| 8 of 36 layers, no training | 8.30 | 70% |
+| 8 of 36 layers, trained | 9.20 | 77% |
+| 8 of 36 layers + small modules replacing the removed layers, trained | 9.69 | 81% |
 
-These runs use a later evaluation setup than P4, so the 4-bit numbers differ from there; the comparison is within this table. The third column was not run for the 4-bit and the untrained 2-bit copy.
-
-| Copy | Two confidence restarts | Restart at every position | Correction + two confidence restarts |
-|---|---|---|---|
-| 4-bit | 11.90 | 13.05 | n/a |
-| 2-bit, no training | 8.34 | 8.89 | n/a |
-| 2-bit, trained for the drafter | 11.19 | 12.30 | 12.15 |
-| 18 of 36 layers, trained | 10.45 | 11.55 | 10.82 |
-| only the 8 layers the drafter needs, no training | 8.30 | 8.86 | 8.30 |
-| only the 8 layers, trained | 9.20 | 10.26 | 9.29 |
-| only the 8 layers, plus trained modules replacing the removed layers | 9.69 | 10.81 | 9.83 |
-
-The "8 layers" copies keep the layers whose outputs the drafter reads (1, 9, 17, 25, 33), plus layers 0, 34 and 35 for the input and the next-token prediction, and skip the other 28.
+The "8 of 36 layers" copies keep only the layers whose outputs the drafter reads, plus the first and the last two layers. Training is described below. Without training a 2-bit copy loses 30%; with training it keeps 94% of the 4-bit result.
 
 Three ways to make the copy cheaper were tested.
 
