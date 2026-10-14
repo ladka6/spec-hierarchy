@@ -123,9 +123,15 @@ The copy and drafter work of the next round can run on a second CUDA stream whil
 
 ## 8. Analysis: how cheap can the copy be
 
-The copy cost is the main overhead, so we studied whether a cheaper copy can give the same features. The table gives the accepted length with each copy for three restart settings: two confidence restarts; all restart types; and the correction restart plus two confidence restarts. These runs use a later evaluation setup than P4, so the 4-bit numbers differ from there; the comparison is within this table.
+The copy cost is the main overhead, so we studied whether a cheaper copy can give the same features. The table gives the accepted length with each copy in three restart settings. In all three, the drafter first drafts a block from the real features, the copy runs once over it, and the target verifies the block together with the restarted continuations as one tree.
 
-| Copy | Two confidence restarts | All restarts | Correction + two confidence restarts |
+- **Two confidence restarts** (about 40 tree nodes): the drafter restarts at the two positions where it is most likely to stop, judged from its own confidence, with the copy's features as context. The copy's token predictions are not used, so this column measures the quality of the copy's features alone.
+- **Restart at every position** (about 180 tree nodes): one restart at each of the 15 positions of the block. This is too large a tree to be practical, but it is an upper bound on what the copy's features allow.
+- **Correction + two confidence restarts** (about 56 tree nodes): the correction restart (the copy's token at its first disagreement, then the drafter continues with the copy's features) plus the two confidence restarts. This column also depends on how good the copy's token predictions are.
+
+These runs use a later evaluation setup than P4, so the 4-bit numbers differ from there; the comparison is within this table. The third column was not run for the 4-bit and the untrained 2-bit copy.
+
+| Copy | Two confidence restarts | Restart at every position | Correction + two confidence restarts |
 |---|---|---|---|
 | 4-bit | 11.90 | 13.05 | n/a |
 | 2-bit, no training | 8.34 | 8.89 | n/a |
