@@ -34,7 +34,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dflash.model import extract_context_feature  # noqa: E402
-from exp27_refresh import blocks_logits, matched  # noqa: E402
+from exp27_refresh import blocks_logits, matched, tree_nodes  # noqa: E402
+from exp56_wide import v  # noqa: E402
 from transformers import DynamicCache  # noqa: E402
 
 from hspec.lagtrain import draft_logits_lagged, pack  # noqa: E402
@@ -52,8 +53,14 @@ def main():
     ap.add_argument("--teacher", required=True)
     ap.add_argument("--n-fit", type=int, default=600, help="training sequences for the ridge fits")
     ap.add_argument("--n-val", type=int, default=0, help="0: all held-out sequences")
-    ap.add_argument("--chunks", nargs="+", type=int, default=[4, 8, 12])
+    ap.add_argument("--chunks", nargs="*", type=int, default=[4, 8, 12])
     ap.add_argument("--ridge", type=float, default=1e-3)
+    ap.add_argument("--n-conf", type=int, default=2, help="confidence restarts (M3)")
+    ap.add_argument("--drafter-ms", type=float, default=2.6)
+    ap.add_argument("--restart-ms", type=float, default=1.0, help="the batched restart drafter call")
+    ap.add_argument("--copy-ms", type=float, default=3.0)
+    ap.add_argument("--map-ms", type=float, default=0.2, help="the ridge map (one matmul)")
+    ap.add_argument("--shallow-ms", type=float, default=0.5, help="the target's first two layers on the block")
     ap.add_argument("--save", default="exp65_cheaprefresh")
     args = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -79,8 +86,8 @@ def main():
         hid = draft(target_hidden=feats, noise_embedding=noise, position_ids=pos, attention_mask=mask,
                     past_key_values=None, use_cache=False)[0]
         rows = torch.stack([hid[st : st + D] for st in starts])                       # [A, 15, H]
-        y = draft.compute_logits(rows, target.lm_head).argmax(-1)
-        return y, rows
+        conf, y = torch.softmax(draft.compute_logits(rows, target.lm_head).float(), -1).max(-1)
+        return y, rows, conf
 
     @torch.inference_mode()
     def seq_data(d):
@@ -90,8 +97,8 @@ def main():
         cache = tout.past_key_values
         del tout
         anchors = list(d["anchors"])
-        y, rows = first_pass(feats, x, anchors)
-        return x, feats, cache, anchors, y, rows
+        y, rows, conf = first_pass(feats, x, anchors)
+        return x, feats, cache, anchors, y, rows, conf
 
     def inputs(rows_k, toks, shallow=None):
         """Regression inputs for positions s .. s+14: drafter row i (predicting s+i+1), embedding of token at s+i."""
@@ -108,7 +115,7 @@ def main():
                torch.zeros(n, nT * H, device=dev, dtype=torch.float32)) for k, n in dims.items()}
     with torch.inference_mode():
         for d in fit:
-            x, feats, _, anchors, y, rows = seq_data(d)
+            x, feats, _, anchors, y, rows, _ = seq_data(d)
             for k, s in enumerate(anchors):
                 toks = torch.cat([x[s : s + 1], y[k, : D - 1]])                       # tokens at s .. s+14
                 Y = feats[0, s : s + D].float()                                        # real taps at s .. s+14
@@ -134,11 +141,12 @@ def main():
 
     # ---------------------------------------------------------------- evaluate
     cos = defaultdict(lambda: torch.zeros(nT))
+    nodes = defaultdict(list)
     ncos = 0
     tau = defaultdict(list)
     with torch.inference_mode():
         for d in val:
-            x, feats, tcache, anchors, y, rows = seq_data(d)
+            x, feats, tcache, anchors, y, rows, conf = seq_data(d)
             for k, s in enumerate(anchors):
                 truth = x[s + 1 :].tolist()
                 yk = y[k]
@@ -173,6 +181,26 @@ def main():
                         a = matched(chain, truth) + 1
                         tau[f"{name}|{n}"].append(a)
                         tau[f"{name}|{n}|best"].append(max(a, ok + 1))
+                # M3: restarts at the drafter's two most likely stop positions (exp27/exp56 confidence restarts)
+                ck = conf[k].tolist()
+                post, run = {}, 1.0
+                for i in range(1, D + 1):
+                    run *= ck[i - 1]
+                    post[i] = run * (1.0 - ck[i]) if i < D else run
+                cpos = sorted(post, key=lambda i: -post[i])[: args.n_conf]
+                yl = yk.tolist()
+                for name in SOURCES:
+                    chains = [yl]
+                    for i in cpos:                                                       # restart anchor s+i
+                        if name == "none":
+                            L = draft_logits_lagged(draft, target, feats, z, s + i, i, bs)
+                        else:
+                            Fz = torch.cat([feats[:, :s], src[name][:i][None].to(feats.dtype)], 1)
+                            L = blocks_logits(draft, target, Fz, z, [(s + i, 0)], bs)[0]
+                        chains.append(yl[:i] + L.argmax(-1).tolist())
+                    best = max(matched(ch, truth) for ch in chains) + 1
+                    tau[f"conf|{name}"].append(best)
+                    nodes[name].append(tree_nodes(chains))
             print(f"[val] {len(tau['block1'])} anchors", flush=True)
 
     crow = [{"source": n, **{f"cos_L{lids[i]}": float(cos[n][i] / ncos) for i in range(nT)}}
@@ -184,9 +212,27 @@ def main():
         for name in SOURCES:
             rows_out.append({"chunk": n, "source": name, "tau": mean(tau[f"{name}|{n}"]),
                              "tau_best_of_two": mean(tau[f"{name}|{n}|best"]), "block1": mean(tau["block1"])})
-    print_table(rows_out, list(rows_out[0]), "M2: chunk of n drafted tokens + restart from its end with refreshed "
+    if rows_out:
+        print_table(rows_out, list(rows_out[0]), "M2: chunk of n drafted tokens + restart from its end with refreshed "
                                              "features (block up to n+15); best_of_two = max with block 1")
-    save_json(args.save, {"args": vars(args), "cos": crow, "restart": rows_out})
+    # M3 table: tau, tree size, projected speed vs DFlash, and how often the accepted length reaches p
+    base_tau = mean(tau["block1"])
+    base_ms = args.drafter_ms + v(D + 1)
+    cost = {"oracle": 0.0, "copy": args.copy_ms, "tier0": args.map_ms, "tier1": args.map_ms + args.shallow_ms,
+            "none": 0.0}
+    m3 = [{"source": "block1 (DFlash)", "tau": base_tau, "nodes": float(D), "x_vs_dflash": 1.0,
+           **{f"P(>={q})": mean(float(t >= q) for t in tau["block1"]) for q in (4, 8, 12, 16, 20)}}]
+    for name in SOURCES:
+        tt = tau[f"conf|{name}"]
+        nd = mean(nodes[name])
+        ms = args.drafter_ms + cost[name] + args.restart_ms + v(nd + 1)
+        m3.append({"source": name, "tau": mean(tt), "nodes": nd, "x_vs_dflash": (mean(tt) / ms) / (base_tau / base_ms),
+                   **{f"P(>={q})": mean(float(t >= q) for t in tt) for q in (4, 8, 12, 16, 20)}})
+    print_table(m3, list(m3[0]), f"M3: block 1 + restarts at the {args.n_conf} most likely stop positions, features "
+                                 f"for the restarted prefix from each source; x = projected speed vs DFlash (vLLM "
+                                 f"costs; oracle is not attainable, its cost is set to 0); P(>=q) = share of rounds "
+                                 f"accepting at least q tokens")
+    save_json(args.save, {"args": vars(args), "cos": crow, "restart": rows_out, "conf_restart": m3})
 
 
 if __name__ == "__main__":
