@@ -57,10 +57,12 @@ def main():
     ap.add_argument("--ridge", type=float, default=1e-3)
     ap.add_argument("--n-conf", type=int, default=2, help="confidence restarts (M3)")
     ap.add_argument("--drafter-ms", type=float, default=2.6)
-    ap.add_argument("--restart-ms", type=float, default=1.0, help="the batched restart drafter call")
+    ap.add_argument("--restart-ms", type=float, default=2.3, help="the batched restart drafter call")
     ap.add_argument("--copy-ms", type=float, default=3.0)
-    ap.add_argument("--map-ms", type=float, default=0.2, help="the ridge map (one matmul)")
-    ap.add_argument("--shallow-ms", type=float, default=0.5, help="the target's first two layers on the block")
+    ap.add_argument("--map-ms", type=float, default=0.44, help="the ridge map (one matmul)")
+    ap.add_argument("--shallow-ms", type=float, default=0.76, help="the target's first two layers on the block")
+    ap.add_argument("--chain", type=int, default=0, help="M4: up to this many SEQUENTIAL restarts (0: skip M4)")
+    ap.add_argument("--chain-sources", nargs="+", default=["oracle", "tier1"])
     ap.add_argument("--save", default="exp65_cheaprefresh")
     args = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -88,6 +90,16 @@ def main():
         rows = torch.stack([hid[st : st + D] for st in starts])                       # [A, 15, H]
         conf, y = torch.softmax(draft.compute_logits(rows, target.lm_head).float(), -1).max(-1)
         return y, rows, conf
+
+    @torch.inference_mode()
+    def restart_block(Fz, ids, a):
+        """One drafter block at anchor a over context features Fz [1, a, 5H]: tokens, final rows [15, H], conf."""
+        noise, pos, mask, starts = pack(draft, target, Fz, ids, [(a, 0)], bs)
+        hid = draft(target_hidden=Fz, noise_embedding=noise, position_ids=pos, attention_mask=mask,
+                    past_key_values=None, use_cache=False)[0]
+        rows = hid[starts[0] : starts[0] + D]
+        conf, y = torch.softmax(draft.compute_logits(rows, target.lm_head).float(), -1).max(-1)
+        return y.tolist(), rows, conf.tolist()
 
     @torch.inference_mode()
     def seq_data(d):
@@ -201,6 +213,32 @@ def main():
                     best = max(matched(ch, truth) for ch in chains) + 1
                     tau[f"conf|{name}"].append(best)
                     nodes[name].append(tree_nodes(chains))
+                # M4: SEQUENTIAL restarts. Each restart starts at the most likely stop position beyond the previous
+                # restart anchor, with features for every drafted position before it from the source (tier1 built
+                # from the newest block's own drafter rows); all intermediate chains form the verified tree.
+                T_len = feats.shape[1]
+                for name in (args.chain_sources if args.chain else []):
+                    c, R, cf = list(yl), rows[k], list(ck)
+                    chains, prev = [list(yl)], 0
+                    for r in range(1, args.chain + 1):
+                        post, run = {}, 1.0
+                        for i in range(1, len(c) + 1):
+                            run *= cf[i - 1]
+                            if i > prev and s + i < T_len:
+                                post[i] = run * (1.0 - cf[i]) if i < len(c) else run
+                        if post:
+                            i = max(post, key=post.get)
+                            toks_c = torch.tensor([x[s].item()] + c[: i - 1], device=dev)
+                            real_c = feats[0, s : s + i].float()
+                            fz = real_c if name == "oracle" else predict(name, R[:i], toks_c, real_c)
+                            Fz = torch.cat([feats[:, :s], fz[None].to(feats.dtype)], 1)
+                            zc = torch.cat([x[: s + 1], torch.tensor(c, device=dev)])
+                            yb, Rb, cb = restart_block(Fz, zc, s + i)
+                            c, R, cf, prev = c[:i] + yb, torch.cat([R[:i], Rb]), cf[:i] + cb, i
+                            chains.append(list(c))
+                        tau[f"chain|{name}|{r}"].append(max(matched(ch, truth) for ch in chains) + 1)
+                        nodes[f"chain|{name}|{r}"].append(tree_nodes(chains))
+                        tau[f"chain|{name}|{r}|len"].append(len(c))
             print(f"[val] {len(tau['block1'])} anchors", flush=True)
 
     crow = [{"source": n, **{f"cos_L{lids[i]}": float(cos[n][i] / ncos) for i in range(nT)}}
@@ -232,7 +270,19 @@ def main():
                                  f"for the restarted prefix from each source; x = projected speed vs DFlash (vLLM "
                                  f"costs; oracle is not attainable, its cost is set to 0); P(>=q) = share of rounds "
                                  f"accepting at least q tokens")
-    save_json(args.save, {"args": vars(args), "cos": crow, "restart": rows_out, "conf_restart": m3})
+    m4 = []
+    for name in (args.chain_sources if args.chain else []):
+        for r in range(1, args.chain + 1):
+            tt, nd = tau[f"chain|{name}|{r}"], mean(nodes[f"chain|{name}|{r}"])
+            ms = args.drafter_ms + r * (args.restart_ms + cost[name]) + v(nd + 1)
+            m4.append({"source": name, "restarts": r, "tau": mean(tt), "chain_len": mean(tau[f"chain|{name}|{r}|len"]),
+                       "nodes": nd, "x_vs_dflash": (mean(tt) / ms) / (base_tau / base_ms),
+                       **{f"P(>={q})": mean(float(t >= q) for t in tt) for q in (8, 12, 16, 20, 30)}})
+    if m4:
+        print_table(m4, list(m4[0]), f"M4: block 1 + r SEQUENTIAL restarts, each at the most likely stop beyond the "
+                                     f"previous anchor; tree = all intermediate chains; each restart costs "
+                                     f"{args.restart_ms} ms + the source's refresh cost")
+    save_json(args.save, {"args": vars(args), "cos": crow, "restart": rows_out, "conf_restart": m3, "chain": m4})
 
 
 if __name__ == "__main__":

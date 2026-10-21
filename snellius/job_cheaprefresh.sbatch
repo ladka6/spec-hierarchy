@@ -5,11 +5,11 @@
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=18
-#SBATCH --time=00:50:00
+#SBATCH --time=01:10:00
 #SBATCH --output=cheaprefresh-%j.out
 # exp65: how cheap can a KV refresh be? Ridge maps from the drafter's own final states (+ exact layer-1 tap) to the
 # target's 5 tap features, against the 4-bit copy and the real features; cosine per tap and chunk-and-restart tau.
-# Default run: confidence restarts only (M3); set CHUNKS="4 8 12" for the fixed-chunk table (M2) too.
+# Extra flags pass through: sbatch job_cheaprefresh.sbatch --chain 4 --n-val 150
 set -uo pipefail
 cd "$SLURM_SUBMIT_DIR"
 module purge
@@ -21,5 +21,5 @@ export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export HSPEC_RESULTS="$SLURM_SUBMIT_DIR/results/cheaprefresh"
 mkdir -p "$HSPEC_RESULTS"
 W=/scratch-shared/$USER/hspec_copytrain
-python scripts/exp65_cheaprefresh.py --teacher $W/teacher.pt --copy ${COPY:-bnb4:Qwen/Qwen3-8B} --chunks ${CHUNKS:-} --save exp65_cheaprefresh_conf 2>&1 \
+python scripts/exp65_cheaprefresh.py --teacher $W/teacher.pt --copy ${COPY:-bnb4:Qwen/Qwen3-8B} --chunks --save exp65_cheaprefresh_chain "$@" 2>&1 \
   | grep --line-buffered -v -i warn
