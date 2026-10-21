@@ -1,232 +1,139 @@
-"""Stage latencies of feature-refreshed decoding under CUDA graphs (no torch.compile), batch 1.
+"""Measured cost of the cheap KV refresh components (one A100, batch 1, CUDA graphs, as bench_overlap.py).
 
-Each stage is captured once with torch.cuda.CUDAGraph at the exact shape the loop uses and then
-replayed, which removes HF's per-call Python / launch overhead (the dominant cost in eager mode):
+Times, after a ctx-token prefix in the KV cache:
+  target verify       the full target over q = 16 / 32 / 48 / 64 tokens               (the reference)
+  shallow bf16        the target's first --shallow layers over the 16-token block (exact layer-1 tap; no LM head)
+  shallow 4-bit       the same layers of the 4-bit copy
+  copy                the full 4-bit copy over the block                           (today's refresh)
+  map                 the ridge map, 16 rows x (3H+1) -> 5H taps (fp32 and bf16), and -> one fused H vector (bf16)
+  drafter             one drafter block, and a batched call with --restarts blocks (the restart call)
+Each component is also given as a fraction of the target's 16-token verify in the same harness, so it can be
+carried over to other cost tables (e.g. vLLM).
 
-  verify   bf16 target, q new tokens on a cached context, explicit 4-D attention mask (tree-shaped
-           masks cost the same as any other mask of that shape), hidden states returned
-  copy     the cheap copy (torchao int4 by default; bnb4 for comparison) over q tokens, hidden
-           states + logits for the last 16 positions
-
-StaticCache with fixed cache_position, so every replay overwrites the same slots. Eager timings of
-the same calls are printed next to the graph timings.
-
-  python scripts/bench_refresh.py --copies ao4:Qwen/Qwen3-8B bnb4:Qwen/Qwen3-8B
+  python scripts/bench_refresh.py --ctx 1024
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-import time
 from pathlib import Path
 
 import torch
-from transformers import StaticCache
+from transformers import DynamicCache
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from hspec.models import free, load_mid, load_target  # noqa: E402
+from bench_overlap import KEEP, capture_draft, capture_model, timed  # noqa: E402
+
+from hspec.models import free, load_draft, load_mid, load_target  # noqa: E402
+from hspec.pipeline import crop  # noqa: E402
 from hspec.utils import print_table, save_json  # noqa: E402
 
 
-def stage(model, ctx, q, reps, keep=None):
-    """(eager ms, graph ms) for one forward of q tokens on a ctx-token static cache."""
-    dev = next(model.parameters()).device
-    V = model.config.vocab_size
-    max_len = ctx + q + 8
-    cache = StaticCache(config=model.config, max_cache_len=max_len)
-    prompt = torch.randint(0, V - 10, (1, ctx), device=dev)
-    with torch.inference_mode():
-        model(prompt, past_key_values=cache, use_cache=True, logits_to_keep=1,
-              cache_position=torch.arange(ctx, device=dev))
-    ids = torch.randint(0, V - 10, (1, q), device=dev)
-    cpos = torch.arange(ctx, ctx + q, device=dev)
-    mask = torch.zeros(1, 1, q, max_len, dtype=torch.bool, device=dev)
-    mask[..., :ctx] = True
-    mask[0, 0, :, ctx : ctx + q] = torch.tril(torch.ones(q, q, dtype=torch.bool, device=dev))
-    kw = dict(position_ids=cpos[None], cache_position=cpos, attention_mask=mask, past_key_values=cache,
-              use_cache=True, output_hidden_states=True, logits_to_keep=keep or q)
+@torch.inference_mode()
+def capture_shallow(model, n_layers, ctx, q):
+    """CUDA graph of the base model truncated to its first n_layers, over q tokens after a ctx-token prefix."""
+    base = model.model
+    full_layers, full_n = base.layers, model.config.num_hidden_layers
+    base.layers = torch.nn.ModuleList(list(full_layers)[:n_layers])
+    model.config.num_hidden_layers = n_layers
+    try:
+        dev = next(model.parameters()).device
+        vocab = model.config.vocab_size
+        cache = DynamicCache()
+        base(torch.randint(0, vocab, (1, ctx), device=dev), past_key_values=cache, use_cache=True)
+        ids = torch.randint(0, vocab, (1, q), device=dev)
+        pos = torch.arange(ctx, ctx + q, device=dev).unsqueeze(0)
 
-    def run():
-        # this transformers StaticCache writes at its own counter (cumulative_length), not at
-        # cache_position: reset it so every call overwrites the same q slots after the context
-        for layer in cache.layers:
-            layer.cumulative_length.fill_(ctx)
-        out = model(ids, **kw)
-        return out.logits, out.hidden_states[-1]
+        def step():
+            base(ids, position_ids=pos, past_key_values=cache, use_cache=True)
+            crop(cache, ctx)
 
-    with torch.inference_mode():
-        for _ in range(3):
-            run()
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(reps):
-            run()
-        torch.cuda.synchronize()
-        eager = (time.perf_counter() - t0) * 1000 / reps
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                run()
+                step()
         torch.cuda.current_stream().wait_stream(s)
+        KEEP.append([(layer.keys, layer.values) for layer in cache.layers])
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            run()
-        for _ in range(3):
-            g.replay()
-        torch.cuda.synchronize()
-        st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        st.record()
-        for _ in range(reps):
-            g.replay()
-        en.record()
-        torch.cuda.synchronize()
-        graph = st.elapsed_time(en) / reps
-    del g, cache
-    return eager, graph
-
-
-def draft_stage(draft, target, ctx, new_ctx, n_blocks, reps):
-    """(eager ms, graph ms) for one drafter call: new_ctx fresh context features plus n_blocks masked
-    blocks of 16 (n_blocks > 1 = batched restarts with per-block masks) on a ctx-position cache."""
-    from dflash.model import _make_cache
-
-    from hspec.pipeline import crop
-
-    dev = next(draft.parameters()).device
-    bs = draft.block_size
-    W = len(draft.target_layer_ids) * target.config.hidden_size
-    H = target.config.hidden_size
-    cache = _make_cache(draft.config)
-    q = n_blocks * bs
-    pos = torch.arange(ctx + new_ctx + q, device=dev)[None]
-    with torch.inference_mode():
-        draft(target_hidden=torch.randn(1, ctx, W, device=dev, dtype=torch.bfloat16),
-              noise_embedding=torch.randn(1, bs, H, device=dev, dtype=torch.bfloat16),
-              position_ids=pos[:, : ctx + bs], past_key_values=cache, use_cache=True)
+            base(ids, position_ids=pos, past_key_values=cache, use_cache=True)
         crop(cache, ctx)
-    h = torch.randn(1, new_ctx, W, device=dev, dtype=torch.bfloat16)
-    noise = torch.randn(1, q, H, device=dev, dtype=torch.bfloat16)
-    mask = None
-    if n_blocks > 1:
-        m = torch.zeros(q, ctx + new_ctx + q, dtype=torch.bool, device=dev)
-        m[:, :ctx] = True
-        for r in range(n_blocks):
-            m[r * bs : (r + 1) * bs, ctx : ctx + 1 + r * (new_ctx - 1) // max(n_blocks - 1, 1)] = True
-            m[r * bs : (r + 1) * bs, ctx + new_ctx + r * bs : ctx + new_ctx + (r + 1) * bs] = True
-        mask = m[None, None]
-    head = target.lm_head
-
-    def run():
-        hid = draft(target_hidden=h, noise_embedding=noise, position_ids=pos[:, ctx:], attention_mask=mask,
-                    past_key_values=cache, use_cache=True)
-        return draft.compute_logits(hid, head).argmax(-1)
-
-    with torch.inference_mode():
-        for _ in range(3):
-            run()
-            crop(cache, ctx)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(reps):
-            run()
-            crop(cache, ctx)
-        torch.cuda.synchronize()
-        eager = (time.perf_counter() - t0) * 1000 / reps
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(3):
-                run()
-                crop(cache, ctx)
-        torch.cuda.current_stream().wait_stream(s)
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):      # the cache grows to ctx + new_ctx + q inside the graph; replays
-            run()                      # recompute that same step, which is what we want to time
-        for _ in range(3):
-            g.replay()
-        torch.cuda.synchronize()
-        st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        st.record()
-        for _ in range(reps):
-            g.replay()
-        en.record()
-        torch.cuda.synchronize()
-        graph = st.elapsed_time(en) / reps
-    del g, cache
-    return eager, graph
+        KEEP.extend([ids, pos, cache])
+        return g
+    finally:
+        base.layers = full_layers
+        model.config.num_hidden_layers = full_n
 
 
-def bench(name, model, args, qs, keep, rows):
-    for q in qs:
-        row = {"stage": name, "q": q}
-        try:
-            row["eager_ms"], row["graph_ms"] = stage(model, args.ctx, q, args.reps, keep)
-        except Exception as e:  # noqa: BLE001
-            print(f"[{name} q={q}] failed: {type(e).__name__}: {str(e)[:300]}", flush=True)
-            row["eager_ms"] = row["graph_ms"] = float("nan")
-        rows.append(row)
-        print(row, flush=True)
+@torch.inference_mode()
+def capture_matmul(rows, din, dout, dtype, dev):
+    x = torch.randn(rows, din, device=dev, dtype=dtype)
+    w = torch.randn(din, dout, device=dev, dtype=dtype) / din ** 0.5
+    out = torch.empty(rows, dout, device=dev, dtype=dtype)
+
+    def step():
+        torch.matmul(x, w, out=out)
+
+    for _ in range(3):
+        step()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        step()
+    KEEP.extend([x, w, out])
+    return g
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
     ap.add_argument("--draft", default="z-lab/Qwen3-8B-DFlash-b16")
-    ap.add_argument("--copies", nargs="*", default=["ao4:Qwen/Qwen3-8B", "bnb4:Qwen/Qwen3-8B"])
+    ap.add_argument("--copy", default="bnb4:Qwen/Qwen3-8B")
     ap.add_argument("--ctx", type=int, default=1024)
-    ap.add_argument("--verify-qs", nargs="+", type=int, default=[1, 16, 32, 48, 64])
-    ap.add_argument("--copy-qs", nargs="+", type=int, default=[16, 26, 32])
-    ap.add_argument("--reps", type=int, default=30)
-    ap.add_argument("--only-copies", action="store_true")
+    ap.add_argument("--shallow", type=int, default=2, help="target layers for the exact layer-1 tap")
+    ap.add_argument("--restarts", type=int, default=2)
+    ap.add_argument("--out", default="bench_refresh")
     args = ap.parse_args()
-    rows = []
-    if args.only_copies:
-        for spec in args.copies:
-            try:
-                m = load_mid(spec)
-            except Exception as e:  # noqa: BLE001
-                print(f"[{spec}] load failed: {type(e).__name__}: {e}", flush=True)   # full text (build logs)
-                continue
-            print(f"[{spec}] linear layer class: {type(m.model.layers[0].mlp.down_proj).__module__}."
-                  f"{type(m.model.layers[0].mlp.down_proj).__name__}", flush=True)
-            bench("copy_" + spec.split(":")[0], m, args, args.copy_qs, 16, rows)
-            free(m)
-            del m
-        print_table(rows, ["stage", "q", "eager_ms", "graph_ms"], f"copy latency, batch 1, ctx {args.ctx}")
-        save_json("bench_refresh_copies", {"args": vars(args), "rows": rows})
-        return
+    dev = "cuda"
+
     target = load_target(args.target)
-    bench("verify_bf16", target, args, args.verify_qs, None, rows)
-    from hspec.models import load_draft
     draft = load_draft(args.draft)
-    for name, new_ctx, nb in (("draft_block1", 10, 1), ("draft_restarts3", 16, 3), ("draft_restarts1", 16, 1)):
-        row = {"stage": name, "q": nb * draft.block_size}
-        try:
-            row["eager_ms"], row["graph_ms"] = draft_stage(draft, target, args.ctx, new_ctx, nb, args.reps)
-        except Exception as e:  # noqa: BLE001
-            print(f"[{name}] failed: {type(e).__name__}: {str(e)[:300]}", flush=True)
-            row["eager_ms"] = row["graph_ms"] = float("nan")
-        rows.append(row)
-        print(row, flush=True)
-    free(draft)
-    del draft
-    free(target)
-    del target
-    for spec in args.copies:
-        try:
-            m = load_mid(spec)
-        except Exception as e:  # noqa: BLE001
-            print(f"[{spec}] load failed: {type(e).__name__}: {str(e)[:300]}", flush=True)
-            continue
-        bench("copy_" + spec.split(":")[0], m, args, args.copy_qs, 16, rows)
-        free(m)
-        del m
-    print_table(rows, ["stage", "q", "eager_ms", "graph_ms"],
-                f"stage latency, batch 1, ctx {args.ctx} (graph = CUDA-graph replay)")
-    save_json("bench_refresh", {"args": vars(args), "rows": rows})
+    H = target.config.hidden_size
+    bs = draft.block_size
+    rows = []
+
+    def add(name, ms, ref=None):
+        rows.append({"component": name, "ms": ms, "frac_of_verify16": (ms / ref) if ref else float("nan")})
+        print(rows[-1], flush=True)
+
+    gv = {q: capture_model(target, args.ctx, q)[0] for q in (16, 32, 48, 64)}
+    t_v16 = timed(gv[16].replay)
+    for q, g in gv.items():
+        add(f"target verify {q} tokens", t_v16 if q == 16 else timed(g.replay), t_v16)
+    add(f"shallow bf16: target layers 0..{args.shallow - 1}, {bs} tokens",
+        timed(capture_shallow(target, args.shallow, args.ctx, bs).replay), t_v16)
+    gd = capture_draft(draft, target)
+    add("drafter, one block", timed(gd.replay), t_v16)
+    add(f"drafter, {args.restarts} blocks batched (restart call)",
+        timed(capture_draft(draft, target, batch=args.restarts).replay), t_v16)
+    for nm, din, dout, dt in (("map fp32 (3H+1 -> 5H)", 3 * H + 1, 5 * H, torch.float32),
+                              ("map bf16 (3H+1 -> 5H)", 3 * H + 1, 5 * H, torch.bfloat16),
+                              ("map bf16 (3H+1 -> fused H)", 3 * H + 1, H, torch.bfloat16)):
+        add(nm + f", {bs} rows", timed(capture_matmul(bs, din, dout, dt, dev).replay), t_v16)
+    try:
+        copy = load_mid(args.copy)
+        add(f"shallow 4-bit: copy layers 0..{args.shallow - 1}, {bs} tokens",
+            timed(capture_shallow(copy, args.shallow, args.ctx, bs).replay), t_v16)
+        add(f"copy, full 4-bit pass over {bs} tokens", timed(capture_model(copy, args.ctx, bs)[0].replay), t_v16)
+        free(copy)
+    except Exception as e:  # noqa: BLE001
+        print(f"[copy] failed: {type(e).__name__}: {str(e)[:200]}", flush=True)
+    print_table(rows, list(rows[0]), f"measured component costs, one A100, batch 1, CUDA graphs, ctx {args.ctx}")
+    save_json(args.out, {"args": vars(args), "rows": rows})
 
 
 if __name__ == "__main__":
