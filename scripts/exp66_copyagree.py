@@ -71,7 +71,8 @@ def main():
     # how often the stored sequence is the target's own greedy continuation (exactness of the run lengths)
     data_greedy = sum(int((t == d["ids"][max(d["n_prompt"] - 1, 0) + 1 :].long()).sum()) for t, d in zip(tgt, seqs))
     n_pos = sum(len(t) for t in tgt)
-    free(target)
+    del target
+    free()
     print(f"[exp66] {len(seqs)} sequences, {n_pos} response positions; stored text = target greedy at "
           f"{data_greedy / n_pos:.3f} of them", flush=True)
 
@@ -83,7 +84,8 @@ def main():
             print(f"[{spec}] failed to load: {type(e).__name__}: {str(e)[:200]}", flush=True)
             continue
         cp = argmaxes(copy, seqs, dev)
-        free(copy)
+        del copy
+        free()
         agree_all, reach, starts = [], {L: 0 for L in LENS}, {L: 0 for L in LENS}
         ck_num, ck_den = torch.zeros(args.max_k), torch.zeros(args.max_k)
         for a, b in zip(cp, tgt):
