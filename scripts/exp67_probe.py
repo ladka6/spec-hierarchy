@@ -73,7 +73,7 @@ def main():
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
     ap.add_argument("--draft", default="z-lab/Qwen3-8B-DFlash-b16")
     ap.add_argument("--datasets", nargs="+", default=["gsm8k", "math500", "humaneval", "mt-bench"])
-    ap.add_argument("--n", type=int, default=60, help="prompts per dataset")
+    ap.add_argument("--n", type=int, default=150, help="prompts per dataset")
     ap.add_argument("--max-new", type=int, default=384)
     ap.add_argument("--gen-batch", type=int, default=16)
     ap.add_argument("--val-frac", type=float, default=0.25)
@@ -82,6 +82,9 @@ def main():
     ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--bs", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--rank", type=int, default=256, help="probe rank (low rank against memorising)")
+    ap.add_argument("--wd", type=float, default=0.1)
+    ap.add_argument("--patience", type=int, default=3, help="dev checks (every 200 steps) without improvement")
     ap.add_argument("--save", default="exp67_probe")
     args = ap.parse_args()
     dev = "cuda"
@@ -163,33 +166,66 @@ def main():
         row = {"reader": f"probe {kind} (position s-1 only)"}
         for k in args.ks:
             ytr, yva = tr[3][:, k - 1], va[3][:, k - 1]
-            lin = torch.nn.Linear(Xtr.shape[1], H).to(dev)
-            torch.nn.init.normal_(lin.weight, std=1.0 / math.sqrt(Xtr.shape[1]))
-            torch.nn.init.zeros_(lin.bias)
+            # low-rank probe (rank --rank) so it cannot memorise ~50K examples; early stopping on a held-out tail of
+            # the training sequences (contiguous rows = whole sequences), best dev-loss weights are kept
+            n_dev = max(1, int(len(Xtr) * 0.1))
+            Xfit, yfit, Xdev, ydev = Xtr[:-n_dev], ytr[:-n_dev], Xtr[-n_dev:], ytr[-n_dev:]
+            down = torch.nn.Linear(Xtr.shape[1], args.rank, bias=False).to(dev)
+            up = torch.nn.Linear(args.rank, H).to(dev)
+            torch.nn.init.normal_(down.weight, std=1.0 / math.sqrt(Xtr.shape[1]))
+            torch.nn.init.normal_(up.weight, std=1.0 / math.sqrt(args.rank))
+            torch.nn.init.zeros_(up.bias)
             gain = torch.nn.Parameter(torch.ones(H, device=dev))
-            opt = torch.optim.AdamW(list(lin.parameters()) + [gain], lr=args.lr, weight_decay=0.01)
+            params = list(down.parameters()) + list(up.parameters()) + [gain]
+            opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
             sched = torch.optim.lr_scheduler.LambdaLR(
                 opt, lambda s: min(1.0, (s + 1) / 100) * 0.5 * (1 + math.cos(math.pi * s / args.steps)))
-            for step in range(args.steps):
-                idx = torch.randint(0, len(Xtr), (args.bs,))
-                xb, yb = Xtr[idx.to(dev)], ytr[idx].to(dev)
+
+            def fwd(xb):
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    logits = head(rms(lin(xb.float())) * gain)
-                loss = F.cross_entropy(logits.float(), yb)
+                    return head(rms(up(down(xb.float()))) * gain)
+
+            def eval_loss(X, y):
+                tot, n = 0.0, 0
+                with torch.no_grad():
+                    for c in range(0, len(X), 4096):
+                        lg = fwd(X[c : c + 4096]).float()
+                        tot += float(F.cross_entropy(lg, y[c : c + 4096].to(dev), reduction="sum"))
+                        n += len(lg)
+                return tot / max(n, 1)
+
+            best, best_state, since = float("inf"), None, 0
+            for step in range(args.steps):
+                idx = torch.randint(0, len(Xfit), (args.bs,))
+                loss = F.cross_entropy(fwd(Xfit[idx.to(dev)]).float(), yfit[idx].to(dev))
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
                 sched.step()
-                if (step + 1) % 1000 == 0:
-                    print(f"[probe {kind} k={k}] step {step + 1} loss {float(loss):.3f}", flush=True)
+                if (step + 1) % 200 == 0:
+                    dl = eval_loss(Xdev, ydev)
+                    if dl < best:
+                        best, since = dl, 0
+                        best_state = [p.detach().clone() for p in params]
+                    else:
+                        since += 1
+                    if (step + 1) % 1000 == 0 or since >= args.patience:
+                        print(f"[probe {kind} k={k}] step {step + 1} train {float(loss.detach()):.3f} "
+                              f"dev {dl:.3f} (best {best:.3f})", flush=True)
+                    if since >= args.patience:
+                        break
+            with torch.no_grad():
+                for p, b in zip(params, best_state):
+                    p.copy_(b)
             correct = 0
             with torch.no_grad():
                 for c in range(0, len(Xva), 4096):
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
-                        lg = head(rms(lin(Xva[c : c + 4096].to(dev).float())) * gain)
+                    lg = fwd(Xva[c : c + 4096])
                     correct += int((lg.argmax(-1).cpu() == yva[c : c + 4096]).sum())
             row[f"acc_k{k}"] = correct / len(Xva)
-            del lin, opt
+            row[f"devloss_k{k}"] = best
+            del down, up
+            del opt
         del Xtr, Xva
         torch.cuda.empty_cache()
         rows.append(row)
