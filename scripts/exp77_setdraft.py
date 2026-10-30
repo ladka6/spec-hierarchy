@@ -78,6 +78,21 @@ class ModeAdapters(nn.Module):
         return hf[None] + d
 
 
+class ModeInputs(nn.Module):
+    """K mode vectors added to the block's INPUT embeddings (anchor + masks), so the whole drafter runs once per mode
+    and positions inside a mode's block attend to each other: a mode can follow one continuation coherently.
+    Mode 0 adds nothing (plain DFlash at the start); mode k > 0 adds scale x |input| x unit(v_k)."""
+
+    def __init__(self, H, K, scale=0.3):
+        super().__init__()
+        self.v = nn.Parameter(torch.randn(K, H))
+        self.scale = scale
+
+    def vectors(self, ref_norm):                 # [K, H]
+        u = F.normalize(self.v, dim=-1) * self.scale * ref_norm
+        return torch.cat([torch.zeros_like(u[:1]), u[1:]], 0)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
@@ -90,6 +105,9 @@ def main():
     ap.add_argument("--keep0", type=float, default=1.0,
                     help="weight of mode 0's own full loss on every block (mode 0 stays a full drafter; the WTA term "
                          "then trains the others to cover what it misses). 0 = plain winner-takes-all")
+    ap.add_argument("--mode-input", action="store_true",
+                    help="modes as input vectors (one drafter pass per mode, coherent blocks) instead of output adapters")
+    ap.add_argument("--freeze", action="store_true", help="keep the drafter frozen; train only the modes")
     ap.add_argument("--steps", type=int, default=1500)
     ap.add_argument("--blocks", type=int, default=8, help="anchors per sequence per step")
     ap.add_argument("--lr", type=float, default=1e-4, help="drafter")
@@ -100,7 +118,8 @@ def main():
     ap.add_argument("--skip-control", action="store_true")
     ap.add_argument("--save", default="")
     args = ap.parse_args()
-    args.save = args.save or f"exp77_setdraft_K{args.K}_keep{args.keep0:g}"
+    args.save = args.save or (f"exp77_setdraft_K{args.K}_keep{args.keep0:g}" + ("_in" if args.mode_input else "")
+                              + ("_frozen" if args.freeze else ""))
     dev = "cuda"
     t0 = time.time()
 
@@ -134,12 +153,29 @@ def main():
         out = target(x[None], output_hidden_states=True, use_cache=False)
         return extract_context_feature(out.hidden_states, lids)
 
-    def drafter_hidden(draft, feats, x, anchors):
+    def drafter_hidden(draft, feats, x, anchors, mode_in=None):
+        """[A, B, Hd]; with mode_in (ModeInputs): [K, A, B, Hd], one packed pass over K copies of every block."""
+        K_ = 1 if mode_in is None else mode_in.v.shape[0]
+        blocks = [(s, 0) for _ in range(K_) for s in anchors]
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            noise, pos, mask, starts = pack(draft, target, feats, x, [(s, 0) for s in anchors], bs)
+            noise, pos, mask, starts = pack(draft, target, feats, x, blocks, bs)
+            if mode_in is not None:
+                vec = mode_in.vectors(noise.detach()[0].float().norm(dim=-1).mean())      # [K, H]
+                rows = torch.zeros(noise.shape[1], vec.shape[1], device=dev, dtype=vec.dtype)
+                for b, st in enumerate(starts):
+                    rows = rows.index_add(0, torch.arange(st - 1, st + B, device=dev),
+                                          vec[b // len(anchors)][None].expand(B + 1, -1))
+                noise = noise + rows[None].to(noise.dtype)
             hid = draft(target_hidden=feats, noise_embedding=noise, position_ids=pos, attention_mask=mask,
                         past_key_values=None, use_cache=False)[0]
-            return torch.stack([hid[st : st + B] for st in starts])                    # [A, B, Hd]
+            hb = torch.stack([hid[st : st + B] for st in starts])                      # [K_*A, B, Hd]
+        return hb if mode_in is None else hb.view(K_, len(anchors), B, -1)
+
+    def mode_hidden(draft, modes, feats, x, anchors):
+        """[K, A, B, H] for either kind of modes."""
+        if isinstance(modes, ModeInputs):
+            return drafter_hidden(draft, feats, x, anchors, modes)
+        return modes(drafter_hidden(draft, feats, x, anchors))
 
     def logits_of(draft, h):
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -165,7 +201,7 @@ def main():
         for i, an in ev.items():
             x = val[i][0].to(dev)
             feats = target_feats(x)
-            h = drafter_hidden(draft, feats, x, an)
+            h = drafter_hidden(draft, feats, x, an) if modes is None else None
             if modes is None:
                 lg = logits_of(draft, h).float()                                          # [A, B, V]
                 top2 = lg.topk(2, -1)
@@ -181,7 +217,7 @@ def main():
                         chains.append(c)
                     chains_all.append(chains)
             else:
-                lg = logits_of(draft, modes(h)).float()                                  # [K, A, B, V]
+                lg = logits_of(draft, mode_hidden(draft, modes, feats, x, an)).float()   # [K, A, B, V]
                 pred = lg.argmax(-1)
                 chains_all = [[pred[k, a].tolist() for k in range(K)] for a in range(len(an))]
             for a, s in enumerate(an):
@@ -217,8 +253,18 @@ def main():
         rng = random.Random(2)
         draft = load_draft(args.draft, dev).float()      # fp32 master weights (bf16 + small lr rounds updates away)
         draft.train()
-        modes = ModeAdapters(Hd, K, args.rank).to(dev) if K > 1 else None
-        groups = [{"params": [p for p in draft.parameters() if p.requires_grad], "lr": args.lr}]
+        if K == 1:
+            modes = None
+        elif args.mode_input:
+            modes = ModeInputs(Hd, K).to(dev)
+        else:
+            modes = ModeAdapters(Hd, K, args.rank).to(dev)
+        groups = []
+        if not args.freeze:
+            groups.append({"params": [p for p in draft.parameters() if p.requires_grad], "lr": args.lr})
+        else:
+            for p_ in draft.parameters():
+                p_.requires_grad_(False)
         if modes is not None:
             groups.append({"params": list(modes.parameters()), "lr": args.lr_m})
         opt = torch.optim.AdamW(groups, weight_decay=0.0, betas=(0.9, 0.95))
@@ -233,8 +279,7 @@ def main():
                 continue
             feats = target_feats(x)
             labels = torch.stack([x[s + 1 : s + 1 + B] for s in an])                       # [A, B]
-            h = drafter_hidden(draft, feats, x, an)
-            hk = modes(h) if modes is not None else h[None]                                 # [K, A, B, H]
+            hk = mode_hidden(draft, modes, feats, x, an) if modes is not None else drafter_hidden(draft, feats, x, an)[None]
             lg = logits_of(draft, hk)                                                       # [K, A, B, V]
             ce = F.cross_entropy(lg.float().flatten(0, 2), labels[None].expand(lg.shape[0], -1, -1).reshape(-1),
                                  reduction="none").view(lg.shape[0], len(an), B)
