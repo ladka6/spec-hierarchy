@@ -165,7 +165,7 @@ def main():
                 cos_in = {}
                 for nme in names:
                     hm = Xb[a] @ W[nme]                                               # [B, H] mapped states
-                    cos_in[nme] = float(F.cosine_similarity(hm, Y[nme][a], dim=-1).mean())
+                    cos_in[f"map_{nme}"] = float(F.cosine_similarity(hm, Y[nme][a], dim=-1).mean())
                     if nme == "final":
                         hout = hm.to(torch.bfloat16)
                     else:
@@ -178,7 +178,7 @@ def main():
                     st[key]["acc"] += float(right.mean())
                     st[key]["acc4"] += float(right[:4].mean())
                     if key.startswith("map_"):
-                        st[key]["cos_in"] += cos_in[key[4:]]
+                        st[key]["cos_in"] += cos_in[key]
                 n_eval += 1
             if n_done % 20 == 0:
                 print(f"[eval] {n_done}/{len(ev)} sequences, {time.time()-t0:.0f}s", flush=True)
