@@ -67,6 +67,24 @@ class Bottleneck(nn.Module):
         return g * ref_norm * F.normalize(z, dim=-1)
 
 
+class KVSummary(nn.Module):
+    """The summary as `chunks` extra key/value entries of the drafter's context (the channel DFlash reads target
+    features from), instead of one vector added to the block's inputs. Each chunk mean -> d dims -> the drafter's
+    feature width (the 5 concatenated target layers), plus a learned chunk-index embedding; rescaled to the norm of a
+    real feature row. The drafter's own fc + RMSNorm then treats the entries like target features."""
+
+    def __init__(self, H, d, chunks, feat_dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(H)
+        self.down = nn.Linear(H, d)
+        self.up = nn.Linear(d, feat_dim)
+        self.chunk_emb = nn.Parameter(torch.randn(chunks, feat_dim) * 0.02)
+
+    def forward(self, chunk_means, ref_norm):   # [A, chunks, H], scalar -> [A, chunks, feat_dim]
+        z = self.up(self.down(self.norm(chunk_means))) + self.chunk_emb
+        return ref_norm * F.normalize(z, dim=-1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
@@ -74,6 +92,9 @@ def main():
     ap.add_argument("--cache", required=True, help="(ids, n_prompt) greedy sequences, e.g. from exp69")
     ap.add_argument("--ds", nargs="+", type=int, default=[0, 16, 64, 256], help="bottleneck sizes (0 = no summary)")
     ap.add_argument("--chunks", type=int, default=1)
+    ap.add_argument("--inject", choices=["add", "kv"], default="add",
+                    help="add: one vector added to the block's input embeddings; kv: one extra key/value context "
+                         "entry per chunk, visible only to its own block")
     ap.add_argument("--scale", type=float, default=0.3,
                     help="summary norm as a fraction of the input-embedding norm (fixed); <= 0 = learned tanh gate")
     ap.add_argument("--steps", type=int, default=800)
@@ -85,7 +106,7 @@ def main():
     ap.add_argument("--val-frac", type=float, default=0.2)
     ap.add_argument("--save", default="")
     args = ap.parse_args()
-    args.save = args.save or f"exp75_futuresummary_c{args.chunks}"
+    args.save = args.save or f"exp75_futuresummary_{args.inject}_c{args.chunks}"
     dev = "cuda"
     t0 = time.time()
 
@@ -121,7 +142,22 @@ def main():
     def run(draft, bott, feats, x, anchors, hdeep, train_mode):
         """Packed DFlash pass over all anchors, with the summary added to each block's input embeddings."""
         noise, pos, mask, starts = pack(draft, target, feats, x, [(s, 0) for s in anchors], bs)
-        if bott is not None:
+        if bott is not None and args.inject == "kv":
+            T, Q, c = feats.shape[1], noise.shape[1], args.chunks
+            ref = feats.detach()[0].float().norm(dim=-1).mean()
+            extra = bott(summary_input(hdeep, anchors), ref)                            # [A, c, F]
+            stats["ratio"] = float(extra.detach().norm(dim=-1).mean() / ref.clamp_min(1e-9))
+            feats = torch.cat([feats, extra.reshape(1, -1, extra.shape[-1]).to(feats.dtype)], 1)
+            spos = torch.tensor([s for s in anchors for _ in range(c)], device=dev)    # at the anchor's position
+            pos = torch.cat([pos[0, :T], spos, pos[0, T:]])[None]
+            m = mask[0, 0]
+            m2 = torch.zeros(Q, T + len(spos) + Q, dtype=m.dtype, device=dev)
+            m2[:, :T] = m[:, :T]
+            m2[:, T + len(spos):] = m[:, T:]
+            for a, st in enumerate(starts):                                             # each block sees its own
+                m2[st - 1 : st + B, T + a * c : T + (a + 1) * c] = True
+            mask = m2[None, None]
+        elif bott is not None:
             ref = noise.detach()[0].float().norm(dim=-1).mean()
             add = bott(summary_input(hdeep, anchors), ref).to(noise.dtype)             # [A, W]
             # how large the summary is next to the block's own input embeddings (logged during training)
@@ -183,7 +219,12 @@ def main():
         draft = load_draft(args.draft, dev).float()     # fp32 master weights: bf16 + lr 3e-5 rounds updates away
         draft.train()
         width = draft.config.hidden_size
-        bott = Bottleneck(H, d, args.chunks, width, args.scale).to(dev) if d > 0 else None
+        if d == 0:
+            bott = None
+        elif args.inject == "kv":
+            bott = KVSummary(H, d, args.chunks, len(lids) * H).to(dev)
+        else:
+            bott = Bottleneck(H, d, args.chunks, width, args.scale).to(dev)
         groups = [{"params": [p for p in draft.parameters() if p.requires_grad], "lr": args.lr}]
         if bott is not None:
             groups.append({"params": list(bott.parameters()), "lr": args.lr_b})
@@ -215,7 +256,7 @@ def main():
                 tail = log[-100:]
                 print(f"[train d={d}] step {step}: loss {sum(a for a, _ in tail)/len(tail):.4f}  "
                       f"acc@1 {sum(b for _, b in tail)/len(tail):.3f}  |summary|/|input| {stats['ratio']:.3f}  "
-                      f"gate {float(torch.tanh(bott.gate.detach())) if bott is not None and bott.gate is not None else (args.scale if bott is not None else 0.0):.3f}  "
+                      f"gate {float(torch.tanh(bott.gate.detach())) if getattr(bott, 'gate', None) is not None else (args.scale if bott is not None and args.inject == 'add' else 0.0):.3f}  "
                       f"{time.time()-t0:.0f}s", flush=True)
         r = evaluate(draft, bott)
         rows_out.append({"condition": "finetune" if d == 0 else "finetune + true summary", "d": d, **r})
