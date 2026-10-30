@@ -87,6 +87,9 @@ def main():
     ap.add_argument("--K", type=int, default=3)
     ap.add_argument("--rank", type=int, default=128)
     ap.add_argument("--eps", type=float, default=0.05, help="relaxed winner-takes-all: weight shared by the losers")
+    ap.add_argument("--keep0", type=float, default=1.0,
+                    help="weight of mode 0's own full loss on every block (mode 0 stays a full drafter; the WTA term "
+                         "then trains the others to cover what it misses). 0 = plain winner-takes-all")
     ap.add_argument("--steps", type=int, default=1500)
     ap.add_argument("--blocks", type=int, default=8, help="anchors per sequence per step")
     ap.add_argument("--lr", type=float, default=1e-4, help="drafter")
@@ -97,7 +100,7 @@ def main():
     ap.add_argument("--skip-control", action="store_true")
     ap.add_argument("--save", default="")
     args = ap.parse_args()
-    args.save = args.save or f"exp77_setdraft_K{args.K}"
+    args.save = args.save or f"exp77_setdraft_K{args.K}_keep{args.keep0:g}"
     dev = "cuda"
     t0 = time.time()
 
@@ -240,7 +243,7 @@ def main():
                 best = per.detach().argmin(0)                                               # [A]
                 wt = torch.full_like(per, args.eps / (K - 1))
                 wt[best, torch.arange(len(an), device=dev)] = 1 - args.eps
-                loss = (wt * per).sum(0).mean()
+                loss = (wt * per).sum(0).mean() + args.keep0 * per[0].mean()
                 share = torch.bincount(best, minlength=K).float() / len(an)
             else:
                 loss = per.mean()
