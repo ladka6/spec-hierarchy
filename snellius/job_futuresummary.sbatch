@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=18
-#SBATCH --time=04:00:00
+#SBATCH --time=02:00:00
 #SBATCH --output=futuresum-%j.out
 # exp75 at scale: can DFlash learn to use a NEW input (a summary of the block's true future) with a real training
 # budget? The Colab runs (420 sequences, 800 steps) could not tell: even an oracle bag of the future tokens gave ~0.
