@@ -51,13 +51,14 @@ def matched(chain, truth):
 class Bottleneck(nn.Module):
     def __init__(self, H, d, chunks, out_dim):
         super().__init__()
+        self.norm = nn.LayerNorm(H)             # deep-layer states have huge, outlier-heavy norms: normalise first
         self.down = nn.Linear(H, d)
         self.up = nn.Linear(d * chunks, out_dim)
         nn.init.zeros_(self.up.weight)          # starts as "no summary": the fine-tune begins exactly at DFlash
         nn.init.zeros_(self.up.bias)
 
     def forward(self, chunk_means):             # [A, chunks, H] -> [A, out_dim]
-        z = self.down(chunk_means)
+        z = self.down(self.norm(chunk_means))
         return self.up(z.flatten(1))
 
 
@@ -71,7 +72,7 @@ def main():
     ap.add_argument("--steps", type=int, default=800)
     ap.add_argument("--blocks", type=int, default=16, help="anchors per sequence per step")
     ap.add_argument("--lr", type=float, default=3e-5, help="drafter")
-    ap.add_argument("--lr-b", type=float, default=1e-3, help="bottleneck")
+    ap.add_argument("--lr-b", type=float, default=2e-4, help="bottleneck")
     ap.add_argument("--gamma", type=float, default=0.9, help="position weight decay in the loss (as DFlash)")
     ap.add_argument("--anchors", type=int, default=500, help="eval anchors")
     ap.add_argument("--val-frac", type=float, default=0.2)
