@@ -49,19 +49,22 @@ def matched(chain, truth):
 
 
 class Bottleneck(nn.Module):
-    def __init__(self, H, d, chunks, out_dim):
+    def __init__(self, H, d, chunks, out_dim, scale=0.3):
         super().__init__()
+        self.scale = scale
         self.norm = nn.LayerNorm(H)             # deep-layer states have huge, outlier-heavy norms: normalise first
         self.down = nn.Linear(H, d)
         self.up = nn.Linear(d * chunks, out_dim)
-        # bounded injection: the summary is rescaled to the size of the block's input embedding and multiplied by
-        # tanh(gate), gate = 0 at init, so the fine-tune starts exactly at DFlash and the summary can never exceed
-        # the input it is added to (an unbounded version grew to ~100x the input and drowned the block positions)
-        self.gate = nn.Parameter(torch.zeros(()))
+        # bounded injection: the summary is rescaled to `scale` x the norm of the block's input embedding.
+        # scale > 0: fixed, so the projections get full gradients from step 0. (An unbounded version grew to ~100x the
+        # input and drowned the block positions; a learned gate tanh(g), g = 0 at init, never opened because the
+        # projections behind a closed gate get no gradient and stay random.) scale <= 0: the learned gate.
+        self.gate = nn.Parameter(torch.zeros(())) if scale <= 0 else None
 
     def forward(self, chunk_means, ref_norm):   # [A, chunks, H], scalar -> [A, out_dim]
         z = self.up(self.down(self.norm(chunk_means)).flatten(1))
-        return torch.tanh(self.gate) * ref_norm * F.normalize(z, dim=-1)
+        g = torch.tanh(self.gate) if self.gate is not None else self.scale
+        return g * ref_norm * F.normalize(z, dim=-1)
 
 
 def main():
@@ -71,6 +74,8 @@ def main():
     ap.add_argument("--cache", required=True, help="(ids, n_prompt) greedy sequences, e.g. from exp69")
     ap.add_argument("--ds", nargs="+", type=int, default=[0, 16, 64, 256], help="bottleneck sizes (0 = no summary)")
     ap.add_argument("--chunks", type=int, default=1)
+    ap.add_argument("--scale", type=float, default=0.3,
+                    help="summary norm as a fraction of the input-embedding norm (fixed); <= 0 = learned tanh gate")
     ap.add_argument("--steps", type=int, default=800)
     ap.add_argument("--blocks", type=int, default=16, help="anchors per sequence per step")
     ap.add_argument("--lr", type=float, default=1e-4, help="drafter")
@@ -178,7 +183,7 @@ def main():
         draft = load_draft(args.draft, dev).float()     # fp32 master weights: bf16 + lr 3e-5 rounds updates away
         draft.train()
         width = draft.config.hidden_size
-        bott = Bottleneck(H, d, args.chunks, width).to(dev) if d > 0 else None
+        bott = Bottleneck(H, d, args.chunks, width, args.scale).to(dev) if d > 0 else None
         groups = [{"params": [p for p in draft.parameters() if p.requires_grad], "lr": args.lr}]
         if bott is not None:
             groups.append({"params": list(bott.parameters()), "lr": args.lr_b})
@@ -210,7 +215,7 @@ def main():
                 tail = log[-100:]
                 print(f"[train d={d}] step {step}: loss {sum(a for a, _ in tail)/len(tail):.4f}  "
                       f"acc@1 {sum(b for _, b in tail)/len(tail):.3f}  |summary|/|input| {stats['ratio']:.3f}  "
-                      f"gate {float(torch.tanh(bott.gate)) if bott is not None else 0.0:.3f}  "
+                      f"gate {float(torch.tanh(bott.gate.detach())) if bott is not None and bott.gate is not None else (args.scale if bott is not None else 0.0):.3f}  "
                       f"{time.time()-t0:.0f}s", flush=True)
         r = evaluate(draft, bott)
         rows_out.append({"condition": "finetune" if d == 0 else "finetune + true summary", "d": d, **r})
