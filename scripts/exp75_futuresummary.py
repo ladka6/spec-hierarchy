@@ -72,7 +72,7 @@ def main():
     ap.add_argument("--steps", type=int, default=800)
     ap.add_argument("--blocks", type=int, default=16, help="anchors per sequence per step")
     ap.add_argument("--lr", type=float, default=1e-4, help="drafter")
-    ap.add_argument("--lr-b", type=float, default=2e-4, help="bottleneck")
+    ap.add_argument("--lr-b", type=float, default=1e-3, help="bottleneck")
     ap.add_argument("--gamma", type=float, default=0.9, help="position weight decay in the loss (as DFlash)")
     ap.add_argument("--anchors", type=int, default=500, help="eval anchors")
     ap.add_argument("--val-frac", type=float, default=0.2)
@@ -109,11 +109,15 @@ def main():
         blk = torch.stack([hdeep[s + 1 : s + 1 + B] for s in anchors])               # [A, B, H]
         return torch.stack([c.mean(1) for c in blk.chunk(args.chunks, dim=1)], 1)
 
+    stats = {"ratio": 0.0}
+
     def run(draft, bott, feats, x, anchors, hdeep, train_mode):
         """Packed DFlash pass over all anchors, with the summary added to each block's input embeddings."""
         noise, pos, mask, starts = pack(draft, target, feats, x, [(s, 0) for s in anchors], bs)
         if bott is not None:
             add = bott(summary_input(hdeep, anchors)).to(noise.dtype)                  # [A, W]
+            # how large the summary is next to the block's own input embeddings (logged during training)
+            stats["ratio"] = float(add.detach().norm(dim=-1).mean() / noise.detach()[0].norm(dim=-1).mean().clamp_min(1e-9))
             rows = torch.zeros(noise.shape[1], add.shape[1], device=dev, dtype=noise.dtype)
             for a, st in enumerate(starts):
                 rows = rows.index_add(0, torch.arange(st - 1, st + B, device=dev),
@@ -192,14 +196,18 @@ def main():
             loss = (ce * w).sum(1).mean() / w.sum()
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_([p for g in groups for p in g["params"]], 1.0)
+            # clip each group on its own: a joint clip lets the drafter's gradients swamp the bottleneck's, so the
+            # zero-initialised summary never grew (first run: d = 16 tracked d = 0 exactly)
+            for g in groups:
+                torch.nn.utils.clip_grad_norm_(g["params"], 1.0)
             opt.step()
             sched.step()
             log.append((float(loss.detach()), float((lg[:, 0].argmax(-1) == labels[:, 0]).float().mean())))
             if step % 100 == 0 or step == args.steps - 1:
                 tail = log[-100:]
                 print(f"[train d={d}] step {step}: loss {sum(a for a, _ in tail)/len(tail):.4f}  "
-                      f"acc@1 {sum(b for _, b in tail)/len(tail):.3f}  {time.time()-t0:.0f}s", flush=True)
+                      f"acc@1 {sum(b for _, b in tail)/len(tail):.3f}  |summary|/|input| {stats['ratio']:.3f}  "
+                      f"{time.time()-t0:.0f}s", flush=True)
         r = evaluate(draft, bott)
         rows_out.append({"condition": "finetune" if d == 0 else "finetune + true summary", "d": d, **r})
         print(f"[eval] d={d}: {r}", flush=True)
