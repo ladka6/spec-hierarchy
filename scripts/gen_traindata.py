@@ -49,9 +49,11 @@ def main():
     ap.add_argument("--max-prompts", type=int, default=0, help="use only the first N (shuffled) prompts")
     ap.add_argument("--skip-prompts", type=int, default=0, help="drop the first N prompts (extend an earlier run)")
     ap.add_argument("--tag", default="", help="suffix of the shard file name")
+    ap.add_argument("--n-gsm8k", type=int, default=2000, help="GSM8K train questions (max ~7.5k)")
+    ap.add_argument("--n-alpaca", type=int, default=2600, help="Alpaca instructions (max ~52k)")
     args = ap.parse_args()
 
-    allp = training_prompts()
+    allp = training_prompts(args.n_gsm8k, args.n_alpaca)
     if args.max_prompts:
         allp = allp[: args.max_prompts]
     allp = allp[args.skip_prompts :]

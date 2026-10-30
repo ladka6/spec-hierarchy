@@ -5,9 +5,10 @@
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
-#SBATCH --time=02:00:00
+#SBATCH --time=08:00:00
 #SBATCH --output=lag-gen-%j.out
-# Target-greedy responses to ~5k training prompts, 4 shards in parallel.
+# Target-greedy responses to ~5k training prompts (default), 4 shards in parallel.
+# More: GEN_ARGS="--n-gsm8k 7400 --n-alpaca 15000" sbatch snellius/job_lag_gen.sbatch   (~23k prompts)
 set -uo pipefail
 cd "$SLURM_SUBMIT_DIR"
 module purge
