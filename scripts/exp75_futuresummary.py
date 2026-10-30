@@ -54,12 +54,14 @@ class Bottleneck(nn.Module):
         self.norm = nn.LayerNorm(H)             # deep-layer states have huge, outlier-heavy norms: normalise first
         self.down = nn.Linear(H, d)
         self.up = nn.Linear(d * chunks, out_dim)
-        nn.init.zeros_(self.up.weight)          # starts as "no summary": the fine-tune begins exactly at DFlash
-        nn.init.zeros_(self.up.bias)
+        # bounded injection: the summary is rescaled to the size of the block's input embedding and multiplied by
+        # tanh(gate), gate = 0 at init, so the fine-tune starts exactly at DFlash and the summary can never exceed
+        # the input it is added to (an unbounded version grew to ~100x the input and drowned the block positions)
+        self.gate = nn.Parameter(torch.zeros(()))
 
-    def forward(self, chunk_means):             # [A, chunks, H] -> [A, out_dim]
-        z = self.down(self.norm(chunk_means))
-        return self.up(z.flatten(1))
+    def forward(self, chunk_means, ref_norm):   # [A, chunks, H], scalar -> [A, out_dim]
+        z = self.up(self.down(self.norm(chunk_means)).flatten(1))
+        return torch.tanh(self.gate) * ref_norm * F.normalize(z, dim=-1)
 
 
 def main():
@@ -115,7 +117,8 @@ def main():
         """Packed DFlash pass over all anchors, with the summary added to each block's input embeddings."""
         noise, pos, mask, starts = pack(draft, target, feats, x, [(s, 0) for s in anchors], bs)
         if bott is not None:
-            add = bott(summary_input(hdeep, anchors)).to(noise.dtype)                  # [A, W]
+            ref = noise.detach()[0].float().norm(dim=-1).mean()
+            add = bott(summary_input(hdeep, anchors), ref).to(noise.dtype)             # [A, W]
             # how large the summary is next to the block's own input embeddings (logged during training)
             stats["ratio"] = float(add.detach().norm(dim=-1).mean() / noise.detach()[0].norm(dim=-1).mean().clamp_min(1e-9))
             rows = torch.zeros(noise.shape[1], add.shape[1], device=dev, dtype=noise.dtype)
@@ -207,6 +210,7 @@ def main():
                 tail = log[-100:]
                 print(f"[train d={d}] step {step}: loss {sum(a for a, _ in tail)/len(tail):.4f}  "
                       f"acc@1 {sum(b for _, b in tail)/len(tail):.3f}  |summary|/|input| {stats['ratio']:.3f}  "
+                      f"gate {float(torch.tanh(bott.gate)) if bott is not None else 0.0:.3f}  "
                       f"{time.time()-t0:.0f}s", flush=True)
         r = evaluate(draft, bott)
         rows_out.append({"condition": "finetune" if d == 0 else "finetune + true summary", "d": d, **r})
