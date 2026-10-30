@@ -61,7 +61,7 @@ def main():
     ap.add_argument("--k", type=int, default=28, help="first target layer the completion runs (layers k..L-1)")
     ap.add_argument("--steps", type=int, default=1500)
     ap.add_argument("--blocks", type=int, default=8, help="anchors per sequence per step")
-    ap.add_argument("--lr", type=float, default=3e-5, help="drafter")
+    ap.add_argument("--lr", type=float, default=1e-4, help="drafter")
     ap.add_argument("--lr-p", type=float, default=1e-4, help="projection P")
     ap.add_argument("--own-w", type=float, default=0.5)
     ap.add_argument("--gamma", type=float, default=0.9)
@@ -103,11 +103,13 @@ def main():
         return extract_context_feature(out.hidden_states, lids), out.hidden_states[K][0]
 
     def drafter_pass(draft, feats, x, anchors):
-        noise, pos, mask, starts = pack(draft, target, feats, x, [(s, 0) for s in anchors], bs)
-        hid = draft(target_hidden=feats, noise_embedding=noise, position_ids=pos, attention_mask=mask,
-                    past_key_values=None, use_cache=False)[0]
-        hb = torch.stack([hid[st : st + B] for st in starts])                          # [A, B, Hd]
-        return hb, draft.compute_logits(hb, head).float()                              # own logits [A, B, V]
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            noise, pos, mask, starts = pack(draft, target, feats, x, [(s, 0) for s in anchors], bs)
+            hid = draft(target_hidden=feats, noise_embedding=noise, position_ids=pos, attention_mask=mask,
+                        past_key_values=None, use_cache=False)[0]
+            hb = torch.stack([hid[st : st + B] for st in starts])                      # [A, B, Hd]
+            ol = draft.compute_logits(hb, head).float()                                # own logits [A, B, V]
+        return hb, ol
 
     def proj_input(hb, own_logits, x, anchors):
         prev = torch.cat([x[torch.tensor(anchors, device=dev)][:, None], own_logits.argmax(-1)[:, :-1]], 1)
@@ -230,7 +232,7 @@ def main():
     def finetune(mode):
         torch.manual_seed(0)
         rng = random.Random(2)
-        draft = load_draft(args.draft, dev)
+        draft = load_draft(args.draft, dev).float()     # fp32 master weights: bf16 + lr 3e-5 rounds updates away
         draft.train()
         groups = [{"params": [p for p in draft.parameters() if p.requires_grad], "lr": args.lr}]
         P = None

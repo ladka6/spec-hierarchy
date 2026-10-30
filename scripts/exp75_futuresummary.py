@@ -71,7 +71,7 @@ def main():
     ap.add_argument("--chunks", type=int, default=1)
     ap.add_argument("--steps", type=int, default=800)
     ap.add_argument("--blocks", type=int, default=16, help="anchors per sequence per step")
-    ap.add_argument("--lr", type=float, default=3e-5, help="drafter")
+    ap.add_argument("--lr", type=float, default=1e-4, help="drafter")
     ap.add_argument("--lr-b", type=float, default=2e-4, help="bottleneck")
     ap.add_argument("--gamma", type=float, default=0.9, help="position weight decay in the loss (as DFlash)")
     ap.add_argument("--anchors", type=int, default=500, help="eval anchors")
@@ -119,10 +119,11 @@ def main():
                 rows = rows.index_add(0, torch.arange(st - 1, st + B, device=dev),
                                       add[a][None].expand(B + 1, -1))
             noise = noise + rows[None]
-        hid = draft(target_hidden=feats, noise_embedding=noise, position_ids=pos, attention_mask=mask,
-                    past_key_values=None, use_cache=False)[0]
-        hb = torch.stack([hid[st : st + B] for st in starts])                          # [A, B, W]
-        return draft.compute_logits(hb, head).float()                                  # [A, B, V]
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            hid = draft(target_hidden=feats, noise_embedding=noise, position_ids=pos, attention_mask=mask,
+                        past_key_values=None, use_cache=False)[0]
+            hb = torch.stack([hid[st : st + B] for st in starts])                      # [A, B, W]
+            return draft.compute_logits(hb, head).float()                              # [A, B, V]
 
     def anchors_in(ids, lo, n, rng):
         hi = len(ids) - bs - 1
@@ -167,7 +168,7 @@ def main():
     for d in args.ds:
         torch.manual_seed(0)
         rng = random.Random(1)
-        draft = load_draft(args.draft, dev)
+        draft = load_draft(args.draft, dev).float()     # fp32 master weights: bf16 + lr 3e-5 rounds updates away
         draft.train()
         width = draft.config.hidden_size
         bott = Bottleneck(H, d, args.chunks, width).to(dev) if d > 0 else None
