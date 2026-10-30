@@ -163,15 +163,30 @@ def main():
     print_table(srows, list(srows[0]), "part 1: one block of 4 layers at 2-bit (RTN), everything else bf16")
 
     # ---------------- part 2: allocations ----------------
+    configs = [(name, [lo_b if j < args.split else up_b for j in range(L)]) for name, lo_b, up_b in ALLOCS]
+
+    def except_(base, keep, name):
+        return (name, [16 if j in keep else base for j in range(L)])
+
+    configs += [
+        except_(2, {25, 33}, "all 2 except layers 25, 33 (bf16)"),
+        except_(2, {0, 1}, "all 2 except layers 0, 1 (bf16)"),
+        except_(2, {0, 1, 25, 33}, "all 2 except layers 0, 1, 25, 33 (bf16)"),
+        except_(3, {25, 33}, "all 3 except layers 25, 33 (bf16)"),
+    ]
+    # the two blocks whose 2-bit version hurt the deep taps most (part 1) kept in bf16
+    worst = sorted(range(len(srows)), key=lambda r: min(srows[r]["cos_L25"], srows[r]["cos_L33"]))[:2]
+    keep = {j for r in worst for j in range(4 * r, min(4 * r + 4, L))}
+    configs.append(except_(2, keep, f"all 2 except the 2 most sensitive blocks ({sorted(keep)})"))
+
     rows = []
-    for name, lo_b, up_b in ALLOCS:
-        bits = [lo_b if j < args.split else up_b for j in range(L)]
+    for name, bits in configs:
         r = run_config(bits, list(by_seq), True)
         rows.append({"config": name, "bytes_vs_4bit_copy (feat, to L33)": cost(bits, lids[-1]),
                      "bytes_vs_4bit_copy (tokens, all)": cost(bits, L - 1), **r})
         print(f"[alloc] {rows[-1]}  {time.time()-t0:.0f}s", flush=True)
     restore()
-    print_table(rows, list(rows[0]), f"part 2: lower layers 0-{args.split - 1} / upper {args.split}-{L - 1}; tau with "
+    print_table(rows, list(rows[0]), f"part 2: bit allocations (lower = layers 0-{args.split - 1}, upper = {args.split}-{L - 1}); tau with "
                                      f"the configuration's features for the last {args.m} context positions "
                                      f"(real 8.44, removed 1.60, 4-bit copy 8.30 in exp71)")
     save_json(args.save, {"args": vars(args), "sensitivity": srows, "allocations": rows,
