@@ -95,6 +95,9 @@ def main():
     ap.add_argument("--inject", choices=["add", "kv"], default="add",
                     help="add: one vector added to the block's input embeddings; kv: one extra key/value context "
                          "entry per chunk, visible only to its own block")
+    ap.add_argument("--source", choices=["deep", "tokens"], default="deep",
+                    help="deep: the block's real deep-layer target states; tokens: the block's true token embeddings "
+                         "(ORACLE channel check: a bag of the future tokens must help, else the channel is broken)")
     ap.add_argument("--scale", type=float, default=0.3,
                     help="summary norm as a fraction of the input-embedding norm (fixed); <= 0 = learned tanh gate")
     ap.add_argument("--steps", type=int, default=800)
@@ -106,7 +109,7 @@ def main():
     ap.add_argument("--val-frac", type=float, default=0.2)
     ap.add_argument("--save", default="")
     args = ap.parse_args()
-    args.save = args.save or f"exp75_futuresummary_{args.inject}_c{args.chunks}"
+    args.save = args.save or f"exp75_futuresummary_{args.inject}_{args.source}_c{args.chunks}"
     dev = "cuda"
     t0 = time.time()
 
@@ -132,20 +135,42 @@ def main():
         out = target(x[None], output_hidden_states=True, use_cache=False)
         return extract_context_feature(out.hidden_states, lids), out.hidden_states[deep][0].float()
 
-    def summary_input(hdeep, anchors):
-        """[A, chunks, H]: chunk means of the real deep states at positions s+1 .. s+B."""
-        blk = torch.stack([hdeep[s + 1 : s + 1 + B] for s in anchors])               # [A, B, H]
+    emb = target.get_input_embeddings()
+
+    @torch.no_grad()
+    def source_of(x, hdeep):
+        """Per-position source vectors [T, H] the summary is built from, standardised per dimension."""
+        src = hdeep if args.source == "deep" else emb(x).float()
+        return (src - src_mu) / src_sd
+
+    # per-dimension standardisation stats: deep states have a few huge outlier dimensions shared by every position,
+    # which drown the position-specific content (LayerNorm alone keeps them dominant)
+    with torch.no_grad():
+        acc_s, acc_q, n_s = 0.0, 0.0, 0
+        for ids, _lo in train[:40]:
+            x_ = ids.to(dev)
+            _, hd_ = target_pass(x_)
+            v = hd_ if args.source == "deep" else emb(x_).float()
+            acc_s = acc_s + v.sum(0)
+            acc_q = acc_q + (v * v).sum(0)
+            n_s += v.shape[0]
+        src_mu = acc_s / n_s
+        src_sd = (acc_q / n_s - src_mu ** 2).clamp_min(1e-6).sqrt()
+
+    def summary_input(src, anchors):
+        """[A, chunks, H]: chunk means of the (standardised) source vectors at positions s+1 .. s+B."""
+        blk = torch.stack([src[s + 1 : s + 1 + B] for s in anchors])                 # [A, B, H]
         return torch.stack([c.mean(1) for c in blk.chunk(args.chunks, dim=1)], 1)
 
     stats = {"ratio": 0.0}
 
-    def run(draft, bott, feats, x, anchors, hdeep, train_mode):
+    def run(draft, bott, feats, x, anchors, hdeep, train_mode, sum_anchors=None):
         """Packed DFlash pass over all anchors, with the summary added to each block's input embeddings."""
         noise, pos, mask, starts = pack(draft, target, feats, x, [(s, 0) for s in anchors], bs)
         if bott is not None and args.inject == "kv":
             T, Q, c = feats.shape[1], noise.shape[1], args.chunks
             ref = feats.detach()[0].float().norm(dim=-1).mean()
-            extra = bott(summary_input(hdeep, anchors), ref)                            # [A, c, F]
+            extra = bott(summary_input(source_of(x, hdeep), sum_anchors or anchors), ref)  # [A, c, F]
             stats["ratio"] = float(extra.detach().norm(dim=-1).mean() / ref.clamp_min(1e-9))
             feats = torch.cat([feats, extra.reshape(1, -1, extra.shape[-1]).to(feats.dtype)], 1)
             spos = torch.tensor([s for s in anchors for _ in range(c)], device=dev)    # at the anchor's position
@@ -159,7 +184,7 @@ def main():
             mask = m2[None, None]
         elif bott is not None:
             ref = noise.detach()[0].float().norm(dim=-1).mean()
-            add = bott(summary_input(hdeep, anchors), ref).to(noise.dtype)             # [A, W]
+            add = bott(summary_input(source_of(x, hdeep), sum_anchors or anchors), ref).to(noise.dtype)
             # how large the summary is next to the block's own input embeddings (logged during training)
             stats["ratio"] = float(add.detach().norm(dim=-1).mean() / noise.detach()[0].norm(dim=-1).mean().clamp_min(1e-9))
             rows = torch.zeros(noise.shape[1], add.shape[1], device=dev, dtype=noise.dtype)
@@ -187,13 +212,18 @@ def main():
         ev.setdefault(i, []).append(s)
 
     @torch.no_grad()
-    def evaluate(draft, bott):
+    def evaluate(draft, bott, shuffle=False):
+        """shuffle: each block gets the summary of ANOTHER anchor of the same sequence (rolled by one). If tau does not
+        drop, the trained drafter ignores the summary."""
         draft.eval()
         tau, acc, acc4, n = 0.0, 0.0, 0.0, 0
         for i, anchors in ev.items():
+            if shuffle and len(anchors) < 2:
+                continue
             x = val[i][0].to(dev)
             feats, hdeep = target_pass(x)
-            lg = run(draft, bott, feats, x, anchors, hdeep, False)
+            sa = anchors[1:] + anchors[:1] if shuffle else None
+            lg = run(draft, bott, feats, x, anchors, hdeep, False, sum_anchors=sa)
             pred = lg.argmax(-1)
             for a, s in enumerate(anchors):
                 truth = x[s + 1 : s + 1 + B]
@@ -259,8 +289,12 @@ def main():
                       f"gate {float(torch.tanh(bott.gate.detach())) if getattr(bott, 'gate', None) is not None else (args.scale if bott is not None and args.inject == 'add' else 0.0):.3f}  "
                       f"{time.time()-t0:.0f}s", flush=True)
         r = evaluate(draft, bott)
-        rows_out.append({"condition": "finetune" if d == 0 else "finetune + true summary", "d": d, **r})
+        rows_out.append({"condition": "finetune" if d == 0 else f"finetune + true summary ({args.source})", "d": d, **r})
         print(f"[eval] d={d}: {r}", flush=True)
+        if bott is not None:
+            rs = evaluate(draft, bott, shuffle=True)
+            rows_out.append({"condition": "  same, summary of another anchor (shuffled)", "d": d, **rs})
+            print(f"[eval] d={d} shuffled: {rs}", flush=True)
         del draft, bott, opt
         torch.cuda.empty_cache()
 
