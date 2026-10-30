@@ -89,7 +89,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
     ap.add_argument("--draft", default="z-lab/Qwen3-8B-DFlash-b16")
-    ap.add_argument("--cache", required=True, help="(ids, n_prompt) greedy sequences, e.g. from exp69")
+    ap.add_argument("--cache", required=True, help="(ids, n_prompt) greedy sequences, e.g. from exp69 (evaluation; "
+                                                   "also training unless --data is given)")
+    ap.add_argument("--data", default="", help="directory of gen_traindata.py shards (*.pt, records with ids / "
+                                               "n_prompt): train on these, evaluate on all of --cache")
     ap.add_argument("--ds", nargs="+", type=int, default=[0, 16, 64, 256], help="bottleneck sizes (0 = no summary)")
     ap.add_argument("--chunks", type=int, default=1)
     ap.add_argument("--inject", choices=["add", "kv"], default="add",
@@ -115,8 +118,17 @@ def main():
 
     seqs = torch.load(args.cache)
     random.Random(0).shuffle(seqs)
-    nv = int(len(seqs) * args.val_frac)
-    val, train = seqs[:nv], seqs[nv:]
+    if args.data:
+        # large training set (target-greedy responses to TRAINING prompts, disjoint from the eval sets in --cache)
+        train = []
+        for f in sorted(Path(args.data).glob("*.pt")):
+            train += [(r["ids"].long(), int(r["n_prompt"])) for r in torch.load(f)]
+        train = [(ids, lo) for ids, lo in train if len(ids) - lo > 20]
+        val = seqs[: max(int(len(seqs) * args.val_frac), 1)]   # same held-out eval sequences as the small runs
+        print(f"[data] {len(train)} training sequences from {args.data}, {len(val)} eval sequences", flush=True)
+    else:
+        nv = int(len(seqs) * args.val_frac)
+        val, train = seqs[:nv], seqs[nv:]
     target = load_target(args.target, dev)
     for p_ in target.parameters():
         p_.requires_grad_(False)
