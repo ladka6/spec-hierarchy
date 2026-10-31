@@ -52,6 +52,9 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--optim", default="adamw8bit", choices=["adamw8bit", "adamw"])
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--fp32", action="store_true",
+                    help="fp32 master weights for the drafter under bf16 autocast (plain bf16 rounds small updates "
+                         "away at lr ~1e-5..1e-4); saved back in bf16")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -71,6 +74,8 @@ def main():
     for p in target.parameters():
         p.requires_grad_(False)
     draft = load_draft(args.draft)
+    if args.fp32:
+        draft = draft.float()
     draft.train()
     params = [p for p in draft.parameters() if p.requires_grad]
     print(f"trainable drafter parameters: {sum(p.numel() for p in params) / 1e6:.0f} M", flush=True)
@@ -86,6 +91,10 @@ def main():
     deep = {}
 
     def loss_fn(feats, ids, blocks):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.fp32):
+            return _loss_fn(feats, ids, blocks)
+
+    def _loss_fn(feats, ids, blocks):
         if not args.depth_exit:
             return block_loss(draft, target, feats, ids, blocks, bs, args.gamma)
         if "m" not in deep:
@@ -153,6 +162,8 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     draft.eval()
+    if args.fp32:
+        draft = draft.to(torch.bfloat16)
     draft.save_pretrained(out)
     print(f"saved drafter to {out}")
 
