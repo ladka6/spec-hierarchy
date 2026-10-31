@@ -180,6 +180,10 @@ def main():
     ap.add_argument("--eval-every", type=int, default=2000)
     ap.add_argument("--stats-seqs", type=int, default=64)
     ap.add_argument("--load", default="")
+    ap.add_argument("--stops", type=int, default=0,
+                    help="stop-position eval on this many anchors instead of training: cut at block 1's first error "
+                         "(oracle n), draft block 2 from real / tokens-only / estimated features, compare with a "
+                         "normal second round")
     ap.add_argument("--out", default="")
     ap.add_argument("--save", default="")
     args = ap.parse_args()
@@ -389,6 +393,73 @@ def main():
         if with_tau:
             res["tau"] = {f"{k}|{m}": sum(v) / max(len(v), 1) for (k, m), v in taus.items()}
         return res
+
+    # ------------------------------------------------------------------ stop-position eval (the chained round)
+    def stop_eval():
+        """Block 1 at anchor s (real features) matches n tokens. Assume the n are accepted (oracle cut) and draft
+        block 2 at anchor a = s+n, which needs features for positions s .. a-1 (n of them):
+          real    the verifier's features (ceiling; what a copy gives)
+          tokens  none: the n tokens as plain inputs (lagged block; a lag-trained drafter is the fair version)
+          est     the estimator's features (n <= span)
+        Block 2's first token re-predicts position a+1, where block 1 failed (no bonus token yet).
+        One verification of block 1 + block 2 gives n + m2 + 1 tokens. Normal DFlash needs a second verification:
+        anchor at the bonus a+1 with real features, m_next matched -> ((n+1) + (m_next+1)) / 2 per verification."""
+        vr = random.Random(7)
+        cand = [(i, s) for i, (ids, lo) in enumerate(val) for s in range(lo + 8, len(ids) - 3 * bs)]
+        vr.shuffle(cand)
+        by = {}
+        for i, s in cand[: args.stops]:
+            by.setdefault(i, []).append(s)
+        nmax = min(bs - 2, L) if est is not None else bs - 2
+        recs, n_all, n_dist = [], 0, {}
+        with torch.inference_mode():
+            for i, anchors in by.items():
+                ids, lo = val[i]
+                x = ids.to(dev)
+                f = feats_of(x)
+                for s in anchors:
+                    y1 = blocks_logits(draft, target, f[None, :s], x, [(s, 0)], bs)[0].argmax(-1).tolist()
+                    n = matched(y1, x[s + 1 :].tolist())
+                    n_all += 1
+                    n_dist[n] = n_dist.get(n, 0) + 1
+                    if n < 1 or n > nmax:
+                        continue
+                    a = s + n
+                    truth = x[a + 1 :].tolist()
+                    r = {"n": n}
+                    lg = blocks_logits(draft, target, f[None, :a], x, [(a, 0)], bs)[0]
+                    r["real"] = matched(lg.argmax(-1).tolist(), truth)
+                    lg = blocks_logits(draft, target, f[None, :s], x, [(a, n)], bs)[0]
+                    r["tokens"] = matched(lg.argmax(-1).tolist(), truth)
+                    if est is not None:
+                        y25, y33 = estimate(f, x, [s], n)
+                        fz = f[None, :a].clone()
+                        fz[0, s:a] = raw_part(f, s, y25[0], y33[0], n).to(f.dtype)
+                        lg = blocks_logits(draft, target, fz, x, [(a, 0)], bs)[0]
+                        r["est"] = matched(lg.argmax(-1).tolist(), truth)
+                    lg = blocks_logits(draft, target, f[None, : a + 1], x, [(a + 1, 0)], bs)[0]
+                    r["m_next"] = matched(lg.argmax(-1).tolist(), x[a + 2 :].tolist())
+                    recs.append(r)
+        k = len(recs)
+        normal = sum((r["n"] + 1 + r["m_next"] + 1) / 2 for r in recs) / max(k, 1)
+        rows = []
+        for c in ("real", "tokens", "est"):
+            if not recs or c not in recs[0]:
+                continue
+            rows.append({"block 2 from": c,
+                         "fixes failed position": sum(r[c] >= 1 for r in recs) / k,
+                         "mean m2": sum(r[c] for r in recs) / k,
+                         "tokens / verification (chained)": sum(r["n"] + r[c] + 1 for r in recs) / k,
+                         "normal DFlash (2 verifications)": normal})
+        print(f"[stops] {k} of {n_all} rounds with 1 <= n <= {nmax} (mean n {sum(r['n'] for r in recs) / max(k, 1):.2f}); "
+              f"n distribution {dict(sorted(n_dist.items()))}", flush=True)
+        print_table(rows, list(rows[0]), f"chained round at block 1's first error (oracle cut), drafter {args.draft}")
+        save_json(args.save + "_stops", {"args": vars(args), "rows": rows, "records": recs, "n_dist": n_dist})
+
+    if args.stops:
+        stop_eval()
+        print(f"[done] {time.time() - t0:.0f}s", flush=True)
+        return
 
     hist = []
     if est is not None and args.steps > 0:
