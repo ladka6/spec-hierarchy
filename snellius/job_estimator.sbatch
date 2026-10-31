@@ -27,6 +27,8 @@ F="grep --line-buffered -v -i warn"
 #   E0 (filler check, no training):  sbatch --time=00:40:00 --export=ALL,STEPS=0 snellius/job_estimator.sbatch
 #   run 1 (fused context):           sbatch --export=ALL,CTX=fused snellius/job_estimator.sbatch
 #   run 2 (layer-matched context):   sbatch --export=ALL,CTX=layer snellius/job_estimator.sbatch
+#   v2 (robust loss, normalised context, last real state): 
+#     CTX=layer TAG=_v2 EXTRA="--loss huber --zclip 10 --ctx-norm --prev --kl-weight 3" sbatch --export=ALL snellius/job_estimator.sbatch
 echo "[job] CTX=$CTX SHALLOW=$SHALLOW STEPS=$STEPS EXTRA=${EXTRA:-}"
 python scripts/exp79_estimator.py --cache "$CACHE" --data "$DATA" --ctx "$CTX" --shallow "$SHALLOW" \
-  --steps "$STEPS" --out "$HOME/hspec_ckpt/est_${CTX}_${SHALLOW}.pt" ${EXTRA:-} 2>&1 | $F
+  --steps "$STEPS" --out "$HOME/hspec_ckpt/est_${CTX}_${SHALLOW}${TAG:-}.pt" ${EXTRA:-} 2>&1 | $F

@@ -67,8 +67,9 @@ class Block(nn.Module):
 
 
 class Stage(nn.Module):
-    def __init__(self, ctx_dim, in_dim, out_dim, d, layers, heads, window, span):
+    def __init__(self, ctx_dim, in_dim, out_dim, d, layers, heads, window, span, ctx_norm=False):
         super().__init__()
+        self.ctx_ln = nn.LayerNorm(ctx_dim) if ctx_norm else nn.Identity()
         self.ctx_in, self.tok_in = nn.Linear(ctx_dim, d), nn.Linear(in_dim, d)
         self.pos, self.seg = nn.Embedding(window + span, d), nn.Embedding(2, d)
         self.blocks = nn.ModuleList(Block(d, heads) for _ in range(layers))
@@ -78,7 +79,7 @@ class Stage(nn.Module):
         W, L = ctx.shape[1], tok.shape[1]
         typ = torch.cat([torch.zeros(W, dtype=torch.long, device=ctx.device),
                          torch.ones(L, dtype=torch.long, device=ctx.device)])
-        h = torch.cat([self.ctx_in(ctx), self.tok_in(tok)], 1) + self.pos.weight[: W + L] + self.seg(typ)
+        h = torch.cat([self.ctx_in(self.ctx_ln(ctx)), self.tok_in(tok)], 1) + self.pos.weight[: W + L] + self.seg(typ)
         for b in self.blocks:
             h = b(h, mask)
         hn = self.norm(h[:, W:])
@@ -86,19 +87,27 @@ class Stage(nn.Module):
 
 
 class Estimator(nn.Module):
-    def __init__(self, H, ctx_dim, d=1024, layers=3, heads=16, window=128, span=8):
+    def __init__(self, H, ctx_dim, d=1024, layers=3, heads=16, window=128, span=8, ctx_norm=False, prev=False):
         super().__init__()
-        self.cfg = dict(H=H, ctx_dim=ctx_dim, d=d, layers=layers, heads=heads, window=window, span=span)
-        self.window, self.span = window, span
-        self.a = Stage(ctx_dim, H, H, d, layers, heads, window, span)
-        self.b = Stage(ctx_dim, d + H, H, d, layers, heads, window, span)
+        self.cfg = dict(H=H, ctx_dim=ctx_dim, d=d, layers=layers, heads=heads, window=window, span=span,
+                        ctx_norm=ctx_norm, prev=prev)
+        self.window, self.span, self.prev = window, span, prev
+        extra = ctx_dim if prev else 0          # the last real context state, given to every new position
+        self.a = Stage(ctx_dim, H + extra, H, d, layers, heads, window, span, ctx_norm)
+        self.b = Stage(ctx_dim, d + H + extra, H, d, layers, heads, window, span, ctx_norm)
+        self.prev_ln = nn.LayerNorm(ctx_dim) if prev else None
         self.skip = nn.Parameter(torch.zeros(H))
         for n in ("mu25", "sd25", "mu33", "sd33"):
             self.register_buffer(n, torch.zeros(H) if n.startswith("mu") else torch.ones(H))
 
     def forward(self, ctx_a, ctx_b, e_tok, mask):
-        ha, y25 = self.a(ctx_a, e_tok, mask)
-        _, y33 = self.b(ctx_b, torch.cat([ha, y25], -1), mask)
+        L = e_tok.shape[1]
+        ta, tb = [e_tok], []
+        if self.prev:                           # EAGLE-style: the real state right before the span
+            ta.append(self.prev_ln(ctx_a[:, -1:]).expand(-1, L, -1))
+            tb.append(self.prev_ln(ctx_b[:, -1:]).expand(-1, L, -1))
+        ha, y25 = self.a(ctx_a, torch.cat(ta, -1), mask)
+        _, y33 = self.b(ctx_b, torch.cat([ha, y25] + tb, -1), mask)
         return y25, y33 + self.skip * y25                       # standardised L25 / L33 of the new tokens
 
 
@@ -146,6 +155,10 @@ def main():
     ap.add_argument("--offsets", type=int, default=4, help="re-anchored drafter blocks per anchor in the KL term")
     ap.add_argument("--kl-weight", type=float, default=1.0)
     ap.add_argument("--cos-weight", type=float, default=1.0)
+    ap.add_argument("--loss", choices=["mse", "huber"], default="mse", help="regression loss in standardised space")
+    ap.add_argument("--zclip", type=float, default=0.0, help="clip standardised states (targets and context) to +-z")
+    ap.add_argument("--ctx-norm", action="store_true", help="LayerNorm on the context inputs")
+    ap.add_argument("--prev", action="store_true", help="give every new position the last real context state")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--val-frac", type=float, default=0.2)
@@ -157,7 +170,8 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--save", default="")
     args = ap.parse_args()
-    args.save = args.save or f"exp79_estimator_{args.ctx}_{args.shallow}_s{args.steps}"
+    args.save = args.save or (f"exp79_estimator_{args.ctx}_{args.shallow}_s{args.steps}"
+                              + ("_v2" if args.loss == "huber" or args.prev or args.ctx_norm else ""))
     assert max(args.m) <= args.span
     dev = "cuda"
     t0 = time.time()
@@ -220,7 +234,7 @@ def main():
 
     est = None
     if args.steps > 0 or args.load:
-        est = Estimator(H, H, args.dim, args.layers, args.heads, W, L).to(dev)
+        est = Estimator(H, H, args.dim, args.layers, args.heads, W, L, args.ctx_norm, args.prev).to(dev)
         if args.load:
             d = torch.load(args.load, map_location="cpu")
             est = Estimator(**d["cfg"]).to(dev)
@@ -232,7 +246,8 @@ def main():
               flush=True)
 
     def std(f, t):
-        return (f[:, sl[t]].float() - getattr(est, f"mu{t}")) / getattr(est, f"sd{t}")
+        z = (f[:, sl[t]].float() - getattr(est, f"mu{t}")) / getattr(est, f"sd{t}")
+        return z.clamp(-args.zclip, args.zclip) if args.zclip > 0 else z
 
     def shallow_fill(f, s, n):
         if args.shallow == "zero":
@@ -381,7 +396,10 @@ def main():
                 y25, y33 = estimate(f, x, anc)
                 r25 = torch.stack([std(f, 25)[s : s + L] for s in anc])
                 r33 = torch.stack([std(f, 33)[s : s + L] for s in anc])
-                mse = (y25 - r25).pow(2).mean() + (y33 - r33).pow(2).mean()
+                if args.loss == "huber":
+                    mse = F.smooth_l1_loss(y25, r25) + F.smooth_l1_loss(y33, r33)
+                else:
+                    mse = (y25 - r25).pow(2).mean() + (y33 - r33).pow(2).mean()
                 raw = [raw_part(f, s, y25[a], y33[a], L) for a, s in enumerate(anc)]
                 rr = [f[s : s + L].float() for s in anc]
                 c25 = torch.stack([F.cosine_similarity(e[:, sl[25]], r[:, sl[25]], dim=-1) for e, r in zip(raw, rr)])
@@ -413,7 +431,7 @@ def main():
             step += 1
             if step % 50 == 0 and run["n"]:
                 n = run["n"]
-                print(f"[step {step}/{args.steps}] mse {run['mse'] / n:.4f} cos25 {run['cos25'] / n:.3f} "
+                print(f"[step {step}/{args.steps}] {args.loss} {run['mse'] / n:.4f} cos25 {run['cos25'] / n:.3f} "
                       f"cos33 {run['cos33'] / n:.3f} kl {run['kl'] / n:.4f}  {(time.time() - tl) / step:.2f}s/step",
                       flush=True)
                 run = {k: 0.0 for k in run} | {"n": 0}
