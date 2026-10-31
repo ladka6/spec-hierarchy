@@ -87,13 +87,15 @@ class Stage(nn.Module):
 
 
 class Estimator(nn.Module):
-    def __init__(self, H, ctx_dim, d=1024, layers=3, heads=16, window=128, span=8, ctx_norm=False, prev=False):
+    def __init__(self, H, ctx_dim, d=1024, layers=3, heads=16, window=128, span=8, ctx_norm=False, prev=False,
+                 lookahead=False):
         super().__init__()
         self.cfg = dict(H=H, ctx_dim=ctx_dim, d=d, layers=layers, heads=heads, window=window, span=span,
-                        ctx_norm=ctx_norm, prev=prev)
+                        ctx_norm=ctx_norm, prev=prev, lookahead=lookahead)
         self.window, self.span, self.prev = window, span, prev
         extra = ctx_dim if prev else 0          # the last real context state, given to every new position
-        self.a = Stage(ctx_dim, H + extra, H, d, layers, heads, window, span, ctx_norm)
+        nxt = H if lookahead else 0             # embedding of the next token (the target's output if accepted)
+        self.a = Stage(ctx_dim, H + nxt + extra, H, d, layers, heads, window, span, ctx_norm)
         self.b = Stage(ctx_dim, d + H + extra, H, d, layers, heads, window, span, ctx_norm)
         self.prev_ln = nn.LayerNorm(ctx_dim) if prev else None
         self.skip = nn.Parameter(torch.zeros(H))
@@ -111,12 +113,15 @@ class Estimator(nn.Module):
         return y25, y33 + self.skip * y25                       # standardised L25 / L33 of the new tokens
 
 
-def make_mask(valid, L):
-    """valid [B, W] bool (real context positions) -> [B, 1, S, S] attention mask (True = attend), causal."""
+def make_mask(valid, L, bidir=False):
+    """valid [B, W] bool (real context positions) -> [B, 1, S, S] attention mask (True = attend). Causal; with
+    bidir the new tokens see each other in both directions (all of them are known at inference)."""
     B, W = valid.shape
     S = W + L
     dev = valid.device
     causal = torch.ones(S, S, dtype=torch.bool, device=dev).tril()
+    if bidir:
+        causal[W:, W:] = True
     keys = torch.cat([valid, torch.ones(B, L, dtype=torch.bool, device=dev)], 1)
     m = (causal[None] & keys[:, None, :]) | torch.eye(S, dtype=torch.bool, device=dev)[None]
     return m[:, None]
@@ -162,6 +167,11 @@ def main():
     ap.add_argument("--zclip", type=float, default=0.0, help="clip standardised states (targets and context) to +-z")
     ap.add_argument("--ctx-norm", action="store_true", help="LayerNorm on the context inputs")
     ap.add_argument("--prev", action="store_true", help="give every new position the last real context state")
+    ap.add_argument("--bidir", action="store_true", help="new tokens attend to each other in both directions")
+    ap.add_argument("--lookahead", action="store_true",
+                    help="give position p the embedding of x_{p+1} (the target's greedy output if the prefix is "
+                         "accepted; for the last position it is the next block's anchor)")
+    ap.add_argument("--var-span", action="store_true", help="train on random span lengths 1..span (with --bidir)")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--val-frac", type=float, default=0.2)
@@ -174,7 +184,8 @@ def main():
     ap.add_argument("--save", default="")
     args = ap.parse_args()
     args.save = args.save or (f"exp79_estimator_{args.ctx}_{args.shallow}_s{args.steps}"
-                              + ("_v2" if args.loss == "huber" or args.prev or args.ctx_norm else ""))
+                              + ("_v2" if args.loss == "huber" or args.prev or args.ctx_norm else "")
+                              + ("_bidir" if args.bidir else "") + ("_look" if args.lookahead else ""))
     assert max(args.m) <= args.span
     dev = "cuda"
     t0 = time.time()
@@ -237,7 +248,8 @@ def main():
 
     est = None
     if args.steps > 0 or args.load:
-        est = Estimator(H, H, args.dim, args.layers, args.heads, W, L, args.ctx_norm, args.prev).to(dev)
+        est = Estimator(H, H, args.dim, args.layers, args.heads, W, L, args.ctx_norm, args.prev,
+                        args.lookahead).to(dev)
         if args.load:
             d = torch.load(args.load, map_location="cpu")
             est = Estimator(**d["cfg"]).to(dev)
@@ -259,8 +271,9 @@ def main():
             return sh_mean[None].expand(n, -1)
         return f[s : s + n, shallow_cols].float()
 
-    def estimate(f, x, anchors):
-        """standardised (y25, y33) [A, L, H] for positions s .. s+L-1 of each anchor s."""
+    def estimate(f, x, anchors, n=None):
+        """standardised (y25, y33) [A, n, H] for positions s .. s+n-1 of each anchor s (n = span by default)."""
+        n = n or L
         if args.ctx == "layer":
             sa, sb = std(f, 25), std(f, 33)
         else:
@@ -272,10 +285,13 @@ def main():
             ca.append(a_)
             cb.append(b_)
             vv.append(v)
-        toks = torch.stack([x[s : s + L] for s in anchors])
+        toks = torch.stack([x[s : s + n] for s in anchors])
         e = token_emb(draft, target, toks).float()
+        if est.cfg.get("lookahead"):
+            nx = torch.stack([x[s + 1 : s + n + 1] for s in anchors])
+            e = torch.cat([e, token_emb(draft, target, nx).float()], -1)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            y25, y33 = est(torch.stack(ca), torch.stack(cb), e, make_mask(torch.stack(vv), L))
+            y25, y33 = est(torch.stack(ca), torch.stack(cb), e, make_mask(torch.stack(vv), n, args.bidir))
         return y25.float(), y33.float()
 
     def raw_part(f, s, y25, y33, n, real_shallow=False):
@@ -351,7 +367,7 @@ def main():
                             elif kind == "mean":
                                 fz[0, s - m : s] = mean_feat[None].to(f.dtype)
                             else:
-                                y25, y33 = estimate(f, x, [s - m])
+                                y25, y33 = estimate(f, x, [s - m], m)
                                 fz[0, s - m : s] = raw_part(f, s - m, y25[0], y33[0], m,
                                                             real_shallow=kind == "est_realshallow").to(f.dtype)
                             blocks = [(s, 0)]
@@ -405,16 +421,17 @@ def main():
                 else:
                     anc = rng.sample(range(lo + 1, hi), min(args.anchors_train, hi - lo - 1))
                 kl_idx = sorted(rng.sample(range(len(anc)), min(args.anchors_train, len(anc))))
-                y25, y33 = estimate(f, x, anc)
-                r25 = torch.stack([std(f, 25)[s : s + L] for s in anc])
-                r33 = torch.stack([std(f, 33)[s : s + L] for s in anc])
+                Lb = rng.randint(1, L) if args.var_span else L
+                y25, y33 = estimate(f, x, anc, Lb)
+                r25 = torch.stack([std(f, 25)[s : s + Lb] for s in anc])
+                r33 = torch.stack([std(f, 33)[s : s + Lb] for s in anc])
                 if args.loss == "huber":
                     mse = F.smooth_l1_loss(y25, r25) + F.smooth_l1_loss(y33, r33)
                 else:
                     mse = (y25 - r25).pow(2).mean() + (y33 - r33).pow(2).mean()
-                raw = {a: raw_part(f, anc[a], y25[a], y33[a], L) for a in kl_idx}
+                raw = {a: raw_part(f, anc[a], y25[a], y33[a], Lb) for a in kl_idx}
                 c_idx = kl_idx
-                rr = {a: f[anc[a] : anc[a] + L].float() for a in c_idx}
+                rr = {a: f[anc[a] : anc[a] + Lb].float() for a in c_idx}
                 c25 = torch.stack([F.cosine_similarity(raw[a][:, sl[25]], rr[a][:, sl[25]], dim=-1) for a in c_idx])
                 c33 = torch.stack([F.cosine_similarity(raw[a][:, sl[33]], rr[a][:, sl[33]], dim=-1) for a in c_idx])
                 loss = mse + args.cos_weight * ((1 - c25).mean() + (1 - c33).mean())
@@ -422,13 +439,13 @@ def main():
                 if args.kl_weight > 0:
                     for a in kl_idx:
                         s = anc[a]
-                        offs = sorted(rng.sample(range(1, L + 1), min(args.offsets, L)))
+                        offs = sorted(rng.sample(range(1, Lb + 1), min(args.offsets, Lb)))
                         blocks = [(s + j, 0) for j in offs]
                         mix = torch.cat([f[:s], raw[a].to(f.dtype)], 0)[None]
                         with torch.autocast("cuda", dtype=torch.bfloat16):
                             lg = blocks_logits(draft, target, mix, x, blocks, bs).float()
                         with torch.no_grad():
-                            ref = blocks_logits(draft, target, f[None, : s + L], x, blocks, bs).float()
+                            ref = blocks_logits(draft, target, f[None, : s + Lb], x, blocks, bs).float()
                         kl = F.kl_div(torch.log_softmax(lg, -1), torch.log_softmax(ref, -1), log_target=True,
                                       reduction="none").sum(-1).mean()
                         kl_tot = kl_tot + kl / len(kl_idx)
