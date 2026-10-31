@@ -152,6 +152,9 @@ def main():
     ap.add_argument("--steps", type=int, default=8000, help="0 = no training (filler check / --load eval)")
     ap.add_argument("--batch", type=int, default=4, help="sequences per step")
     ap.add_argument("--anchors-train", type=int, default=4, help="anchors per sequence per step")
+    ap.add_argument("--dense", type=int, default=0,
+                    help="regression loss on anchors tiling the response (stride = span), at most this many per "
+                         "sequence; the KL term stays on --anchors-train of them. 0 = off (regression on the KL anchors)")
     ap.add_argument("--offsets", type=int, default=4, help="re-anchored drafter blocks per anchor in the KL term")
     ap.add_argument("--kl-weight", type=float, default=1.0)
     ap.add_argument("--cos-weight", type=float, default=1.0)
@@ -392,7 +395,16 @@ def main():
                 hi = T - L - bs - 1
                 if hi <= lo + 1:
                     continue
-                anc = rng.sample(range(lo + 1, hi), min(args.anchors_train, hi - lo - 1))
+                if args.dense:
+                    start = lo + 1 + rng.randrange(L)
+                    anc = list(range(start, hi, L))
+                    if len(anc) > args.dense:
+                        anc = sorted(rng.sample(anc, args.dense))
+                    if not anc:
+                        continue
+                else:
+                    anc = rng.sample(range(lo + 1, hi), min(args.anchors_train, hi - lo - 1))
+                kl_idx = sorted(rng.sample(range(len(anc)), min(args.anchors_train, len(anc))))
                 y25, y33 = estimate(f, x, anc)
                 r25 = torch.stack([std(f, 25)[s : s + L] for s in anc])
                 r33 = torch.stack([std(f, 33)[s : s + L] for s in anc])
@@ -400,14 +412,16 @@ def main():
                     mse = F.smooth_l1_loss(y25, r25) + F.smooth_l1_loss(y33, r33)
                 else:
                     mse = (y25 - r25).pow(2).mean() + (y33 - r33).pow(2).mean()
-                raw = [raw_part(f, s, y25[a], y33[a], L) for a, s in enumerate(anc)]
-                rr = [f[s : s + L].float() for s in anc]
-                c25 = torch.stack([F.cosine_similarity(e[:, sl[25]], r[:, sl[25]], dim=-1) for e, r in zip(raw, rr)])
-                c33 = torch.stack([F.cosine_similarity(e[:, sl[33]], r[:, sl[33]], dim=-1) for e, r in zip(raw, rr)])
+                raw = {a: raw_part(f, anc[a], y25[a], y33[a], L) for a in kl_idx}
+                c_idx = kl_idx
+                rr = {a: f[anc[a] : anc[a] + L].float() for a in c_idx}
+                c25 = torch.stack([F.cosine_similarity(raw[a][:, sl[25]], rr[a][:, sl[25]], dim=-1) for a in c_idx])
+                c33 = torch.stack([F.cosine_similarity(raw[a][:, sl[33]], rr[a][:, sl[33]], dim=-1) for a in c_idx])
                 loss = mse + args.cos_weight * ((1 - c25).mean() + (1 - c33).mean())
                 kl_tot = 0.0
                 if args.kl_weight > 0:
-                    for a, s in enumerate(anc):
+                    for a in kl_idx:
+                        s = anc[a]
                         offs = sorted(rng.sample(range(1, L + 1), min(args.offsets, L)))
                         blocks = [(s + j, 0) for j in offs]
                         mix = torch.cat([f[:s], raw[a].to(f.dtype)], 0)[None]
@@ -417,7 +431,7 @@ def main():
                             ref = blocks_logits(draft, target, f[None, : s + L], x, blocks, bs).float()
                         kl = F.kl_div(torch.log_softmax(lg, -1), torch.log_softmax(ref, -1), log_target=True,
                                       reduction="none").sum(-1).mean()
-                        kl_tot = kl_tot + kl / len(anc)
+                        kl_tot = kl_tot + kl / len(kl_idx)
                     loss = loss + args.kl_weight * kl_tot
                 (loss / args.batch).backward()
                 run["mse"] += float(mse.detach())
