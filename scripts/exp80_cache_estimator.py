@@ -81,6 +81,9 @@ class CacheEstimator(nn.Module):
         self.norm = nn.LayerNorm(d)
         self.out25, self.out33 = nn.Linear(d, H), nn.Linear(d, H)
         self.skip = nn.Parameter(torch.zeros(H))
+        for lin in (self.out25, self.out33):                 # start at the dataset mean (standardised 0)
+            nn.init.zeros_(lin.weight)
+            nn.init.zeros_(lin.bias)
         self.register_buffer("mu", torch.zeros(ntaps, H))
         self.register_buffer("sd", torch.ones(ntaps, H))
 
