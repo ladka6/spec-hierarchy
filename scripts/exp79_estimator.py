@@ -214,6 +214,7 @@ def main():
         stats[f"mu{t}"] = mu.float()
         stats[f"sd{t}"] = (acc[f"q{t}"] / n_pos - mu * mu).clamp_min(1e-8).sqrt().float().clamp_min(1e-4)
     sh_mean = (acc["sh"] / n_pos).float()
+    mean_feat = torch.cat([sh_mean, stats["mu25"], stats["mu33"]])          # all taps at their dataset mean
     print(f"[stats] {n_pos} positions; sd L25 median {stats['sd25'].median():.3f} max {stats['sd25'].max():.1f}; "
           f"sd L33 median {stats['sd33'].median():.3f} max {stats['sd33'].max():.1f}", flush=True)
 
@@ -272,7 +273,7 @@ def main():
             est.eval()
         vr = random.Random(123)
         vs = val if n_seqs is None else val[:n_seqs]
-        cos = {k: torch.zeros(L, device=dev) for k in ("L25", "L33", "c")}
+        cos = {k: torch.zeros(L, device=dev) for k in ("L25", "L33", "zL25", "zL33", "c")}
         cnt = torch.zeros(L, device=dev)
         agree, n_ag = 0.0, 0
         cand = [(i, s) for i, (ids, lo) in enumerate(vs) for s in range(lo + L + 8, len(ids) - bs - 1)]
@@ -280,7 +281,7 @@ def main():
         tau_by = {}
         for i, s in cand[: args.anchors]:
             tau_by.setdefault(i, []).append(s)
-        conds = [("real", 0)] + [(k, m) for m in args.m for k in ("removed", "fill")]
+        conds = [("real", 0)] + [(k, m) for m in args.m for k in ("removed", "mean", "fill")]
         if est is not None:
             conds += [(k, m) for m in args.m for k in ("est", "est_realshallow")]
         taus = {c: [] for c in conds}
@@ -300,6 +301,8 @@ def main():
                         e5 = raw_part(f, s, y25[a], y33[a], L, real_shallow=True)
                         cos["L25"] += F.cosine_similarity(e5[:, sl[25]], r[:, sl[25]], dim=-1)
                         cos["L33"] += F.cosine_similarity(e5[:, sl[33]], r[:, sl[33]], dim=-1)
+                        cos["zL25"] += F.cosine_similarity(y25[a], std(f, 25)[s : s + L], dim=-1)
+                        cos["zL33"] += F.cosine_similarity(y33[a], std(f, 33)[s : s + L], dim=-1)
                         e5f = raw_part(f, s, y25[a], y33[a], L)
                         cf = draft.hidden_norm(draft.fc(e5f.to(f.dtype)[None]))[0].float()
                         cos["c"] += F.cosine_similarity(cf, fz_all[s : s + L], dim=-1)
@@ -327,6 +330,8 @@ def main():
                             fz = f[None, :s].clone()
                             if kind == "fill":
                                 fz[0, s - m : s, shallow_cols] = shallow_fill(f, s - m, m).to(f.dtype)
+                            elif kind == "mean":
+                                fz[0, s - m : s] = mean_feat[None].to(f.dtype)
                             else:
                                 y25, y33 = estimate(f, x, [s - m])
                                 fz[0, s - m : s] = raw_part(f, s - m, y25[0], y33[0], m,
@@ -343,6 +348,8 @@ def main():
             res["agree"] = agree / max(n_ag, 1)
             print(f"[{tag}] cos by offset  L25: {' '.join(f'{v:.3f}' for v in res['cos_L25'])}", flush=True)
             print(f"[{tag}] cos by offset  L33: {' '.join(f'{v:.3f}' for v in res['cos_L33'])}", flush=True)
+            print(f"[{tag}] standardised  zL25: {' '.join(f'{v:.3f}' for v in res['cos_zL25'])}", flush=True)
+            print(f"[{tag}] standardised  zL33: {' '.join(f'{v:.3f}' for v in res['cos_zL33'])}", flush=True)
             print(f"[{tag}] cos by offset    c: {' '.join(f'{v:.3f}' for v in res['cos_c'])}  "
                   f"drafter top-1 agreement {res['agree']:.3f}", flush=True)
         if with_tau:
@@ -395,7 +402,7 @@ def main():
                         kl_tot = kl_tot + kl / len(anc)
                     loss = loss + args.kl_weight * kl_tot
                 (loss / args.batch).backward()
-                run["mse"] += float(mse)
+                run["mse"] += float(mse.detach())
                 run["cos25"] += float(c25.mean())
                 run["cos33"] += float(c33.mean())
                 run["kl"] += float(kl_tot)
@@ -421,7 +428,7 @@ def main():
     ref = {"real": res["tau"]["real|0"]}
     rows = []
     for m in args.m:
-        row = {"m": m, "real": ref["real"], "removed": res["tau"][f"removed|{m}"],
+        row = {"m": m, "real": ref["real"], "removed": res["tau"][f"removed|{m}"], "mean feats": res["tau"][f"mean|{m}"],
                f"fill ({args.shallow}, real deep)": res["tau"][f"fill|{m}"]}
         if est is not None:
             row["est"] = res["tau"][f"est|{m}"]

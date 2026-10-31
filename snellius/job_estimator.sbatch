@@ -24,8 +24,9 @@ SHALLOW=${SHALLOW:-mean}
 STEPS=${STEPS:-8000}
 F="grep --line-buffered -v -i warn"
 # exp79: learned target-state estimator (L25 / L33 of drafted tokens), DFlash frozen.
-#   E0 (filler check, no training, ~20 min):  STEPS=0 sbatch --time=00:40:00 snellius/job_estimator.sbatch
-#   run 1 (fused context):                     CTX=fused sbatch snellius/job_estimator.sbatch
-#   run 2 (layer-matched context):             CTX=layer sbatch snellius/job_estimator.sbatch
+#   E0 (filler check, no training):  sbatch --time=00:40:00 --export=ALL,STEPS=0 snellius/job_estimator.sbatch
+#   run 1 (fused context):           sbatch --export=ALL,CTX=fused snellius/job_estimator.sbatch
+#   run 2 (layer-matched context):   sbatch --export=ALL,CTX=layer snellius/job_estimator.sbatch
+echo "[job] CTX=$CTX SHALLOW=$SHALLOW STEPS=$STEPS EXTRA=${EXTRA:-}"
 python scripts/exp79_estimator.py --cache "$CACHE" --data "$DATA" --ctx "$CTX" --shallow "$SHALLOW" \
   --steps "$STEPS" --out "$HOME/hspec_ckpt/est_${CTX}_${SHALLOW}.pt" ${EXTRA:-} 2>&1 | $F
