@@ -402,15 +402,15 @@ def main():
           tokens  none: the n tokens as plain inputs (lagged block; a lag-trained drafter is the fair version)
           est     the estimator's features (n <= span)
         Block 2's first token re-predicts position a+1, where block 1 failed (no bonus token yet).
-        One verification of block 1 + block 2 gives n + m2 + 1 tokens. Normal DFlash needs a second verification:
-        anchor at the bonus a+1 with real features, m_next matched -> ((n+1) + (m_next+1)) / 2 per verification."""
+        All rounds count (n = 0: nothing to chain, m2 = 0; n = 15: block 1 fully accepted, block 2 continues).
+        Normal DFlash covers one block per verification: E[n + 1]. Chained: E[n + m2 + 1] per verification.
+        est needs n <= span; on that subset real and tokens are reported too."""
         vr = random.Random(7)
         cand = [(i, s) for i, (ids, lo) in enumerate(val) for s in range(lo + 8, len(ids) - 3 * bs)]
         vr.shuffle(cand)
         by = {}
         for i, s in cand[: args.stops]:
             by.setdefault(i, []).append(s)
-        nmax = min(bs - 2, L) if est is not None else bs - 2
         recs, n_all, n_dist = [], 0, {}
         with torch.inference_mode():
             for i, anchors in by.items():
@@ -422,39 +422,45 @@ def main():
                     n = matched(y1, x[s + 1 :].tolist())
                     n_all += 1
                     n_dist[n] = n_dist.get(n, 0) + 1
-                    if n < 1 or n > nmax:
-                        continue
                     a = s + n
                     truth = x[a + 1 :].tolist()
                     r = {"n": n}
+                    if n == 0:
+                        r.update(real=0, tokens=0, est=0)
+                        recs.append(r)
+                        continue
                     lg = blocks_logits(draft, target, f[None, :a], x, [(a, 0)], bs)[0]
                     r["real"] = matched(lg.argmax(-1).tolist(), truth)
                     lg = blocks_logits(draft, target, f[None, :s], x, [(a, n)], bs)[0]
                     r["tokens"] = matched(lg.argmax(-1).tolist(), truth)
-                    if est is not None:
+                    if est is not None and n <= L:
                         y25, y33 = estimate(f, x, [s], n)
                         fz = f[None, :a].clone()
                         fz[0, s:a] = raw_part(f, s, y25[0], y33[0], n).to(f.dtype)
                         lg = blocks_logits(draft, target, fz, x, [(a, 0)], bs)[0]
                         r["est"] = matched(lg.argmax(-1).tolist(), truth)
-                    lg = blocks_logits(draft, target, f[None, : a + 1], x, [(a + 1, 0)], bs)[0]
-                    r["m_next"] = matched(lg.argmax(-1).tolist(), x[a + 2 :].tolist())
                     recs.append(r)
-        k = len(recs)
-        normal = sum((r["n"] + 1 + r["m_next"] + 1) / 2 for r in recs) / max(k, 1)
-        rows = []
-        for c in ("real", "tokens", "est"):
-            if not recs or c not in recs[0]:
-                continue
-            rows.append({"block 2 from": c,
-                         "fixes failed position": sum(r[c] >= 1 for r in recs) / k,
-                         "mean m2": sum(r[c] for r in recs) / k,
-                         "tokens / verification (chained)": sum(r["n"] + r[c] + 1 for r in recs) / k,
-                         "normal DFlash (2 verifications)": normal})
-        print(f"[stops] {k} of {n_all} rounds with 1 <= n <= {nmax} (mean n {sum(r['n'] for r in recs) / max(k, 1):.2f}); "
-              f"n distribution {dict(sorted(n_dist.items()))}", flush=True)
-        print_table(rows, list(rows[0]), f"chained round at block 1's first error (oracle cut), drafter {args.draft}")
-        save_json(args.save + "_stops", {"args": vars(args), "rows": rows, "records": recs, "n_dist": n_dist})
+
+        def table(sub, conds, title):
+            k = len(sub)
+            normal = sum(r["n"] + 1 for r in sub) / max(k, 1)
+            rows = [{"block 2 from": "none (normal DFlash, one block per verification)", "block 2 first token right": "-",
+                     "mean m2": 0.0, "tokens / verification": normal, "vs normal": 1.0}]
+            for c in conds:
+                t = sum(r["n"] + r[c] + 1 for r in sub) / max(k, 1)
+                rows.append({"block 2 from": c, "block 2 first token right": sum(r[c] >= 1 for r in sub) / max(k, 1),
+                             "mean m2": sum(r[c] for r in sub) / max(k, 1), "tokens / verification": t,
+                             "vs normal": t / normal})
+            print_table(rows, list(rows[0]), f"{title}: {k} rounds, mean n {sum(r['n'] for r in sub) / max(k, 1):.2f}")
+            return rows
+
+        print(f"[stops] {n_all} rounds; n distribution {dict(sorted(n_dist.items()))}", flush=True)
+        out = {"all": table(recs, ["real", "tokens"], f"chained round, all rounds (oracle cut), drafter {args.draft}")}
+        if est is not None:
+            sub = [r for r in recs if r["n"] <= L]
+            out["est_subset"] = table(sub, ["real", "tokens", "est"], f"rounds with n <= {L} (estimator span)")
+        tag = Path(args.draft).name
+        save_json(args.save + f"_stops_{tag}", {"args": vars(args), "tables": out, "records": recs, "n_dist": n_dist})
 
     if args.stops:
         stop_eval()
