@@ -35,11 +35,18 @@ from exp27_refresh import blocks_logits, matched  # noqa: E402
 from hspec.models import load_draft, load_target  # noqa: E402
 from hspec.utils import print_table, save_json  # noqa: E402
 
-VARIANTS = {"uni": [1], "bi": [2], "tri": [3], "backoff": [3, 2, 1], "mean": []}
+# (k, fwd): match the last k tokens; fwd also requires the NEXT token to match (x_{t+1} = x_{p+1}). For in-flight
+# positions the next token is a drafted token of block 1 (the last one's is block 2's anchor): no target run needed.
+VARIANTS = {"uni": [(1, False)], "bi": [(2, False)], "tri": [(3, False)],
+            "backoff": [(3, False), (2, False), (1, False)],
+            "uni+next": [(1, True)], "bi+next": [(2, True)], "tri+next": [(3, True)],
+            "backoff+next": [(3, True), (2, True), (1, True), (3, False), (2, False), (1, False)],
+            "mean": []}
 
 
-def find_match(xl, occ, p, s, k):
-    """latest t < s with xl[t-k+1 .. t] == xl[p-k+1 .. p] (xl: list of ints, occ: token -> positions ascending)"""
+def find_match(xl, occ, p, s, k, fwd=False):
+    """latest t < s with xl[t-k+1 .. t] == xl[p-k+1 .. p] (and xl[t+1] == xl[p+1] if fwd)
+    (xl: list of ints, occ: token -> positions ascending)"""
     if p - k + 1 < 0:
         return None
     for t in reversed(occ.get(xl[p], ())):
@@ -47,6 +54,8 @@ def find_match(xl, occ, p, s, k):
             continue
         if t - k + 1 < 0:
             return None
+        if fwd and xl[t + 1] != xl[p + 1]:
+            continue
         if all(xl[t - j] == xl[p - j] for j in range(1, k)):
             return t
     return None
@@ -122,8 +131,8 @@ def main():
                     est = mean[None].expand(n, -1).clone()
                     hit = torch.zeros(n, dtype=torch.bool, device=dev)
                     for j, p in enumerate(range(s, a)):
-                        for k in ks:
-                            t = find_match(xl, occ, p, s, k)
+                        for k, fwd in ks:
+                            t = find_match(xl, occ, p, s, k, fwd)
                             if t is not None:
                                 est[j] = f[t].float()
                                 hit[j] = True
