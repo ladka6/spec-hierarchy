@@ -102,7 +102,7 @@ def main():
             mix = torch.cat([f[:s], inflight.to(f.dtype)], 0)[None]
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 lg = blocks_logits(draft, target, mix, x, [(a, 0)], bs)[0].float()
-            loss = F.cross_entropy(lg, x[a + 1 : a + bs])
+            loss = F.cross_entropy(lg, x[a + 1 : a + bs].long())
             loss.backward()
             g = inflight.grad.double().view(n, K, H)
             for t, ti in deep.items():
