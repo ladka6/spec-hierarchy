@@ -107,6 +107,10 @@ def main():
     ap.add_argument("--anchors-train", type=int, default=24)
     ap.add_argument("--kl-anchors", type=int, default=4)
     ap.add_argument("--kl-weight", type=float, default=0.3)
+    ap.add_argument("--ce-weight", type=float, default=0.0,
+                    help="cross-entropy of DFlash's block 2 (estimated features) on the true continuation, position "
+                         "weights gamma^(k-1) (KV Prediction's base-model loss)")
+    ap.add_argument("--gamma", type=float, default=0.9)
     ap.add_argument("--zclip", type=float, default=10.0)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--max-len", type=int, default=1024)
@@ -312,13 +316,14 @@ def main():
 
     hist = []
     if args.steps > 0:
-        hist.append({"step": 0, "rows": stop_eval(args.eval_stops, "step 0 (5 real layers, others skipped)")})
+        hist.append({"step": 0, "rows": stop_eval(args.eval_stops, "step 0 (loaded checkpoint)" if args.load else "step 0 (5 real layers, others skipped)")})
         opt = torch.optim.AdamW(est.parameters(), lr=args.lr, weight_decay=0.0)
         sched = torch.optim.lr_scheduler.LambdaLR(
             opt, lambda s: min(1.0, (s + 1) / 200) * (0.1 + 0.45 * (1 + math.cos(math.pi * min(s, args.steps)
                                                                                    / args.steps))))
         it, step, tl = 0, 0, time.time()
-        run = {"reg": 0.0, "kl": 0.0, "z25": 0.0, "z33": 0.0, "n": 0}
+        run = {"reg": 0.0, "kl": 0.0, "ce": 0.0, "z25": 0.0, "z33": 0.0, "n": 0}
+        gw = torch.tensor([args.gamma ** k_ for k_ in range(bs - 1)], device=dev)
         while step < args.steps:
             opt.zero_grad(set_to_none=True)
             for _ in range(args.batch):
@@ -343,7 +348,8 @@ def main():
                 y25, y33 = zs(h25, i25), zs(h33, i33)
                 reg = F.smooth_l1_loss(y25, r25) + F.smooth_l1_loss(y33, r33)
                 kl_tot = torch.zeros((), device=dev)
-                if args.kl_weight > 0:
+                ce_tot = torch.zeros((), device=dev)
+                if args.kl_weight > 0 or args.ce_weight > 0:
                     kl_idx = rng.sample(range(len(anc)), min(args.kl_anchors, len(anc)))
                     for a_i in kl_idx:
                         s = anc[a_i]
@@ -351,14 +357,21 @@ def main():
                         mix = torch.cat([f[:s], raw_part(h25[a_i], h33[a_i]).to(f.dtype)], 0)[None]
                         with torch.autocast("cuda", dtype=torch.bfloat16):
                             lg = blocks_logits(draft, target, mix, x, [(a, 0)], bs).float()
-                        with torch.no_grad():
-                            ref = blocks_logits(draft, target, f[None, :a], x, [(a, 0)], bs).float()
-                        kl_tot = kl_tot + F.kl_div(torch.log_softmax(lg, -1), torch.log_softmax(ref, -1),
-                                                   log_target=True, reduction="none").sum(-1).mean() / len(kl_idx)
-                loss = reg + args.kl_weight * kl_tot
+                        if args.kl_weight > 0:
+                            with torch.no_grad():
+                                ref = blocks_logits(draft, target, f[None, :a], x, [(a, 0)], bs).float()
+                            kl_tot = kl_tot + F.kl_div(torch.log_softmax(lg, -1), torch.log_softmax(ref, -1),
+                                                       log_target=True, reduction="none").sum(-1).mean() / len(kl_idx)
+                        if args.ce_weight > 0:
+                            truth = x[a + 1 : a + bs].long()
+                            ce = F.cross_entropy(lg[0, : len(truth)], truth, reduction="none")
+                            w = gw[: len(truth)]
+                            ce_tot = ce_tot + (ce * w).sum() / w.sum() / len(kl_idx)
+                loss = reg + args.kl_weight * kl_tot + args.ce_weight * ce_tot
                 (loss / args.batch).backward()
                 run["reg"] += float(reg.detach())
                 run["kl"] += float(kl_tot.detach())
+                run["ce"] += float(ce_tot.detach())
                 run["z25"] += float(F.cosine_similarity(y25.detach(), r25, dim=-1).mean())
                 run["z33"] += float(F.cosine_similarity(y33.detach(), r33, dim=-1).mean())
                 run["n"] += 1
@@ -369,7 +382,7 @@ def main():
             step += 1
             if step % 50 == 0 and run["n"]:
                 m = run["n"]
-                print(f"[step {step}/{args.steps}] huber {run['reg'] / m:.4f} kl {run['kl'] / m:.4f} "
+                print(f"[step {step}/{args.steps}] huber {run['reg'] / m:.4f} kl {run['kl'] / m:.4f} ce {run['ce'] / m:.4f} "
                       f"zcos25 {run['z25'] / m:.3f} zcos33 {run['z33'] / m:.3f}  {(time.time() - tl) / step:.2f}s/step",
                       flush=True)
                 run = {k_: 0.0 for k_ in run}
