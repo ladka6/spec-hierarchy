@@ -39,5 +39,5 @@ for V in ${VARIANTS:-both role lm}; do
   esac
   echo "[job] variant $V: $A"
   python scripts/exp55_copytrain.py --phase train --base ${BASE:-rtn2}:Qwen/Qwen3-8B --teacher $W/teacher.pt $A \
-    --out $W/copy_$V 2>&1 | $F
+    --out $W/copy_${V}${TAG:+_$TAG} 2>&1 | $F
 done
