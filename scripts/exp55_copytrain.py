@@ -63,6 +63,8 @@ def main():
     ap.add_argument("--target", default="Qwen/Qwen3-8B")
     ap.add_argument("--draft", default="z-lab/Qwen3-8B-DFlash-b16")
     ap.add_argument("--root", default="", help="gen_domaindata.py output (teacher phase)")
+    ap.add_argument("--shards", default="", help="alternative teacher data: a directory of shard*.pt records "
+                    "({'ids', 'n_prompt'}, e.g. the lag training set); the first --n-val sequences become validation")
     ap.add_argument("--domains", nargs="+", default=["math", "code", "chat", "think"])
     ap.add_argument("--n-train", type=int, default=2400)
     ap.add_argument("--n-val", type=int, default=120)
@@ -74,7 +76,9 @@ def main():
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--alpha", type=float, default=32.0)
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--w-agree", type=float, default=0.5)
+    ap.add_argument("--w-agree", type=float, default=0.5, help="weight of the copy's next-token loss (LM objective)")
+    ap.add_argument("--w-draft", type=float, default=1.0, help="weight of the drafter loss (role objective); "
+                    "0 = copy trained as a language model only")
     ap.add_argument("--gamma", type=float, default=0.9)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--eval-every", type=int, default=500)
@@ -89,9 +93,16 @@ def main():
         target = load_target(args.target, dev)
         rng = random.Random(0)
         out = {}
+        if args.shards:
+            pool = []
+            for f in sorted(Path(args.shards).expanduser().glob("shard*.pt")):
+                pool += [d for d in torch.load(f) if len(d["ids"]) <= args.max_len]
+            random.Random(0).shuffle(pool)
+            splits = {"val": pool[: args.n_val], "train": pool[args.n_val : args.n_val + args.n_train]}
         for split, n in (("train", args.n_train), ("val", args.n_val)):
             recs = []
-            for d in load_seqs(args.root, args.domains, split, args.max_len, n, 0):
+            src = splits[split] if args.shards else load_seqs(args.root, args.domains, split, args.max_len, n, 0)
+            for d in src:
                 ids = d["ids"].long().to(dev)
                 lo, hi = max(d["n_prompt"], 1), len(ids) - bs
                 if hi <= lo:
@@ -171,7 +182,7 @@ def main():
         for j in order:
             step += 1
             l_d, l_a, _ = run(train[j], True)
-            loss = l_d + args.w_agree * l_a
+            loss = args.w_draft * l_d + args.w_agree * l_a
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
