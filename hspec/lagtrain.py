@@ -25,11 +25,15 @@ import torch.nn.functional as F
 from dflash.model import _draft_value, _output_head, _raw_input_embeddings
 
 
-def block_inputs(draft, ids: torch.Tensor, s: int, g: int, bs: int):
-    """Token ids and positions of one lagged block (ids: 1-D sequence)."""
+def block_inputs(draft, ids: torch.Tensor, s: int, g: int, bs: int, reveal=()):
+    """Token ids and positions of one lagged block (ids: 1-D sequence). reveal: block offsets k (1..bs-1) whose true
+    token is given instead of MASK (infill training: the drafter sees a later token of its own block)."""
     ctx_end = s - g
     toks = torch.full((g + bs,), draft.mask_token_id, dtype=torch.long, device=ids.device)
     toks[: g + 1] = ids[ctx_end : s + 1]
+    for k in reveal:
+        if s + k < ids.shape[0]:
+            toks[g + k] = ids[s + k]
     pos = torch.arange(ctx_end, s + bs, device=ids.device)
     return toks, pos, ctx_end
 
@@ -42,8 +46,9 @@ def pack(draft, head_src, feats: torch.Tensor, ids: torch.Tensor, blocks, bs: in
     T = feats.shape[1]
     toks, poss, spans, starts = [], [], [], []
     q = 0
-    for s, g in blocks:
-        t, p, ctx_end = block_inputs(draft, ids, s, g, bs)
+    for blk in blocks:
+        s, g = blk[0], blk[1]
+        t, p, ctx_end = block_inputs(draft, ids, s, g, bs, blk[2] if len(blk) > 2 else ())
         toks.append(t)
         poss.append(p)
         spans.append((q, q + len(t), ctx_end))
@@ -90,10 +95,13 @@ def block_loss(draft, head_src, feats, ids, blocks, bs, gamma=0.9):
     hidden = draft(target_hidden=feats, noise_embedding=noise, position_ids=pos, attention_mask=mask,
                    past_key_values=None, use_cache=False)[0]
     rows, labels, weights, first = [], [], [], []
-    for (s, _g), st in zip(blocks, starts):
+    for blk, st in zip(blocks, starts):
+        s, rev = blk[0], (blk[2] if len(blk) > 2 else ())
         for k in range(1, bs):
             if s + k >= T:
                 break
+            if k in rev:
+                continue
             rows.append(st + k - 1)
             labels.append(int(ids[s + k]))
             weights.append(gamma ** (k - 1))
@@ -187,10 +195,13 @@ def block_loss_depth(draft, head_src, feats, ids, blocks, bs, deep, gamma=0.9):
 
 def _weighted_ce(draft, head_src, hidden, ids, blocks, starts, bs, T, gamma):
     rows, labels, weights, first = [], [], [], []
-    for (s, _g), st in zip(blocks, starts):
+    for blk, st in zip(blocks, starts):
+        s, rev = blk[0], (blk[2] if len(blk) > 2 else ())
         for k in range(1, bs):
             if s + k >= T:
                 break
+            if k in rev:
+                continue
             rows.append(st + k - 1)
             labels.append(int(ids[s + k]))
             weights.append(gamma ** (k - 1))

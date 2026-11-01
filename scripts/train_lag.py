@@ -39,6 +39,10 @@ def main():
                     help="depth lag instead of token lag: lagged positions keep the features of target "
                          "layers below this exit layer, deeper ones are missing (0 = token lag)")
     ap.add_argument("--p-zero", type=float, default=0.25)
+    ap.add_argument("--reveal", type=float, default=0.0,
+                    help="infill training: probability that a block gets 1..--reveal-max true tokens at random later "
+                         "offsets (2..bs-1) instead of MASK; those positions are not in the loss")
+    ap.add_argument("--reveal-max", type=int, default=3)
     ap.add_argument("--blocks", type=int, default=24, help="blocks sampled per sequence")
     ap.add_argument("--batch", type=int, default=4, help="sequences per optimizer step")
     ap.add_argument("--epochs", type=float, default=2.0)
@@ -125,8 +129,23 @@ def main():
                     losses.append(float(l))
                     accs.append(float(a))
                 res[lag] = (sum(losses) / len(losses), sum(accs) / len(accs))
+        if args.reveal:
+            with torch.no_grad():
+                for m in (4, 8, 12):
+                    losses, accs = [], []
+                    for d in val:
+                        ids = d["ids"].long().to(args.device)
+                        blocks = [(s, 0, (m,)) for s, _ in
+                                  sample_blocks(d["n_prompt"], len(ids), 8, bs, 0, 1.0, vrng)]
+                        if not blocks:
+                            continue
+                        l, a = loss_fn(feats_of(ids), ids, blocks)
+                        losses.append(float(l))
+                        accs.append(float(a))
+                    res[f"reveal{m}"] = (sum(losses) / len(losses), sum(accs) / len(accs))
         draft.train()
-        return " ".join(f"lag{k}: loss {v[0]:.3f} acc1 {v[1]:.3f}" for k, v in res.items())
+        return " ".join(f"{'lag' if isinstance(k, int) else ''}{k}: loss {v[0]:.3f} acc1 {v[1]:.3f}"
+                        for k, v in res.items())
 
     print(f"[step 0] val {evaluate()}", flush=True)
     step, t0 = 0, time.time()
@@ -142,6 +161,9 @@ def main():
                 d = train[j]
                 ids = d["ids"].long().to(args.device)
                 blocks = sample_blocks(d["n_prompt"], len(ids), args.blocks, bs, args.max_lag, args.p_zero, rng)
+                if args.reveal:
+                    blocks = [(s_, g_, tuple(rng.sample(range(2, bs), rng.randint(1, args.reveal_max))))
+                              if rng.random() < args.reveal else (s_, g_) for s_, g_ in blocks]
                 if not blocks:
                     continue
                 loss, acc = loss_fn(feats_of(ids), ids, blocks)
