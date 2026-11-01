@@ -103,6 +103,7 @@ def main():
 
     acc = defaultdict(list)          # key -> accepted lengths (aligned with plain on the same anchors)
     pr = defaultdict(list)           # source -> anchor correct?
+    n_total, isl_at = 0, defaultdict(int)   # confidence islands: how often, and where
     for dname in args.datasets:
         n_anc = 0
         for p in load_prompts(dname, args.n):
@@ -133,7 +134,9 @@ def main():
                     if conf[m - 1] >= args.tau and min(conf[: m - 1]) < 0.5:
                         isl = m
                         break
+                n_total += 1
                 if isl:
+                    isl_at[isl] += 1
                     injs.append({isl: y[isl - 1]})
                     keys.append(("island", isl))
                 # retrieval from the context
@@ -184,6 +187,9 @@ def main():
     for r in rows:
         for c in cols:
             r.setdefault(c, None)
+    n_isl = sum(isl_at.values())
+    print(f"[islands] {n_isl} of {n_total} blocks ({n_isl / max(n_total, 1):.1%}) have a confidence island (>= {args.tau} "
+          f"after a position < 0.5); by position: " + ", ".join(f"{m}:{c}" for m, c in sorted(isl_at.items())))
     print(f"plain DFlash accepted (all anchors): {mean(acc[('plain', 0, 'alone')]):.3f}")
     print_table(rows, cols, "infill from an anchor at block position m (accepted per verification; tree = best branch)")
     save_json(args.out, {"args": vars(args), "rows": rows})
