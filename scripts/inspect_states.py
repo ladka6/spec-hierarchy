@@ -36,10 +36,11 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--texts", nargs="+", default=DEFAULT_TEXTS)
     ap.add_argument("--layers", nargs="+", type=int, default=[25, 33])
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, device_map="cuda").eval()
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, device_map=args.device).eval()
     cfg = model.config
     n_kv, hd = cfg.num_key_value_heads, cfg.hidden_size // cfg.num_attention_heads
     hd = getattr(cfg, "head_dim", hd)
@@ -49,7 +50,7 @@ def main():
     labels = []
     with torch.inference_mode():
         for t in args.texts:
-            ids = tok(t, return_tensors="pt", add_special_tokens=False)["input_ids"].cuda()
+            ids = tok(t, return_tensors="pt", add_special_tokens=False)["input_ids"].to(args.device)
             out = model(ids, output_hidden_states=True, use_cache=False)
             hs = out.hidden_states                     # hs[i] = input of layer i = output of layer i-1
             probs = torch.softmax(out.logits[0, -1].float(), -1)
