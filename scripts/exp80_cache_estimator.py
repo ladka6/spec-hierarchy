@@ -128,6 +128,9 @@ def main():
     ap.add_argument("--eval-stops", type=int, default=150, help="anchors for the periodic stop eval")
     ap.add_argument("--stops", type=int, default=600, help="anchors for the final stop eval")
     ap.add_argument("--load", default="")
+    ap.add_argument("--project", nargs="*", type=int, default=[],
+                    help="also evaluate the estimates projected onto the top-r PCA directions of the real L25 / L33 "
+                         "(fit on held-in sequences), rest = mean")
     ap.add_argument("--out", default="")
     ap.add_argument("--save", default="exp80_cache_estimator")
     args = ap.parse_args()
@@ -212,6 +215,32 @@ def main():
         return out.view(n, K * H)
 
     # ---------------------------------------------------------------------------------------------- eval
+    pca = {}
+    if args.project:
+        held = seqs[len(val) :]
+        s1 = {t: torch.zeros(H, dtype=torch.float64, device=dev) for t in (i25, i33)}
+        s2 = {t: torch.zeros(H, H, dtype=torch.float64, device=dev) for t in (i25, i33)}
+        npos = 0
+        for ids_h, lo_h in held[:200]:
+            fh = feats_of(ids_h.to(dev))[lo_h:].double().view(-1, K, H)
+            for t in (i25, i33):
+                s1[t] += fh[:, t].sum(0)
+                s2[t] += fh[:, t].T @ fh[:, t]
+            npos += fh.shape[0]
+        for t in (i25, i33):
+            m = s1[t] / npos
+            _, U = torch.linalg.eigh(s2[t] / npos - torch.outer(m, m))
+            pca[t] = (m.float(), U.flip(1).float())
+        print(f"[pca] fitted on {npos} held-in positions, ranks {args.project}", flush=True)
+
+    def project(e, rank):
+        n_ = e.shape[0]
+        ev = e.float().view(n_, K, H).clone()
+        for t, (m, U) in pca.items():
+            Ur = U[:, :rank]
+            ev[:, t] = m + ((ev[:, t] - m) @ Ur) @ Ur.T
+        return ev.view(n_, K * H)
+
     def stop_eval(n_anchors, tag):
         est.eval()
         vr = random.Random(7)
@@ -230,7 +259,7 @@ def main():
                 for s in anchors:
                     y1 = blocks_logits(draft, target, f[None, :s], x, [(s, 0)], bs)[0].argmax(-1).tolist()
                     n = matched(y1, x[s + 1 :].tolist())
-                    r = {"n": n, "real": 0, "tokens": 0, "est": 0}
+                    r = {"n": n, "real": 0, "tokens": 0, "est": 0, **{f"est@pca{rr}": 0 for rr in args.project}}
                     if n > 0:
                         a = s + n
                         truth = x[a + 1 :].tolist()
@@ -243,13 +272,17 @@ def main():
                             fz = torch.cat([f[:s], raw_part(y25[0], y33[0]).to(f.dtype)], 0)[None]
                             lg = blocks_logits(draft, target, fz, x, [(a, 0)], bs)[0]
                             r["est"] = matched(lg.argmax(-1).tolist(), truth)
+                            for rr in args.project:
+                                fz = torch.cat([f[:s], project(raw_part(y25[0], y33[0]), rr).to(f.dtype)], 0)[None]
+                                lg = blocks_logits(draft, target, fz, x, [(a, 0)], bs)[0]
+                                r[f"est@pca{rr}"] = matched(lg.argmax(-1).tolist(), truth)
                     recs.append(r)
         est.train()
         k = len(recs)
         normal = sum(r["n"] + 1 for r in recs) / k
         rows = [{"block 2 from": "none (normal DFlash)", "first token right": "-", "mean m2": 0.0,
                  "tokens / verification": normal, "vs normal": 1.0}]
-        for c in ("real", "tokens", "est"):
+        for c in ("real", "tokens", "est") + tuple(f"est@pca{rr}" for rr in args.project):
             t = sum(r["n"] + r[c] + 1 for r in recs) / k
             rows.append({"block 2 from": c, "first token right": sum(r[c] >= 1 for r in recs if r["n"] > 0)
                          / max(sum(r["n"] > 0 for r in recs), 1), "mean m2": sum(r[c] for r in recs) / k,
