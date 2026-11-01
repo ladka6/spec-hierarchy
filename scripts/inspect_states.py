@@ -24,7 +24,7 @@ DEFAULT_TEXTS = [
     "The capital of France is Paris",                                 # same last token, different prefixes
     "Last summer I spent two weeks walking around Paris",
     "def visit(city):\n    return city == 'Paris",
-    "Paris",
+    "I love Paris",                                                   # ("Paris" alone sits at position 0, the attention sink)
     "The capital of France is London",                                # different last token, same prefix
     "The capital of France is Berlin",
     "The capital of France is",
@@ -68,7 +68,7 @@ def main():
                 v = layer.self_attn.v_proj(x)
                 for name, val in ((f"L{L} output", h_out), (f"K{L} (pre-RoPE)", k.float()), (f"V{L}", v.float())):
                     reps.setdefault(name, []).append(val[-1])
-                    alltok.setdefault(name, []).append(val)
+                    alltok.setdefault(name, []).append(val[1:])     # position 0 is the attention sink (huge norm)
 
     n = len(labels)
     mats = {}
