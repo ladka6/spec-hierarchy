@@ -36,6 +36,7 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--texts", nargs="+", default=DEFAULT_TEXTS)
     ap.add_argument("--layers", nargs="+", type=int, default=[25, 33])
+    ap.add_argument("--plot", default="inspect_states.png", help="heatmap figure (centred cosines); '' to skip")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -70,16 +71,52 @@ def main():
                     alltok.setdefault(name, []).append(val)
 
     n = len(labels)
+    mats = {}
     print("\nlegend: " + "  ".join(f"[{i}] {l}" for i, l in enumerate(labels)))
     for name in reps:
         R = torch.stack(reps[name])
         mu = torch.cat(alltok[name]).mean(0)
         for kind, M in (("raw", R), ("centred", R - mu)):
             C = F.cosine_similarity(M[:, None], M[None], dim=-1)
+            mats[(name, kind)] = C.cpu().numpy()
             print(f"\n{name}, cosine ({kind})")
             print("      " + "".join(f"[{j}]".rjust(7) for j in range(n)))
             for i in range(n):
                 print(f"[{i}]   " + "".join(f"{float(C[i, j]):7.2f}" for j in range(n)))
+
+    if args.plot:
+        plot(mats, labels, list(reps), args.plot)
+
+
+def plot(mats, labels, names, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = len(labels)
+    names_by_layer = {}
+    for nm in names:                                    # rows: layers; columns: output, K, V
+        names_by_layer.setdefault("".join(c for c in nm.split()[0] if c.isdigit()), []).append(nm)
+    rows = list(names_by_layer.values())
+    fig, axes = plt.subplots(len(rows), 3, figsize=(17, 5 * len(rows)), squeeze=False)
+    for r, row in enumerate(rows):
+        for c, nm in enumerate(row):
+            ax = axes[r][c]
+            C = mats[(nm, "centred")]
+            im = ax.imshow(C, vmin=-1, vmax=1, cmap="RdBu_r")
+            for i in range(n):
+                for j in range(n):
+                    ax.text(j, i, f"{C[i, j]:.2f}", ha="center", va="center", fontsize=7,
+                            color="white" if abs(C[i, j]) > 0.6 else "black")
+            ax.set_xticks(range(n), [f"[{i}]" for i in range(n)])
+            ax.set_yticks(range(n), [f"[{i}] {labels[i][-24:]}" if c == 0 else f"[{i}]" for i in range(n)],
+                          fontsize=7)
+            ax.set_title(nm)
+    fig.suptitle("centred cosine between texts, last token", y=1.0)
+    fig.subplots_adjust(wspace=0.15)
+    fig.colorbar(im, ax=axes, shrink=0.6)
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    print(f"[plot] saved {path}")
 
 
 if __name__ == "__main__":
