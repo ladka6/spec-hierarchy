@@ -14,6 +14,10 @@ Per drafter: its own accepted length, and against DFlash (primary):
                    there (independent errors -> its accuracy at a correct prefix; DFlash variants gave 0.08-0.25)
   best of both     accepted length when DFlash's and this drafter's drafts are verified together
 and the union of all drafters.
+Gate pre-check (pard drafters): does disagreement with this drafter locate DFlash's first error? Over block positions
+where DFlash's prefix is right, label = DFlash wrong there; AUROC of DFlash's own confidence, of this drafter's
+probability of DFlash's token, of both combined, and precision / recall of plain disagreement. Drafts are saved
+(<out>_drafts.pt) for later analysis.
 
   python scripts/exp98_dllm_decor.py --drafters pard:amd/PARD-Qwen3-0.6B dream:Dream-org/Dream-v0-Instruct-7B
 """
@@ -32,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dflash.model import extract_context_feature  # noqa: E402
 from exp27_refresh import blocks_logits, matched  # noqa: E402
+from exp89_hedge import auroc  # noqa: E402
 
 from hspec.data import encode, load_prompts, stop_ids  # noqa: E402
 from hspec.models import load_draft, load_target, load_tokenizer  # noqa: E402
@@ -72,6 +77,7 @@ def main():
     lids = list(draft.target_layer_ids)
 
     blocks = []                                   # (x cpu, s, truth, dflash draft)
+    dconf = []                                    # DFlash's probability of its own token, per block position
     for dname in args.datasets:
         for p in load_prompts(dname, args.n):
             ids = encode(tok, p)
@@ -80,14 +86,17 @@ def main():
                                             lids)
             xl, xc = x.tolist(), x.cpu()
             for s in range(ids.shape[1], len(x) - bs - 1, args.stride):
-                y = blocks_logits(draft, target, feats, x, [(s, 0)], bs)[0].argmax(-1).tolist()
-                blocks.append((xc, s, xl[s + 1 : s + 1 + D], y))
+                pr = torch.softmax(blocks_logits(draft, target, feats, x, [(s, 0)], bs)[0].float(), -1)
+                cf, yy = pr.max(-1)
+                blocks.append((xc, s, xl[s + 1 : s + 1 + D], yy.tolist()))
+                dconf.append(cf.tolist())
         print(f"[phase 1] {dname}: {len(blocks)} blocks", flush=True)
     del target, draft
     gc.collect()
     torch.cuda.empty_cache()
 
     drafts = {}                                   # name -> list of chains aligned with blocks
+    p_of_y = {}                                   # name -> this drafter's probability of DFlash's token (pard)
     for spec in args.drafters:
         kind, mid = spec.split(":", 1)
         name = mid.split("/")[-1]
@@ -97,11 +106,13 @@ def main():
                 cfg = AutoConfig.from_pretrained(mid)
                 m = AutoModelForCausalLM.from_pretrained(mid, dtype=torch.bfloat16, device_map=dev).eval()
                 pard = int(cfg.pard_token)
-                out = []
-                for xc, s, t, _ in blocks:
+                out, py = [], []
+                for xc, s, t, yd in blocks:
                     inp = torch.cat([xc[: s + 1], torch.full((D - 1,), pard, dtype=xc.dtype)]).to(dev)
-                    lg = m(inp[None], logits_to_keep=D).logits[0]
+                    lg = m(inp[None], logits_to_keep=D).logits[0].float()
                     out.append(lg.argmax(-1).tolist())
+                    py.append(torch.softmax(lg, -1).gather(-1, torch.tensor(yd, device=dev)[:, None])[:, 0].tolist())
+                p_of_y[mid.split("/")[-1]] = py
             elif kind == "dream":
                 from transformers import AutoModel
                 m = AutoModel.from_pretrained(mid, dtype=torch.bfloat16, trust_remote_code=True).to(dev).eval()
@@ -151,7 +162,36 @@ def main():
     print_table(rows, cols, f"do drafters without target features fail where DFlash fails? ({len(blocks)} blocks)")
     print("[reference] DFlash variants (exp97): right at e 0.08-0.25; independent errors would give about the "
           "drafter's accuracy at a correct prefix", flush=True)
-    save_json(args.out, {"args": vars(args), "rows": rows})
+    # gate pre-check: does disagreement locate DFlash's first error?
+    rows_g = []
+    for name, py in p_of_y.items():
+        ch = drafts.get(name)
+        if ch is None:
+            continue
+        lab, s_d, s_p, s_c, agree = [], [], [], [], []
+        for i, (t, y) in enumerate(zip(truths, prim)):
+            e = a_prim[i]
+            for k in range(min(e + 1, D)):                  # positions with DFlash's prefix right
+                lab.append(k == e)
+                s_d.append(dconf[i][k])
+                s_p.append(py[i][k])
+                s_c.append((dconf[i][k] * py[i][k]) ** 0.5)
+                agree.append(ch[i][k] == y[k])
+        dis = [not a for a in agree]
+        tp = sum(d and l for d, l in zip(dis, lab))
+        rows_g.append({"drafter": name, "positions": len(lab), "DFlash error rate": sum(lab) / len(lab),
+                       "AUROC DFlash conf": auroc(s_d, lab), "AUROC this drafter's p(DFlash token)": auroc(s_p, lab),
+                       "AUROC combined": auroc(s_c, lab), "AUROC disagreement": auroc([float(a) for a in agree], lab),
+                       "disagree rate": sum(dis) / len(dis), "precision (disagree -> error)": tp / max(sum(dis), 1),
+                       "recall (errors caught)": tp / max(sum(lab), 1)})
+    if rows_g:
+        print_table(rows_g, list(rows_g[0]), "gate pre-check: does disagreement locate DFlash's first error? "
+                    "(reference: DFlash conf ~0.92, 4-bit copy margin ~0.97)")
+    save_json(args.out, {"args": vars(args), "rows": rows, "gate": rows_g})
+    res = Path(__import__("os").environ.get("HSPEC_RESULTS", "results"))
+    res.mkdir(parents=True, exist_ok=True)
+    torch.save({"truths": truths, "dflash": prim, "dflash_conf": dconf, "drafts": drafts, "p_of_dflash_token": p_of_y,
+                "anchors": [s for _, s, _, _ in blocks]}, res / f"{args.out}_drafts.pt")
 
 
 if __name__ == "__main__":
