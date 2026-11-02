@@ -193,7 +193,7 @@ def main():
                     # corrected prefix == the true text up to a (y matched t before e, and t[e] is placed at e)
                     ids = x[None, : a + 1]
                     if init == "dflash":
-                        slot_ids, k = z[1 : K + 1], K
+                        slot_ids, k = z[:K], K
                     elif init == "dflash_wrong":
                         slot_ids, k = wrong_tail, len(wrong_tail)
                         if k == 0:
