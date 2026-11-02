@@ -138,14 +138,18 @@ def main():
         cfg.num_hidden_layers, cfg.hidden_size = L, H
         cfg.intermediate_size = 3 * H
         cfg.num_attention_heads = max(H // 128, 1)
-        cfg.num_key_value_heads = max(min(base.num_key_value_heads, cfg.num_attention_heads), 1)
+        cfg.num_key_value_heads = max(k for k in range(1, min(base.num_key_value_heads, cfg.num_attention_heads) + 1)
+                                      if cfg.num_attention_heads % k == 0)
         cfg.head_dim = 128
         cfg.tie_word_embeddings = True
         if hasattr(cfg, "layer_types"):
             cfg.layer_types = ["full_attention"] * L
         with torch.device(dev):
             m = AutoModelForCausalLM.from_config(cfg, dtype=torch.bfloat16, attn_implementation="sdpa").eval()
-        lm_row(f"random {sh}", m)
+        try:
+            lm_row(f"random {sh}", m)
+        except Exception as ex:  # noqa: BLE001
+            print(f"[random {sh}] failed: {type(ex).__name__}: {ex}", flush=True)
         m = None
         torch.cuda.empty_cache()
 
