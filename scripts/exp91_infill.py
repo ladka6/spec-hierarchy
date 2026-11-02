@@ -102,6 +102,7 @@ def main():
     lids = list(draft.target_layer_ids)
 
     acc = defaultdict(list)          # key -> accepted lengths (aligned with plain on the same anchors)
+    hacc = defaultdict(list)         # hole test at the drafter's first error
     pr = defaultdict(list)           # source -> anchor correct?
     n_total, isl_at = 0, defaultdict(int)   # confidence islands: how often, and where
     for dname in args.datasets:
@@ -184,14 +185,14 @@ def main():
                             acc[(kind, m, "tree+lookup")].append(max(a_plain, a_inf, a_look))
                             acc[(kind, m, "plain+lookup")].append(max(a_plain, a_look))
                 # every block counts (blocks without an error keep the plain result)
-                acc[("hole", "oracle filler, infill alone")].append(hole["oracle"])
-                acc[("hole", "oracle filler, tree with plain")].append(max(a_plain, hole["oracle"]))
+                hacc[("hole", "oracle filler, infill alone")].append(hole["oracle"])
+                hacc[("hole", "oracle filler, tree with plain")].append(max(a_plain, hole["oracle"]))
                 for k in (1, 2, 3):
-                    acc[("hole", f"drafter top-{k} fillers, tree with plain")].append(
+                    hacc[("hole", f"drafter top-{k} fillers, tree with plain")].append(
                         max([a_plain] + hole["rank"][:k]))
                 if hole_cand:
                     for k in (1, 2, 3):
-                        acc[("hole cover", f"true token in drafter top-{k} at e")].append(truth[e0] in hole_cand[:k])
+                        hacc[("hole cover", f"true token in drafter top-{k} at e")].append(truth[e0] in hole_cand[:k])
             print(f"[{dname}] {n_anc} anchors", flush=True)
 
     def mean(v):
@@ -217,14 +218,14 @@ def main():
     n_isl = sum(isl_at.values())
     print(f"[islands] {n_isl} of {n_total} blocks ({n_isl / max(n_total, 1):.1%}) have a confidence island (>= {args.tau} "
           f"after a position < 0.5); by position: " + ", ".join(f"{m}:{c}" for m, c in sorted(isl_at.items())))
-    rows_h = [{"hole at the drafter's first error": k[1], "accepted": mean(v)} for k, v in acc.items() if k[0] == "hole"]
+    rows_h = [{"hole at the drafter's first error": k[1], "accepted": mean(v)} for k, v in hacc.items() if k[0] == "hole"]
     rows_h += [{"hole at the drafter's first error": k[1], "accepted": mean([float(b) for b in v])}
-               for k, v in acc.items() if k[0] == "hole cover"]
+               for k, v in hacc.items() if k[0] == "hole cover"]
     print_table(rows_h, list(rows_h[0]), "0. holes: true / drafter top-k token at the actual first error, block redrafted "
                 "around it in one pass (rows 'true token in top-k' are shares, not accepted lengths)")
     print(f"plain DFlash accepted (all anchors): {mean(acc[('plain', 0, 'alone')]):.3f}")
     print_table(rows, cols, "infill from an anchor at block position m (accepted per verification; tree = best branch)")
-    save_json(args.out, {"args": vars(args), "rows": rows})
+    save_json(args.out, {"args": vars(args), "rows": rows, "holes": rows_h})
 
 
 if __name__ == "__main__":
