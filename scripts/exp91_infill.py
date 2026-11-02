@@ -128,6 +128,17 @@ def main():
                     if y[m - 1] != truth[m - 1]:
                         injs.append({m: y[m - 1]})
                         keys.append(("wrong", m))
+                # a hole at the drafter's actual first error e: the true token there (oracle filler), or each of the
+                # drafter's top-3 tokens there (realistic fillers; the verifier keeps whichever is right)
+                e0 = matched(y, truth)
+                hole_cand = []
+                if e0 < D:
+                    injs.append({e0 + 1: truth[e0]})
+                    keys.append(("hole oracle", e0 + 1))
+                    hole_cand = prob[e0].topk(3).indices.tolist()
+                    for r, c in enumerate(hole_cand):
+                        injs.append({e0 + 1: c})
+                        keys.append(("hole rank", r))
                 # confidence island: farthest confident position after an unsure one
                 isl = None
                 for m in range(D, 2, -1):
@@ -150,7 +161,14 @@ def main():
                             keys.append(("retrieval", m))
                 L = infill_logits(draft, target, feats, x, s, injs, bs).float()
                 a_plain = matched(y, truth) + 1
+                hole = {"oracle": a_plain, "rank": []}
                 for (kind, m), inj, row in zip(keys, injs, L):
+                    if kind == "hole oracle":
+                        hole["oracle"] = matched(chain_with(row, inj), truth) + 1
+                        continue
+                    if kind == "hole rank":
+                        hole["rank"].append(matched(chain_with(row, inj), truth) + 1)
+                        continue
                     if kind == "plain":
                         acc[("plain", 0, "alone")].append(a_plain)
                         continue
@@ -165,6 +183,15 @@ def main():
                             a_look = matched(look, truth) + 1
                             acc[(kind, m, "tree+lookup")].append(max(a_plain, a_inf, a_look))
                             acc[(kind, m, "plain+lookup")].append(max(a_plain, a_look))
+                # every block counts (blocks without an error keep the plain result)
+                acc[("hole", "oracle filler, infill alone")].append(hole["oracle"])
+                acc[("hole", "oracle filler, tree with plain")].append(max(a_plain, hole["oracle"]))
+                for k in (1, 2, 3):
+                    acc[("hole", f"drafter top-{k} fillers, tree with plain")].append(
+                        max([a_plain] + hole["rank"][:k]))
+                if hole_cand:
+                    for k in (1, 2, 3):
+                        acc[("hole cover", f"true token in drafter top-{k} at e")].append(truth[e0] in hole_cand[:k])
             print(f"[{dname}] {n_anc} anchors", flush=True)
 
     def mean(v):
@@ -190,6 +217,11 @@ def main():
     n_isl = sum(isl_at.values())
     print(f"[islands] {n_isl} of {n_total} blocks ({n_isl / max(n_total, 1):.1%}) have a confidence island (>= {args.tau} "
           f"after a position < 0.5); by position: " + ", ".join(f"{m}:{c}" for m, c in sorted(isl_at.items())))
+    rows_h = [{"hole at the drafter's first error": k[1], "accepted": mean(v)} for k, v in acc.items() if k[0] == "hole"]
+    rows_h += [{"hole at the drafter's first error": k[1], "accepted": mean([float(b) for b in v])}
+               for k, v in acc.items() if k[0] == "hole cover"]
+    print_table(rows_h, list(rows_h[0]), "0. holes: true / drafter top-k token at the actual first error, block redrafted "
+                "around it in one pass (rows 'true token in top-k' are shares, not accepted lengths)")
     print(f"plain DFlash accepted (all anchors): {mean(acc[('plain', 0, 'alone')]):.3f}")
     print_table(rows, cols, "infill from an anchor at block position m (accepted per verification; tree = best branch)")
     save_json(args.out, {"args": vars(args), "rows": rows})
