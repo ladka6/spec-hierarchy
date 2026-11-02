@@ -123,6 +123,9 @@ def main():
     ap.add_argument("--max-new", type=int, default=512)
     ap.add_argument("--stride", type=int, default=8)
     ap.add_argument("--k", type=int, default=12, help="placeholder slots (offsets 2..k+1); <= block_size - 2")
+    ap.add_argument("--jacobi", type=int, default=0,
+                    help="for the dflash init: re-run this many times feeding the model's own argmax back into the "
+                         "slots (lookahead-decoding style); each iteration is reported as its own row")
     ap.add_argument("--out", default="exp101_maskdraft")
     args = ap.parse_args()
 
@@ -186,6 +189,7 @@ def main():
             model, name = load_mid(mspec), mspec
         for init in args.inits:
             st = Stats()
+            jac = [Stats() for _ in range(args.jacobi)] if init == "dflash" else []
             done = 0
             for x, n_prompt, blocks in seqs:
                 xl = x.tolist()
@@ -202,9 +206,15 @@ def main():
                         slot_ids, k = None, K
                     pred = slot_predictions(model, ids, slot_ids, init, k, mean_emb)
                     st.add(pred, truth[: k + 1])
+                    for it in jac:                       # slot j carries the token at a+j = pred[j-1]
+                        pred = slot_predictions(model, ids, pred[:k], init, k, mean_emb)
+                        it.add(pred, truth[: k + 1])
                     done += 1
             print(f"[{name} / {init}] {done} blocks, leading run {mean(st.runs):.3f}", flush=True)
             stats[f"{name} / {init}"] = st
+            for i, it in enumerate(jac, start=1):
+                print(f"[{name} / {init} jacobi {i}] leading run {mean(it.runs):.3f}", flush=True)
+                stats[f"{name} / {init} jacobi {i}"] = it
         if mspec != "target":
             free(model)
 
