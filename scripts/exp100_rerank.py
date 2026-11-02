@@ -66,6 +66,8 @@ def score_block(pred: list, y: list, truth: list, e: int, D: int) -> str:
     """
     for k in range(min(e + 1, D)):
         if pred[k] != y[k]:
+            if e >= D:
+                return "clean_alarm"
             if k < e:
                 return "early"
             return "resolved" if pred[k] == truth[k] else "wrong_token"
