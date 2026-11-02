@@ -1,4 +1,4 @@
-"""Experiment 100: can the verifier-side model draft the continuation after a resolved fork? (offline, T=0, no training)
+"""Experiment 101: can the verifier-side model draft the continuation after a resolved fork? (offline, T=0, no training)
 
 Question behind it: one copy level today is a copy pass (4 GB) plus a DFlash redraft (3.3 GB), because DFlash can only
 read the copy's computation through five taps. If the copy could fill placeholder ("mask") slots after the corrected
@@ -32,7 +32,7 @@ Reports, per model x init and for the DFlash reference:
 Decision: if the best untrained init on bnb4 is >= ~0.6 at offsets 2-4, train the copy's block head; if it is near
 the dflash_wrong row, placeholders need more than a head.
 
-  python scripts/exp100_maskdraft.py
+  python scripts/exp101_maskdraft.py
 """
 
 from __future__ import annotations
@@ -123,7 +123,7 @@ def main():
     ap.add_argument("--max-new", type=int, default=512)
     ap.add_argument("--stride", type=int, default=8)
     ap.add_argument("--k", type=int, default=12, help="placeholder slots (offsets 2..k+1); <= block_size - 2")
-    ap.add_argument("--out", default="exp100_maskdraft")
+    ap.add_argument("--out", default="exp101_maskdraft")
     args = ap.parse_args()
 
     tok = load_tokenizer(args.target)
