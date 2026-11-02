@@ -15,6 +15,16 @@ draft share the correct prefix AND get position e right? Under independence the 
 alternative's own accuracy at a correct prefix (~0.9); a low rescue rate means correlated failures.
 
   python scripts/exp97_decorrelation.py --models $HOME/hspec_ckpt/drafter_infill $HOME/hspec_ckpt/drafter_depth10
+
+Variants (--variants, exp97b): the primary's or another model's draft from CHANGED target features, to see which
+information makes failures correlated. Spec "<model>:<kind>[:<arg>]", model = base (the primary drafter) or a --models
+checkpoint name:
+  lag:<g>            features only up to s-g, the last g tokens given as tokens (stale features)
+  zero:<layers>      zero the features of these tap layers (e.g. 25,33 or all; tap layers of the drafter)
+  noise:<sigma>      add Gaussian noise, sigma times each feature dimension's std over the sequence
+  shuffle            features of the context in a random order (position 0 kept)
+Reported per variant: its own accepted length and accuracy at a correct prefix, and "alive alternatives right at e"
+(primary drafter reference: other DFlash drafts 0.08-0.25; PARD without features 0.45-0.49, exp98).
 """
 
 from __future__ import annotations
@@ -63,6 +73,8 @@ def main():
     ap.add_argument("--stride", type=int, default=8)
     ap.add_argument("--ks", type=int, nargs="+", default=[2, 4, 8])
     ap.add_argument("--temp", type=float, default=1.0)
+    ap.add_argument("--variants", nargs="*", default=[])
+    ap.add_argument("--skip-base", action="store_true", help="skip the beam and sample sources")
     ap.add_argument("--out", default="exp97_decorrelation")
     args = ap.parse_args()
 
@@ -79,6 +91,32 @@ def main():
     bs, D = draft.block_size, draft.block_size - 1
     lids = list(draft.target_layer_ids)
     gen = torch.Generator(device="cuda").manual_seed(0)
+    models = {"base": draft, **others}
+    variants = []
+    for v in args.variants:
+        name, kind, *rest = v.split(":")
+        if name not in models:
+            print(f"[variants] skipping {v}: unknown model {name}", flush=True)
+            continue
+        variants.append((v, name, kind, rest[0] if rest else None))
+
+    def corrupt(feats, kind, arg, lids_m):
+        """Changed copy of feats [1, T, W] (W = len(lids_m) * H)."""
+        f = feats.clone()
+        H = f.shape[-1] // len(lids_m)
+        if kind == "zero":
+            idx = range(len(lids_m)) if arg == "all" else [lids_m.index(int(l)) for l in arg.split(",")]
+            for i in idx:
+                f[..., i * H : (i + 1) * H] = 0
+        elif kind == "noise":
+            std = f[0, 1:].float().std(0, keepdim=True)
+            f = (f.float() + float(arg) * std * torch.randn(f.shape, generator=gen, device=f.device)).to(f.dtype)
+        elif kind == "shuffle":
+            perm = torch.randperm(f.shape[1] - 1, generator=gen, device=f.device) + 1
+            f[:, 1:] = f[:, perm]
+        return f
+
+    own = defaultdict(lambda: [0, 0])           # source -> [right, positions] at a correct prefix (K=1 sources)
 
     rec = defaultdict(list)          # source -> [(primary acc, best-of-K acc, nodes)]
     resc = defaultdict(lambda: [0, 0])          # source -> [rescued, failures of the primary]
@@ -91,6 +129,10 @@ def main():
             feats = extract_context_feature(target(x[None], output_hidden_states=True, logits_to_keep=1).hidden_states,
                                             lids)
             xl = x.tolist()
+            vfeats = {}
+            for v, name, kind, arg in variants:
+                if kind in ("zero", "noise", "shuffle"):
+                    vfeats[v] = corrupt(feats, kind, arg, list(models[name].target_layer_ids))
             for s in range(ids.shape[1], len(x) - bs - 1, args.stride):
                 n_blocks += 1
                 t = xl[s + 1 : s + 1 + D]
@@ -98,7 +140,12 @@ def main():
                 y = logp.argmax(-1).tolist()
                 a0 = matched(y, t)
                 alts = {}
-                for K in args.ks:
+                for v, name, kind, arg in variants:
+                    g = min(int(arg), s) if kind == "lag" else 0
+                    f = vfeats.get(v, feats)
+                    alts[f"variant {v}"] = [blocks_logits(models[name], target, f, x, [(s, g)], bs)[0]
+                                            .argmax(-1).tolist()]
+                for K in ([] if args.skip_base else args.ks):
                     alts[f"beam K={K}"] = kbest_paths(logp, K)[1:]
                     probs = torch.softmax(logp / args.temp, -1)
                     alts[f"sample K={K}"] = [torch.multinomial(probs, 1, generator=gen)[:, 0].tolist()
@@ -111,6 +158,10 @@ def main():
                     if len(oth) > 1:
                         alts["models all"] = oth
                 for src, al in alts.items():
+                    if len(al) == 1:
+                        m_ = matched(al[0], t)
+                        own[src][0] += m_
+                        own[src][1] += min(m_ + 1, D)
                     chains = [y] + al
                     best = max(matched(c, t) for c in chains)
                     rec[src].append((a0 + 1, best + 1, tree_nodes(chains)))
@@ -126,6 +177,8 @@ def main():
     rows = []
     for src, v in rec.items():
         rows.append({"alternative drafts": src, "primary accepted": sum(a for a, _, _ in v) / len(v),
+                     "alt accepted alone": (own[src][0] + len(v)) / len(v) if own[src][1] else None,
+                     "alt accuracy at correct prefix": own[src][0] / own[src][1] if own[src][1] else None,
                      "best of all accepted": sum(b for _, b, _ in v) / len(v),
                      "tree nodes": sum(n for _, _, n in v) / len(v),
                      "rescue rate at primary's failure": resc[src][0] / max(resc[src][1], 1),
