@@ -24,4 +24,4 @@ F="grep --line-buffered -v -i warn"
 # exp77 at scale: set-valued block drafting (K modes as input vectors, winner-takes-all), trained on the large set,
 # evaluated on the same held-out sequences as on Colab. Includes the K = 1 control fine-tune on the same data.
 #   CACHE=... DATA=... STEPS=6000 K=3 sbatch snellius/job_setdraft.sbatch
-python scripts/exp77_setdraft.py --cache "$CACHE" --data "$DATA" --steps "$STEPS" --K "${K:-3}" --mode-input 2>&1 | $F
+python scripts/exp77_setdraft.py --cache "$CACHE" --data "$DATA" --steps "$STEPS" --K "${K:-3}" --mode-input --save "${SAVE:-exp77_setdraft_K${K:-3}_s${STEPS}}" ${EXTRA:-} 2>&1 | $F

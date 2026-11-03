@@ -63,6 +63,30 @@ def trie_size(chains):
     return len(nodes)
 
 
+def tree_tau(logp, truth, budget, width=8):
+    """Accepted length (out of len(truth) + 1) of a DDTree-style best-first tree over the drafter's per-position
+    marginals: nodes are prefixes, a prefix's score is the sum of its tokens' log-probs, the best `budget` prefixes are
+    kept (children = top-`width` tokens at the next position). Accepted = longest truth prefix in the tree + 1."""
+    import heapq
+    B = len(truth)
+    top = logp.topk(width, -1)
+    tv, ti = top.values.tolist(), top.indices.tolist()
+    heap = [(-tv[0][j], (ti[0][j],)) for j in range(width)]
+    heapq.heapify(heap)
+    best = 0
+    for _ in range(budget):
+        if not heap:
+            break
+        negs, pre = heapq.heappop(heap)
+        d = len(pre)
+        if list(pre) == truth[:d]:
+            best = max(best, d)
+        if d < B:
+            for j in range(width):
+                heapq.heappush(heap, (negs - tv[d][j], pre + (ti[d][j],)))
+    return best + 1
+
+
 class ModeAdapters(nn.Module):
     def __init__(self, H, K, r, init_std=0.02):
         super().__init__()
@@ -117,6 +141,9 @@ def main():
     ap.add_argument("--val-frac", type=float, default=0.2)
     ap.add_argument("--skip-control", action="store_true")
     ap.add_argument("--save", default="")
+    ap.add_argument("--tree-budgets", type=int, nargs="+", default=[15, 30, 45, 60, 120],
+                    help="node budgets for the DDTree-style baseline on the same anchors (compare with the set trie "
+                         "at a similar node count)")
     args = ap.parse_args()
     args.save = args.save or (f"exp77_setdraft_K{args.K}_keep{args.keep0:g}" + ("_in" if args.mode_input else "")
                               + ("_frozen" if args.freeze else ""))
@@ -197,7 +224,8 @@ def main():
     def evaluate(draft, modes, K):
         """modes = None: one chain + the no-dependence branch baseline with K chains."""
         draft.eval()
-        r = {"tau1": 0.0, "tauK": 0.0, "nodes": 0.0, "wins": torch.zeros(K), "disagree": 0.0, "n": 0}
+        r = {"tau1": 0.0, "tauK": 0.0, "nodes": 0.0, "wins": torch.zeros(K), "disagree": 0.0, "n": 0,
+             "tree": {b: 0.0 for b in args.tree_budgets}}
         for i, an in ev.items():
             x = val[i][0].to(dev)
             feats = target_feats(x)
@@ -222,6 +250,10 @@ def main():
                 chains_all = [[pred[k, a].tolist() for k in range(K)] for a in range(len(an))]
             for a, s in enumerate(an):
                 truth = x[s + 1 : s + 1 + B].tolist()
+                if modes is None:
+                    lp = lg[a].log_softmax(-1)
+                    for b in args.tree_budgets:
+                        r["tree"][b] += tree_tau(lp, truth, b)
                 ms = [matched(c, truth) for c in chains_all[a]]
                 r["tau1"] += ms[0] + 1
                 r["tauK"] += max(ms) + 1
@@ -233,7 +265,8 @@ def main():
                                          for p in range(K) for q in range(p + 1, K)) / (K * (K - 1) / 2)
                 r["n"] += 1
         n = r["n"]
-        return {"tau_mode0": r["tau1"] / n, "tau_trie": r["tauK"] / n, "trie_nodes": r["nodes"] / n,
+        return {"tree": {b: v / n for b, v in r["tree"].items()},
+                "tau_mode0": r["tau1"] / n, "tau_trie": r["tauK"] / n, "trie_nodes": r["nodes"] / n,
                 "best_mode_share": [round(float(v) / n, 3) for v in r["wins"]], "mode_disagreement": r["disagree"] / n}
 
     rows = []
@@ -244,6 +277,9 @@ def main():
     rows.append({"condition": f"dflash_orig, {args.K} chains w/o dependence (2nd choice at least confident pos.)",
                  "K": args.K, "tau": r["tau_trie"], "trie_nodes": r["trie_nodes"],
                  "best_mode_share": r["best_mode_share"], "mode_disagreement": r["mode_disagreement"]})
+    for b, v in r["tree"].items():
+        rows.append({"condition": f"dflash_orig, DDTree-style tree, {b} nodes", "K": "-", "tau": v, "trie_nodes": b,
+                     "best_mode_share": "-", "mode_disagreement": "-"})
     print(f"[eval] dflash_orig: {r}", flush=True)
     del d0
     torch.cuda.empty_cache()
@@ -315,6 +351,9 @@ def main():
         rows.append({"condition": f"control, {args.K} chains w/o dependence", "K": args.K, "tau": r["tau_trie"],
                      "trie_nodes": r["trie_nodes"], "best_mode_share": r["best_mode_share"],
                      "mode_disagreement": r["mode_disagreement"]})
+        for b, v in r["tree"].items():
+            rows.append({"condition": f"control, DDTree-style tree, {b} nodes", "K": "-", "tau": v, "trie_nodes": b,
+                         "best_mode_share": "-", "mode_disagreement": "-"})
         print(f"[eval] control: {r}", flush=True)
         del draft
         torch.cuda.empty_cache()
