@@ -52,8 +52,9 @@ from hspec.utils import print_table, save_json  # noqa: E402
 def load_seqs(args):
     seqs = []
     if args.cache:
-        for ids, lo in torch.load(args.cache):
-            seqs.append((ids.long(), int(lo)))
+        for r in torch.load(args.cache):
+            ids, lo = (r["ids"], r["n_prompt"]) if isinstance(r, dict) else r
+            seqs.append((torch.as_tensor(ids).long(), int(lo)))
     else:
         for f in sorted(Path(args.data).expanduser().glob("shard*.pt")):
             for d in torch.load(f):
