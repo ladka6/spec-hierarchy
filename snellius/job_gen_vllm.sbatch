@@ -28,6 +28,11 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export HF_HOME=${HF_HOME:-/scratch-shared/$USER/hf}
 export HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false
-python scripts/gen_traindata_vllm.py gen --file /scratch-shared/$USER/prompts.pt \
-  --out /scratch-shared/$USER/hspec_lagft/data 2>&1 | grep --line-buffered -v -i warn
-ls -la /scratch-shared/$USER/hspec_lagft/data
+# overridable: FILE, OUT, MAXNEW, STOP (e.g. STOP=$'\nQuestion:'), defaults = the original lag-ft run
+FILE=${FILE:-/scratch-shared/$USER/prompts.pt}
+OUT=${OUT:-/scratch-shared/$USER/hspec_lagft/data}
+MAXNEW=${MAXNEW:-384}
+STOPARG=(); [ -n "${STOP:-}" ] && STOPARG=(--stop "$STOP")
+python scripts/gen_traindata_vllm.py gen --file "$FILE" --out "$OUT" --max-new "$MAXNEW" "${STOPARG[@]}" \
+  2>&1 | grep --line-buffered -v -i warn
+ls -la "$OUT"

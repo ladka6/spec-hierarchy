@@ -47,7 +47,7 @@ def generate(args):
     llm = LLM(model=blob["target"], max_model_len=max(len(x) for x in ids) + args.max_new + 8,
               gpu_memory_utilization=0.90, enable_prefix_caching=False)
     eos = llm.get_tokenizer().eos_token_id
-    sp = SamplingParams(temperature=0.0, max_tokens=args.max_new)
+    sp = SamplingParams(temperature=0.0, max_tokens=args.max_new, stop=args.stop or None)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     per = (len(ids) + args.shards - 1) // args.shards
@@ -58,6 +58,12 @@ def generate(args):
             continue
         res = llm.generate([TokensPrompt(prompt_token_ids=x) for x in chunk], sp)
         recs = []
+        why = {}
+        for r in res:
+            f = r.outputs[0].finish_reason
+            f = "stop_string" if f == "stop" and r.outputs[0].stop_reason not in (None, eos) else f
+            why[f] = why.get(f, 0) + 1
+        print(f"[gen] shard {k} finish reasons: {why}", flush=True)
         for p, r in zip(chunk, res):
             resp = list(r.outputs[0].token_ids)
             if len(resp) < 8:
@@ -86,6 +92,7 @@ def main():
     g.add_argument("--max-new", type=int, default=384)
     g.add_argument("--shards", type=int, default=4)
     g.add_argument("--tag", default="")
+    g.add_argument("--stop", nargs="*", default=[], help="stop strings, e.g. $'\\nQuestion:' for base models in Q/A format")
     args = ap.parse_args()
     build_prompts(args) if args.cmd == "prompts" else generate(args)
 
