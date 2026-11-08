@@ -201,8 +201,11 @@ def main():
     ref_head = ref.lm_head.weight.detach().half().cpu()
     if args.ref_tau:
         print("[A] reference tau (chat template)")
-        fmt_ref = lambda p: tok_ref.apply_chat_template(
-            [{"role": "user", "content": p}], add_generation_prompt=True, return_tensors="pt")
+        def fmt_ref(p):
+            # newer transformers return a BatchEncoding here, older ones a tensor
+            out = tok_ref.apply_chat_template(
+                [{"role": "user", "content": p}], add_generation_prompt=True, return_tensors="pt")
+            return out if torch.is_tensor(out) else out["input_ids"]
         res["ref_tau"] = measure_tau(drafter, ref, tok_ref, PROMPTS, fmt_ref,
                                      [128001, 128009], args.max_new, lossless=False)
         print(f"[A] ref tau = {res['ref_tau']['tau_token_weighted']:.3f}")
