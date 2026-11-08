@@ -219,8 +219,12 @@ def main():
     # identical tokenization check (diag compares token-by-token)
     same_tok = all(tok_ref(t).input_ids == tok_ls(t).input_ids for t in DIAG_TEXTS)
     res["same_tokenization"] = same_tok
-    print("same tokenization on diag texts:", same_tok)
-    ls_hs = collect_hidden(ls, tok_ls if not same_tok else tok_ref, DIAG_TEXTS)
+    a, b = tok_ref(DIAG_TEXTS[0]).input_ids, tok_ls(DIAG_TEXTS[0]).input_ids
+    res["tok_diff"] = {"ref_first": a[:3], "ls_first": b[:3], "ref_len": len(a), "ls_len": len(b),
+                       "ls_bos_id": tok_ls.bos_token_id}
+    print("same tokenization on diag texts:", same_tok, res["tok_diff"])
+    # feed both models the exact same ids (ref tokenizer, BOS included) so the comparison is token-aligned
+    ls_hs = collect_hidden(ls, tok_ref, DIAG_TEXTS)
 
     # embeddings / head drift
     ls_emb = ls.model.embed_tokens.weight.detach().half().cpu()
@@ -272,7 +276,13 @@ def main():
 
     # zero-shot tau on LayerSkip
     print("\n[B] zero-shot tau on LayerSkip (Q/A format)")
-    fmt_ls = lambda p: tok_ls(f"Question: {p}\nAnswer:", return_tensors="pt").input_ids
+    bos = tok_ls.bos_token_id if tok_ls.bos_token_id is not None else 128000
+
+    def fmt_ls(p):
+        ids = tok_ls(f"Question: {p}\nAnswer:", return_tensors="pt").input_ids
+        if ids[0, 0].item() != bos:  # LayerSkip tokenizer may not add BOS; Llama needs it
+            ids = torch.cat([torch.tensor([[bos]]), ids], dim=1)
+        return ids
     eos_ls = [tok_ls.eos_token_id] if isinstance(tok_ls.eos_token_id, int) else list(tok_ls.eos_token_id)
     res["ls_tau"] = measure_tau(drafter, ls, tok_ls, PROMPTS, fmt_ls, eos_ls,
                                 args.max_new, lossless=not args.no_lossless)
