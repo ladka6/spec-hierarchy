@@ -82,7 +82,7 @@ def find_keys(d, needles, prefix=""):
     if isinstance(d, dict):
         for k, v in d.items():
             p = f"{prefix}.{k}" if prefix else k
-            if any(n in k.lower() for n in needles):
+            if any(n in str(k).lower() for n in needles):
                 hits[p] = v
             hits.update(find_keys(v, needles, p))
     return hits
