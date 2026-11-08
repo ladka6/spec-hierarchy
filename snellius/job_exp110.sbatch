@@ -22,4 +22,8 @@ export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 mkdir -p results/exp110
 F="grep --line-buffered -v -i warn"
-python scripts/exp110_ls_align_check.py --ref_tau --out "results/exp110/exp110_${SLURM_JOB_ID}.json" 2>&1 | $F
+# optional arg: a different target in phase B, e.g. the non-LayerSkip control
+#   sbatch snellius/job_exp110.sbatch meta-llama/Meta-Llama-3-8B
+LS=${1:-facebook/layerskip-llama3-8B}
+REF_TAU=$([ -z "${1:-}" ] && echo --ref_tau)
+python scripts/exp110_ls_align_check.py --ls "$LS" $REF_TAU --out "results/exp110/exp110_$(basename $LS)_${SLURM_JOB_ID}.json" 2>&1 | $F
