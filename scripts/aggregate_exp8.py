@@ -42,6 +42,8 @@ def main():
                      "tau_clean": (sum(r["tokens_clean"] for r in rs) / sum(r["rounds_clean"] for r in rs)
                                    if all("tokens_clean" in r for r in rs) else float("nan")),
                      "clean": mean(r.get("clean_frac", float("nan")) for r in rs),
+                     "tok/s_clean": (sum(r["tokens_clean"] for r in rs) / (sum(r["ms_clean"] for r in rs) / 1000)
+                                     if all("ms_clean" in r for r in rs) else float("nan")),
                      "rollbacks": mean(r.get("rollbacks", float("nan")) for r in rs),
                      "caught": mean(r.get("caught", float("nan")) for r in rs),
                      "forks": mean(r.get("forks", float("nan")) for r in rs),
@@ -49,12 +51,14 @@ def main():
     by = {(r["lat_ms"], r["dataset"], r["config"]): r["tok/s"] for r in rows}
     for r in rows:
         k = (r["lat_ms"], r["dataset"])
-        r["x_dflash"] = r["tok/s"] / by.get(k + ("dflash",), float("nan"))
+        ref = by.get(k + ("dflash",), by.get(k + ("dflash@orig",), float("nan")))
+        r["x_dflash"] = r["tok/s"] / ref
         ddt = [v for (l, d, c), v in by.items() if (l, d) == k and c.startswith("ddtree")]
         r["x_ddtree"] = r["tok/s"] / max(ddt) if ddt else float("nan")
 
     cols = ["lat_ms", "dataset", "config", "tok/s", "x_dflash", "x_ddtree", "tgt/tok", "mid/tok", "tau",
-            "rollbacks", "caught", "forks", "n"]
+            "tau_clean", "clean", "tok/s_clean", "rollbacks", "caught", "forks", "n"]
+    cols = [c for c in cols if any(not (isinstance(r.get(c), float) and r[c] != r[c]) for r in rows)]  # drop all-nan
     print_table([r for r in rows if r["dataset"] == "ALL"], cols, "all datasets pooled")
     print_table([r for r in rows if r["dataset"] != "ALL"], cols, "per dataset")
 
