@@ -47,7 +47,10 @@ def generate(args):
     llm = LLM(model=blob["target"], max_model_len=max(len(x) for x in ids) + args.max_new + 8,
               gpu_memory_utilization=0.90, enable_prefix_caching=False)
     eos = llm.get_tokenizer().eos_token_id
-    sp = SamplingParams(temperature=0.0, max_tokens=args.max_new, stop=args.stop or None)
+    import codecs
+    stops = [codecs.decode(x, "unicode_escape") for x in args.stop]  # accept a literal "\nQuestion:" from the shell
+    print(f"[gen] stop strings: {stops!r}", flush=True)
+    sp = SamplingParams(temperature=0.0, max_tokens=args.max_new, stop=stops or None)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     per = (len(ids) + args.shards - 1) // args.shards
