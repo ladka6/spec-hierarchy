@@ -20,4 +20,9 @@ print(f"{len(d)} seqs, response mean {sum(n_resp) / len(n_resp):.0f} median {n_r
 print(f"first token BOS: {sum(int(x['ids'][0]) == 128000 for x in d)} of {len(d)}")
 print(f"responses with a new Question: turn: {sum(chr(10) + 'Question:' in s for s in resp)}")
 print(f"responses ending in EOS: {sum(s.endswith('<|end_of_text|>') for s in resp)}")
-print("sample:", repr(resp[0][:400]))
+print(f"responses ending at a Question: stop: {sum(s.rstrip(':').endswith('Question') for s in resp)}")
+print(f"tokenizer has a chat template: {bool(tok.chat_template)} (must be False: Q/A format, as in eval)")
+print("prompt start:", repr(tok.decode(d[0]["ids"][: d[0]["n_prompt"]])[:200]))
+for i in (0, 1, 2):
+    print(f"response {i} start:", repr(resp[i][:200]))
+    print(f"response {i} end:  ", repr(resp[i][-120:]))
