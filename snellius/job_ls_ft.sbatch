@@ -9,7 +9,7 @@
 #SBATCH --output=ls-ft-%j.out
 # Main baseline: the z-lab Llama-3.1 DFlash drafter fine-tuned on LayerSkip Llama3-8B greedy data, standard DFlash
 # recipe (real target features, lag 0, block 10, all response positions as anchors, position-decayed CE).
-# Data: job_gen_vllm.sbatch with STOP=$'\nQuestion:' into $W/data_ft. Checkpoint per epoch; to continue a run:
+# Data: job_gen_vllm.sbatch with STOP=$'\nQuestion:' into $W/data_ft, then scripts/clean_lsdata.py -> $W/data_ft_clean. Checkpoint per epoch; to continue a run:
 #   RESUME=$W/drafter_ls_ft/epoch1 sbatch snellius/job_ls_ft.sbatch
 # If it runs out of memory on the 40 GB A100: lower BLOCK_CHUNK, or sbatch -p gpu_h100.
 set -uo pipefail
@@ -22,7 +22,7 @@ export HF_HOME=${HF_HOME:-/scratch-shared/$USER/hf}
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 W=${LS_DIR:-/scratch-shared/$USER/hspec_ls}
-DATA=${LS_DATA:-$W/data_ft}
+DATA=${LS_DATA:-$W/data_ft_clean}
 OUT=${OUT:-$W/drafter_ls_ft}
 DRAFT=z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat
 RES=()
