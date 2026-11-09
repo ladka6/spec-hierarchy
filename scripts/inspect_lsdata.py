@@ -26,3 +26,16 @@ print("prompt start:", repr(tok.decode(d[0]["ids"][: d[0]["n_prompt"]])[:200]))
 for i in (0, 1, 2):
     print(f"response {i} start:", repr(resp[i][:200]))
     print(f"response {i} end:  ", repr(resp[i][-120:]))
+
+# loops among length-capped responses: share of distinct 8-grams in the last 512 tokens (1.0 = no repetition)
+capped = [x["ids"][x["n_prompt"]:].tolist() for x in d if len(x["ids"]) - x["n_prompt"] >= 1024]
+def distinct(t, n=8):
+    g = [tuple(t[i:i + n]) for i in range(len(t) - n + 1)]
+    return len(set(g)) / max(len(g), 1)
+dist = sorted(distinct(t[-512:]) for t in capped)
+if dist:
+    q = lambda p: dist[int(p * (len(dist) - 1))]
+    print(f"length-capped: {len(capped)}; distinct 8-gram share in last 512 tokens: p10 {q(.1):.2f} median {q(.5):.2f}; "
+          f"looping (< 0.5): {sum(v < 0.5 for v in dist)}, heavy (< 0.2): {sum(v < 0.2 for v in dist)}")
+    worst = min(capped, key=lambda t: distinct(t[-512:]))
+    print("most repetitive tail:", repr(tok.decode(worst[-150:])))
