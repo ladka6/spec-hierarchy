@@ -33,6 +33,7 @@ FILE=${FILE:-/scratch-shared/$USER/prompts.pt}
 OUT=${OUT:-/scratch-shared/$USER/hspec_lagft/data}
 MAXNEW=${MAXNEW:-384}
 STOPARG=(); [ -n "${STOP:-}" ] && STOPARG=(--stop "$STOP")
+[ -n "${ONLY:-}" ] && STOPARG+=(--only $ONLY)   # e.g. ONLY=3 to redo one shard
 python scripts/gen_traindata_vllm.py gen --file "$FILE" --out "$OUT" --max-new "$MAXNEW" "${STOPARG[@]}" \
   2>&1 | grep --line-buffered -v -i warn
 ls -la "$OUT"

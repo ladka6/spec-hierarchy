@@ -29,7 +29,7 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -l 5 > "exp110c
 SMI=$!
 python scripts/train_lag.py --target facebook/layerskip-llama3-8B --draft z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat \
   --data "$DATA" --out "$W/calib_tmp" --max-lag 0 --blocks $BLOCKS --batch 4 --epochs 1 --max-train 400 \
-  --val-seqs 8 --eval-every 100000 --gamma 0.82 --lr 5e-5 --max-len $MAXLEN 2>&1 | grep --line-buffered -v -i warn
+  --val-seqs 8 --eval-every 100000 --gamma 0.82 --lr 5e-5 --max-len $MAXLEN --block-chunk ${BLOCK_CHUNK:-128} --fp32 2>&1 | grep --line-buffered -v -i warn
 kill $SMI
 echo "peak MiB: $(sort -n exp110c-$SLURM_JOB_ID.mem | tail -1)"
 python - <<PY

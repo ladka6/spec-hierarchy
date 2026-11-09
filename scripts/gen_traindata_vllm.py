@@ -57,6 +57,8 @@ def generate(args):
     total = 0
     for k in range(args.shards):
         chunk = ids[k * per : (k + 1) * per]
+        if args.only and k not in args.only:
+            continue
         if not chunk:
             continue
         res = llm.generate([TokensPrompt(prompt_token_ids=x) for x in chunk], sp)
@@ -96,6 +98,7 @@ def main():
     g.add_argument("--max-new", type=int, default=384)
     g.add_argument("--shards", type=int, default=4)
     g.add_argument("--tag", default="")
+    g.add_argument("--only", type=int, nargs="*", default=[], help="generate only these shard indices (redo a shard)")
     g.add_argument("--stop", nargs="*", default=[], help="stop strings, e.g. $'\\nQuestion:' for base models in Q/A format")
     args = ap.parse_args()
     build_prompts(args) if args.cmd == "prompts" else generate(args)
