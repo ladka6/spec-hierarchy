@@ -10,25 +10,12 @@ left shorter than --min-trimmed is dropped (it looped almost from the start); un
 import argparse
 from pathlib import Path
 
+import sys
+
 import torch
 
-
-def loop_onset(t, n=8, win=64, thr=0.75, lookback=256):
-    last, rep = {}, []
-    for i in range(len(t) - n + 1):
-        g = tuple(t[i:i + n])
-        j = last.get(g)
-        rep.append(j is not None and i - j <= lookback)
-        last[g] = i
-    if len(rep) < win:
-        return None
-    s = sum(rep[:win])
-    for i in range(len(rep) - win + 1):
-        if i:
-            s += rep[i + win - 1] - rep[i - 1]
-        if s > thr * win:
-            return i
-    return None
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from hspec.cleancut import loop_onset  # noqa: E402
 
 
 def main():

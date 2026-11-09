@@ -39,6 +39,9 @@ def main():
                      "tgt/tok": mean(r["tgt_calls_per_tok"] for r in rs),
                      "mid/tok": mean(r.get("mid_calls_per_tok", float("nan")) for r in rs),
                      "tau": mean(r.get("tau", float("nan")) for r in rs),
+                     "tau_clean": (sum(r["tokens_clean"] for r in rs) / sum(r["rounds_clean"] for r in rs)
+                                   if all("tokens_clean" in r for r in rs) else float("nan")),
+                     "clean": mean(r.get("clean_frac", float("nan")) for r in rs),
                      "rollbacks": mean(r.get("rollbacks", float("nan")) for r in rs),
                      "caught": mean(r.get("caught", float("nan")) for r in rs),
                      "forks": mean(r.get("forks", float("nan")) for r in rs),

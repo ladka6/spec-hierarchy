@@ -34,6 +34,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hspec.async3 import Costs  # noqa: E402
+from hspec.cleancut import clean_stats  # noqa: E402
 from hspec.data import encode, load_prompts, stop_ids  # noqa: E402
 from hspec.hier import HierConfig, hier_generate  # noqa: E402
 from hspec.models import load_draft, load_mid, load_target, load_tokenizer  # noqa: E402
@@ -132,11 +133,13 @@ def main():
                         r = two_stage_generate(draft, target, target, target, ids, args.max_new, stops)
                     else:
                         r = ddtree_generate(draft, target, ids, args.max_new, stops, budget=int(name.split("-")[1]))
+                    cs = clean_stats(tok, r)
                     for lat in args.latencies_ms:
                         c = Costs(base.target, base.mid, base.draft_ms, lat)
                         records.append({"dataset": d, "i": i, "lat": lat, "config": name + args.suffix,
                                         "tokens": r.num_output_tokens, "ms": baseline_ms(r, c),
-                                        "tgt_calls_per_tok": r.target_calls / max(r.num_output_tokens, 1)})
+                                        "tgt_calls_per_tok": r.target_calls / max(r.num_output_tokens, 1),
+                                        "tau": r.summary()["mean_round_len"], **cs})
             print(f"[{name}] done", flush=True)
             save_json(out_name, {"args": vars(args), "records": records})
             continue
@@ -155,7 +158,7 @@ def main():
                     rec = {"dataset": d, "i": i, "config": spec + args.suffix, "tokens": r.num_output_tokens,
                            "tgt_calls_per_tok": s["target_calls_per_token"],
                            "mid_calls_per_tok": s["mid_calls_per_token"], "tau": s["mean_round_len"],
-                           "mean_q": s["mean_target_q"], **r.async_stats}
+                           "mean_q": s["mean_target_q"], **r.async_stats, **clean_stats(tok, r)}
                     if cfg.blocking:   # identical behaviour at any latency: shift by L per check
                         for L in args.latencies_ms:
                             records.append({**rec, "lat": L, "ms": r.decode_time * 1000 + L * len(r.tq)})
