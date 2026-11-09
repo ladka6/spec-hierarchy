@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 
 
-def loop_onset(t, n=8, win=64, thr=0.9, lookback=256):
+def loop_onset(t, n=8, win=64, thr=0.75, lookback=256):
     last, rep = {}, []
     for i in range(len(t) - n + 1):
         g = tuple(t[i:i + n])
@@ -36,7 +36,7 @@ def main():
     ap.add_argument("inp")
     ap.add_argument("out")
     ap.add_argument("--win", type=int, default=64)
-    ap.add_argument("--thr", type=float, default=0.9)
+    ap.add_argument("--thr", type=float, default=0.75)
     ap.add_argument("--min-resp", type=int, default=8)
     ap.add_argument("--min-trimmed", type=int, default=32)
     ap.add_argument("--show", type=int, default=0)
