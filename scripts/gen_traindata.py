@@ -21,7 +21,7 @@ from hspec.data import format_prompt  # noqa: E402
 from hspec.models import load_target, load_tokenizer  # noqa: E402
 
 
-def training_prompts(n_gsm8k=2000, n_alpaca=2600, seed=0):
+def training_prompts(n_gsm8k=2000, n_alpaca=2600, seed=0, n_ultrachat=0):
     from datasets import load_dataset
 
     out = [r["question"] for r in load_dataset("openai/gsm8k", "main", split="train")]
@@ -33,6 +33,10 @@ def training_prompts(n_gsm8k=2000, n_alpaca=2600, seed=0):
            for r in load_dataset("tatsu-lab/alpaca", split="train")]
     rng.shuffle(alp)
     out += alp[:n_alpaca]
+    if n_ultrachat:  # first user turns of UltraChat (the z-lab drafter's training source); train_sft split only
+        uc = [r["prompt"] for r in load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft")]
+        rng.shuffle(uc)
+        out += uc[:n_ultrachat]
     rng.shuffle(out)
     return out
 

@@ -56,6 +56,12 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--optim", default="adamw8bit", choices=["adamw8bit", "adamw"])
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--block-chunk", type=int, default=0,
+                    help="backward over at most this many blocks at a time (same gradient, less activation memory)")
+    ap.add_argument("--save-epochs", action="store_true", help="save drafter + optimizer state after every epoch")
+    ap.add_argument("--resume", default="",
+                    help="checkpoint dir written by --save-epochs; pass the same dir as --draft (with --fp32 the fp32 "
+                         "master weights in train_state.pt are restored)")
     ap.add_argument("--fp32", action="store_true",
                     help="fp32 master weights for the drafter under bf16 autocast (plain bf16 rounds small updates "
                          "away at lr ~1e-5..1e-4); saved back in bf16")
@@ -147,9 +153,32 @@ def main():
         return " ".join(f"{'lag' if isinstance(k, int) else ''}{k}: loss {v[0]:.3f} acc1 {v[1]:.3f}"
                         for k, v in res.items())
 
-    print(f"[step 0] val {evaluate()}", flush=True)
-    step, t0 = 0, time.time()
+    def save_ckpt(path, epoch, step):
+        path.mkdir(parents=True, exist_ok=True)
+        # bf16 copy for loading/eval; never cast the live (possibly fp32 master) weights in place
+        draft.save_pretrained(path, state_dict={k: v.detach().to(torch.bfloat16) for k, v in draft.state_dict().items()})
+        torch.save({"opt": opt.state_dict(), "sched": sched.state_dict(), "step": step, "epoch": epoch,
+                    "rng": rng.getstate(), "torch_rng": torch.get_rng_state(),
+                    "cuda_rng": torch.cuda.get_rng_state(), "fp32_master": args.fp32 and
+                    {k: v.detach().cpu() for k, v in draft.state_dict().items()}}, path / "train_state.pt")
+        print(f"[ckpt] epoch {epoch} step {step} -> {path}", flush=True)
+
+    step, epoch, t0 = 0, 0, time.time()
     order = list(range(len(train)))
+    if args.resume:
+        st = torch.load(Path(args.resume) / "train_state.pt", weights_only=False)
+        if st.get("fp32_master"):
+            draft.load_state_dict(st["fp32_master"])
+        opt.load_state_dict(st["opt"])
+        sched.load_state_dict(st["sched"])
+        step, epoch = st["step"], st["epoch"]
+        rng.setstate(st["rng"])
+        torch.set_rng_state(st["torch_rng"])
+        torch.cuda.set_rng_state(st["cuda_rng"])
+        print(f"[resume] epoch {epoch} step {step} from {args.resume}", flush=True)
+    else:
+        print(f"[step 0] val {evaluate()}", flush=True)
+    s0 = step
     while step < total:
         rng.shuffle(order)
         for i in range(0, len(order) - args.batch + 1, args.batch):
@@ -166,10 +195,15 @@ def main():
                               if rng.random() < args.reveal else (s_, g_) for s_, g_ in blocks]
                 if not blocks:
                     continue
-                loss, acc = loss_fn(feats_of(ids), ids, blocks)
-                (loss / args.batch).backward()
-                tot_l += float(loss)
-                tot_a += float(acc)
+                feats = feats_of(ids)
+                ch = args.block_chunk or len(blocks)
+                for c in range(0, len(blocks), ch):
+                    sub = blocks[c : c + ch]
+                    frac = len(sub) / len(blocks)
+                    loss, acc = loss_fn(feats, ids, sub)
+                    (loss * frac / args.batch).backward()
+                    tot_l += float(loss.detach()) * frac
+                    tot_a += float(acc) * frac
                 n += 1
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
@@ -177,9 +211,15 @@ def main():
             step += 1
             if step % 50 == 0:
                 print(f"[step {step}/{total}] loss {tot_l / max(n, 1):.3f} acc1 {tot_a / max(n, 1):.3f} "
-                      f"lr {sched.get_last_lr()[0]:.2e} {(time.time() - t0) / step:.2f}s/step", flush=True)
+                      f"lr {sched.get_last_lr()[0]:.2e} {(time.time() - t0) / (step - s0):.2f}s/step "
+                      f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f}GiB", flush=True)
             if step % args.eval_every == 0:
                 print(f"[step {step}] val {evaluate()}", flush=True)
+        else:
+            epoch += 1
+            if args.save_epochs:
+                print(f"[epoch {epoch}] val {evaluate()}", flush=True)
+                save_ckpt(Path(args.out) / f"epoch{epoch}", epoch, step)
     print(f"[final] val {evaluate()}", flush=True)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

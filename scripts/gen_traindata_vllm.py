@@ -31,7 +31,7 @@ def build_prompts(args):
     from hspec.data import format_prompt
 
     tok = AutoTokenizer.from_pretrained(args.target)
-    prompts = training_prompts(args.n_gsm8k, args.n_alpaca)
+    prompts = training_prompts(args.n_gsm8k, args.n_alpaca, n_ultrachat=args.n_ultrachat)
     ids = [tok(format_prompt(tok, p), add_special_tokens=False)["input_ids"] for p in prompts]
     ids = [x for x in ids if len(x) <= args.max_prompt]
     torch.save({"target": args.target, "prompt_ids": ids}, args.file)
@@ -84,6 +84,7 @@ def main():
     a.add_argument("--target", default="Qwen/Qwen3-8B")
     a.add_argument("--n-gsm8k", type=int, default=7400)
     a.add_argument("--n-alpaca", type=int, default=15000)
+    a.add_argument("--n-ultrachat", type=int, default=0, help="UltraChat-200k first user turns")
     a.add_argument("--max-prompt", type=int, default=1024)
     a.add_argument("--file", required=True)
     g = sub.add_parser("gen")
