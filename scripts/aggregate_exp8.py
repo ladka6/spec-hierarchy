@@ -45,9 +45,10 @@ def main():
                      # same clock as tok/s: the record's ms scaled by the share of rounds before the cut
                      # (rounds = tokens / tau); ms_clean in the records is eager wall clock, not comparable
                      "tok/s_clean": (sum(r["tokens_clean"] for r in rs) /
-                                     (sum(r["ms"] * min(1.0, r["rounds_clean"] * r["tau"] / max(r["tokens"], 1))
+                                     (sum(r["ms"] * (min(1.0, r["rounds_clean"] * r["tau"] / r["tokens"])
+                                                     if r["tau"] > 0 and r["tokens"] > 0 else 1.0)
                                           for r in rs) / 1000)
-                                     if all("rounds_clean" in r and r.get("tau") for r in rs) else float("nan")),
+                                     if all("rounds_clean" in r and "tau" in r for r in rs) else float("nan")),
                      "rollbacks": mean(r.get("rollbacks", float("nan")) for r in rs),
                      "caught": mean(r.get("caught", float("nan")) for r in rs),
                      "forks": mean(r.get("forks", float("nan")) for r in rs),
