@@ -23,7 +23,13 @@ Methods (one shared protocol, each trained separately):
   spread  spread over all layers from 0 to the last
 Head: the drafter's missing taps (+ the final state, for the probe) = ridge(z_k) + MLP(z_k), z_k the branch output;
 taps of layers <= k are read from the branch's own intermediate states.
-Loss: --ce-w * drafter block CE (DFlash recipe, as exp108b dthru) + --mse-w * standardised MSE to the real states.
+Loss: --ce-w * drafter block CE (DFlash recipe, as exp108b dthru) + --mse-w * standardised MSE to the real states
+      + --kl-w * KL(target's next-token distribution || lm_head(predicted final state)) at the in-flight positions
+      (trains the fork resolver; 0 = off).
+--draft-rank r > 0: the drafter is no longer frozen for the trained methods: LoRA of rank r on all its linears,
+  trained with the same loss (the drafter learns to use the provisional rows). The table then also gives
+  "real adapted" = tau of the adapted drafter on REAL features; real / removed / share keep the original drafter
+  as reference, so shares stay comparable with the frozen-drafter rows.
 
 Reports per (k, method), exp107 / exp108 protocol on held-out sequences, frozen drafter:
   share   (tau - removed) / (real - removed) with the last m context positions from the branch
@@ -65,6 +71,48 @@ TRAINED = ("read", "lora", "copy")
 ATTN_LIN = ("q_proj", "k_proj", "v_proj", "o_proj")
 MLP_LIN = ("gate_proj", "up_proj", "down_proj")
 BF = torch.bfloat16
+
+
+class DLoRA(nn.Module):
+    """LoRA on one drafter linear, switched globally (off = the original drafter)."""
+
+    on = False
+
+    def __init__(self, base, rank):
+        super().__init__()
+        self.base = base
+        self.A = nn.Parameter(torch.empty(rank, base.in_features, device=base.weight.device))
+        self.B = nn.Parameter(torch.zeros(base.out_features, rank, device=base.weight.device))
+        self.reset()
+
+    def reset(self):
+        nn.init.normal_(self.A, std=1 / math.sqrt(self.base.in_features))
+        nn.init.zeros_(self.B)
+
+    @property
+    def weight(self):
+        return self.base.weight
+
+    @property
+    def bias(self):
+        return self.base.bias
+
+    def forward(self, x):
+        y = self.base(x)
+        if DLoRA.on:
+            y = y + ((x.float() @ self.A.T) @ self.B.T * 2.0).to(y.dtype)
+        return y
+
+
+def add_draft_lora(draft, rank, vocab):
+    mods = []
+    for parent in list(draft.modules()):
+        for nm, ch in list(parent.named_children()):
+            if isinstance(ch, nn.Linear) and ch.out_features < vocab:
+                w = DLoRA(ch, rank)
+                setattr(parent, nm, w)
+                mods.append(w)
+    return mods
 
 
 def rot(x, cos, sin):
@@ -184,6 +232,9 @@ def main():
     ap.add_argument("--rank", type=int, default=64)
     ap.add_argument("--ce-w", type=float, default=1.0)
     ap.add_argument("--mse-w", type=float, default=0.1)
+    ap.add_argument("--kl-w", type=float, default=0.0)
+    ap.add_argument("--draft-rank", type=int, default=0)
+    ap.add_argument("--lr-draft", type=float, default=1e-4)
     ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--blocks", type=int, default=8, help="anchors per sequence per step")
     ap.add_argument("--lr-head", type=float, default=1e-4)
@@ -222,6 +273,10 @@ def main():
     for p in list(target.parameters()) + list(draft.parameters()):
         p.requires_grad_(False)
     head = target.lm_head
+    dmods = add_draft_lora(draft, args.draft_rank, target.config.vocab_size) if args.draft_rank else []
+    if dmods:
+        print(f"[setup] drafter LoRA r{args.draft_rank} on {len(dmods)} linears, "
+              f"{sum(w.A.numel() + w.B.numel() for w in dmods) / 1e6:.1f}M", flush=True)
     lids, bs = list(draft.target_layer_ids), draft.block_size
     hidx = [l + 1 for l in lids]
     H, nT, L = target.config.hidden_size, len(lids), len(target.model.layers)
@@ -314,8 +369,11 @@ def main():
     for si, s in sorted(cand[: args.anchors]):
         by_seq.setdefault(si, []).append(s)
 
-    def run_block(fz, x, s, lag=0):
-        return blocks_logits(draft, target, fz, x, [(s, lag)], bs)[0].argmax(-1).tolist()
+    def run_block(fz, x, s, lag=0, adapted=False):
+        DLoRA.on = adapted
+        out = blocks_logits(draft, target, fz, x, [(s, lag)], bs)[0].argmax(-1).tolist()
+        DLoRA.on = False
+        return out
 
     def mean(v):
         return sum(v) / max(len(v), 1)
@@ -408,12 +466,12 @@ def main():
             T = len(ids)
             lo_s = max(lo, args.m_train + 1)
             if T - bs - 1 <= lo_s:
-                return None, None
+                return None, None, None
             ctx = seq_ctx(ids, branch)
             hs = ctx[0]
             feats = extract_context_feature(hs, lids)
             anchors = rng.sample(range(lo_s, T - bs - 1), min(n_blocks, T - bs - 1 - lo_s))
-            blocks, parts, mse = [], [], 0.0
+            blocks, parts, mse, kl = [], [], 0.0, torch.zeros((), device=dev)
             with torch.autocast("cuda", dtype=BF):
                 for s in anchors:
                     m = rng.randint(1, args.m_train) if train else args.m_train // 2
@@ -421,21 +479,31 @@ def main():
                     Yreal = torch.stack([(hs[tgt_layer(t)][0, s - m : s].float() - ym[q]) / ys[q]
                                          for q, t in enumerate(tk)], 1)
                     mse = mse + F.mse_loss(P, Yreal)
+                    if args.kl_w:
+                        lg = head((P[:, fin] * ys[fin] + ym[fin]).to(hs[-1].dtype)).float()
+                        tl = head(hs[-1][0, s - m : s]).float()
+                        kl = kl + F.kl_div(F.log_softmax(lg, -1), F.softmax(tl, -1), reduction="batchmean")
                     blocks.append((s, m))
                     parts.append(row.to(feats.dtype).view(1, m, nT * H))
                 cx, noise, posi, mask, starts = pack_sub(draft, target, feats, x, blocks, bs, parts)
+                DLoRA.on = bool(dmods)
                 hid = draft(target_hidden=cx, noise_embedding=noise, position_ids=posi, attention_mask=mask,
                             past_key_values=None, use_cache=False)[0]
+                DLoRA.on = False
                 ce, _ = _weighted_ce(draft, target, hid, x, blocks, starts, bs, T, args.gamma)
-            return ce, mse / len(blocks)
+            return ce, mse / len(blocks), kl / len(blocks)
 
         def train(name, branch, mlp):
             mods = nn.ModuleDict({"branch": branch, "mlp": mlp})
+            dpar = [p for w in dmods for p in (w.A, w.B)]
+            mods["draft"] = nn.ParameterList(dpar)
             lrb = args.lr_branch or (2e-4 if name == "lora" else 2e-5)
             groups = [{"params": list(mlp.parameters()), "base": args.lr_head}]
             bp = [p for p in branch.parameters() if p.requires_grad]
             if bp:
                 groups.append({"params": bp, "base": lrb})
+            if dpar:
+                groups.append({"params": dpar, "base": args.lr_draft})
             opt = torch.optim.AdamW(groups, lr=args.lr_head, weight_decay=0.01)
             params = [p for g in groups for p in g["params"]]
 
@@ -446,9 +514,9 @@ def main():
                 tot, n = 0.0, 0
                 with torch.no_grad():
                     for si in val_seqs:
-                        ce, _ = loss_fn(si, 4, branch, mlp, False)
+                        ce, _, kl = loss_fn(si, 4, branch, mlp, False)
                         if ce is not None:
-                            tot += ce.item()
+                            tot += ce.item() + args.kl_w * kl.item()
                             n += 1
                 rng.setstate(st)
                 mods.train()
@@ -464,18 +532,19 @@ def main():
                 for g in opt.param_groups:
                     g["lr"] = g["base"] * cosine_lr(step, args.steps, min(200, args.steps // 10))
                 for _ in range(10):
-                    ce, mse = loss_fn(rng.choice(fit_seqs), args.blocks, branch, mlp, True)
+                    ce, mse, kl = loss_fn(rng.choice(fit_seqs), args.blocks, branch, mlp, True)
                     if ce is not None:
                         break
-                loss = args.ce_w * ce + args.mse_w * mse
+                loss = args.ce_w * ce + args.mse_w * mse + args.kl_w * kl
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
                 opt.step()
                 if (step + 1) % args.eval_every == 0 or step + 1 == args.steps:
                     sc = scorer()
-                    log.append((step + 1, ce.item(), mse.item(), sc))
-                    print(f"[{name} k={k}] step {step + 1} ce {ce.item():.4f} mse {mse.item():.4f} val {sc:.4f} "
+                    log.append((step + 1, ce.item(), mse.item(), kl.item(), sc))
+                    print(f"[{name} k={k}] step {step + 1} ce {ce.item():.4f} mse {mse.item():.4f} "
+                          f"kl {kl.item():.4f} val {sc:.4f} "
                           f"{time.time() - t0:.0f}s", flush=True)
                     if sc > best_sc:
                         best_sc, best_state, bad = sc, snap(), 0
@@ -490,6 +559,7 @@ def main():
 
         @torch.no_grad()
         def evaluate(name, branch, mlp):
+            ad = bool(dmods) and name in TRAINED
             tau, probe, forks = {}, [], {}
             for n_done, (si, anchors) in enumerate(by_seq.items()):
                 ids, _lo = rest[si]
@@ -505,13 +575,17 @@ def main():
                         chain = run_block(feats[:, :s], x, s)
                         e = matched(chain, truth)
                         tau.setdefault("real", []).append(e + 1)
+                        if ad:
+                            tau.setdefault("real_ad", []).append(
+                                matched(run_block(feats[:, :s], x, s, adapted=True), truth) + 1)
                         for m in args.ms:
                             tau.setdefault(f"removed_m{m}", []).append(
                                 matched(run_block(feats[:, : s - m], x, s, m), truth) + 1)
                             row, P = inflight(ctx, s - m, s, branch, mlp)
                             fz = feats[:, :s].clone()
                             fz[0, s - m : s] = row.to(fz.dtype).view(m, nT * H)
-                            tau.setdefault(f"m{m}", []).append(matched(run_block(fz, x, s), truth) + 1)
+                            tau.setdefault(f"m{m}", []).append(
+                                matched(run_block(fz, x, s, adapted=ad), truth) + 1)
                             if m == M:
                                 top = head((P[:, fin] * ys[fin] + ym[fin]).to(hs[-1].dtype)).argmax(-1)
                                 probe.append((top == logits_real[s - m : s].argmax(-1)).float().cpu())
@@ -532,7 +606,7 @@ def main():
                           flush=True)
             real = mean(tau["real"])
             r = {"k": k, "method": name, "kv-map": args.kv_map if name in ("lora", "copy") else "own",
-                 "real": real}
+                 "real": real, "real adapted": mean(tau["real_ad"]) if ad else real}
             for m in args.ms:
                 rem = mean(tau[f"removed_m{m}"])
                 r[f"removed m{m}"] = rem
@@ -551,6 +625,8 @@ def main():
             branch = Branch(target, k, name if name in ("lora", "copy") else "read", args.rank,
                             kv_map("own", k, L) if own_map else gmap).to(dev)
             mlp = copy.deepcopy(zero_mlp if name == "ridge" else mlp0)
+            for w in dmods:
+                w.reset()
             if trained:
                 mlp.train()
                 train(name, branch, mlp)
