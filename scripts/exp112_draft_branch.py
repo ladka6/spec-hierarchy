@@ -26,6 +26,16 @@ taps of layers <= k are read from the branch's own intermediate states.
 Loss: --ce-w * drafter block CE (DFlash recipe, as exp108b dthru) + --mse-w * standardised MSE to the real states
       + --kl-w * KL(target's next-token distribution || lm_head(predicted final state)) at the in-flight positions
       (trains the fork resolver; 0 = off).
+--rank-w > 0: fork reranker (docs/method_fork_reranker.md, on the draft branch instead of a copy slice). The final
+  state only has to choose among the drafter's top --cands candidates: score = lm_head(final)[c] + alpha * log q(c),
+  trained with a listwise CE over the candidates at the in-flight positions (positions where the drafter's first
+  choice is wrong weighted by --fork-w; the others teach it not to raise false alarms).
+Fork columns of the table (one partial pass over the drafted block, first disagreement with the draft = fork):
+  cand recall   the target's token is among the drafter's candidates at its first error (ceiling)
+  2nd           it is the drafter's second choice (what a rule without target computation gets, location given)
+  rr top-1      reranker's choice is right at the first error (location given)
+  resolved      the first disagreement is exactly at the first error AND the choice is right (= c of the cost model)
+  false alarm   the reranker disagrees with a correct drafted token before the first error (all anchors)
 --draft-rank r > 0: the drafter is no longer frozen for the trained methods: LoRA of rank r on all its linears,
   trained with the same loss (the drafter learns to use the provisional rows). The table then also gives
   "real adapted" = tau of the adapted drafter on REAL features; real / removed / share keep the original drafter
@@ -233,6 +243,9 @@ def main():
     ap.add_argument("--ce-w", type=float, default=1.0)
     ap.add_argument("--mse-w", type=float, default=0.1)
     ap.add_argument("--kl-w", type=float, default=0.0)
+    ap.add_argument("--rank-w", type=float, default=0.0)
+    ap.add_argument("--cands", type=int, default=16)
+    ap.add_argument("--fork-w", type=float, default=3.0)
     ap.add_argument("--draft-rank", type=int, default=0)
     ap.add_argument("--lr-draft", type=float, default=1e-4)
     ap.add_argument("--steps", type=int, default=3000)
@@ -369,11 +382,21 @@ def main():
     for si, s in sorted(cand[: args.anchors]):
         by_seq.setdefault(si, []).append(s)
 
-    def run_block(fz, x, s, lag=0, adapted=False):
+    def block_lg(fz, x, s, lag=0, adapted=False):
         DLoRA.on = adapted
-        out = blocks_logits(draft, target, fz, x, [(s, lag)], bs)[0].argmax(-1).tolist()
+        out = blocks_logits(draft, target, fz, x, [(s, lag)], bs)[0]
         DLoRA.on = False
         return out
+
+    def run_block(fz, x, s, lag=0, adapted=False):
+        return block_lg(fz, x, s, lag, adapted).argmax(-1).tolist()
+
+    def rerank(mlp, fin_raw, dlog, dtype):
+        """scores [n, K] of the drafter's top-K candidates and the candidates [n, K] (drafter order)"""
+        lg = head(fin_raw.to(dtype)).float()
+        dlog = dlog.float()
+        cand = dlog.topk(args.cands, -1).indices
+        return lg.gather(1, cand) + mlp.alpha * F.log_softmax(dlog, -1).gather(1, cand), cand
 
     def mean(v):
         return sum(v) / max(len(v), 1)
@@ -471,7 +494,7 @@ def main():
             hs = ctx[0]
             feats = extract_context_feature(hs, lids)
             anchors = rng.sample(range(lo_s, T - bs - 1), min(n_blocks, T - bs - 1 - lo_s))
-            blocks, parts, mse, kl = [], [], 0.0, torch.zeros((), device=dev)
+            blocks, parts, fins, mse, kl = [], [], [], 0.0, torch.zeros((), device=dev)
             with torch.autocast("cuda", dtype=BF):
                 for s in anchors:
                     m = rng.randint(1, args.m_train) if train else args.m_train // 2
@@ -483,6 +506,7 @@ def main():
                         lg = head((P[:, fin] * ys[fin] + ym[fin]).to(hs[-1].dtype)).float()
                         tl = head(hs[-1][0, s - m : s]).float()
                         kl = kl + F.kl_div(F.log_softmax(lg, -1), F.softmax(tl, -1), reduction="batchmean")
+                    fins.append(P[:, fin] * ys[fin] + ym[fin])
                     blocks.append((s, m))
                     parts.append(row.to(feats.dtype).view(1, m, nT * H))
                 cx, noise, posi, mask, starts = pack_sub(draft, target, feats, x, blocks, bs, parts)
@@ -491,7 +515,25 @@ def main():
                             past_key_values=None, use_cache=False)[0]
                 DLoRA.on = False
                 ce, _ = _weighted_ce(draft, target, hid, x, blocks, starts, bs, T, args.gamma)
-            return ce, mse / len(blocks), kl / len(blocks)
+                aux = args.kl_w * kl / len(blocks)
+                if args.rank_w:
+                    # the drafter's candidates for the tokens after the in-flight positions: the block it drafts
+                    # from the last verified position s - m with real features (original drafter, no gradient)
+                    with torch.no_grad():
+                        DL = blocks_logits(draft, target, feats, x, [(s - m, 0) for s, m in blocks], bs)
+                    rk = 0.0
+                    for b, (s, m) in enumerate(blocks):
+                        nv = min(m, bs - 1)
+                        sc, cand = rerank(mlp, fins[b][:nv], DL[b, :nv], hs[-1].dtype)
+                        tgt = x[s - m + 1 : s - m + 1 + nv]
+                        hit = cand == tgt[:, None]
+                        has = hit.any(1)
+                        if has.any():
+                            w = torch.where(cand[:, 0] != tgt, args.fork_w, 1.0)[has]
+                            l = F.cross_entropy(sc[has], hit.float().argmax(1)[has], reduction="none")
+                            rk = rk + (l * w).sum() / w.sum()
+                    aux = aux + args.rank_w * rk / len(blocks)
+            return ce, mse / len(blocks), aux
 
         def train(name, branch, mlp):
             mods = nn.ModuleDict({"branch": branch, "mlp": mlp})
@@ -516,7 +558,7 @@ def main():
                     for si in val_seqs:
                         ce, _, kl = loss_fn(si, 4, branch, mlp, False)
                         if ce is not None:
-                            tot += ce.item() + args.kl_w * kl.item()
+                            tot += ce.item() + kl.item()
                             n += 1
                 rng.setstate(st)
                 mods.train()
@@ -535,7 +577,7 @@ def main():
                     ce, mse, kl = loss_fn(rng.choice(fit_seqs), args.blocks, branch, mlp, True)
                     if ce is not None:
                         break
-                loss = args.ce_w * ce + args.mse_w * mse + args.kl_w * kl
+                loss = args.ce_w * ce + args.mse_w * mse + kl
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -544,7 +586,7 @@ def main():
                     sc = scorer()
                     log.append((step + 1, ce.item(), mse.item(), kl.item(), sc))
                     print(f"[{name} k={k}] step {step + 1} ce {ce.item():.4f} mse {mse.item():.4f} "
-                          f"kl {kl.item():.4f} val {sc:.4f} "
+                          f"aux {kl.item():.4f} val {sc:.4f} "
                           f"{time.time() - t0:.0f}s", flush=True)
                     if sc > best_sc:
                         best_sc, best_state, bad = sc, snap(), 0
@@ -561,6 +603,7 @@ def main():
         def evaluate(name, branch, mlp):
             ad = bool(dmods) and name in TRAINED
             tau, probe, forks = {}, [], {}
+            fk = {n: 0 for n in ("err", "clean", "recall", "second", "rr1", "resolved", "fa")}
             for n_done, (si, anchors) in enumerate(by_seq.items()):
                 ids, _lo = rest[si]
                 x = ids.to(dev)
@@ -572,7 +615,8 @@ def main():
                 with torch.autocast("cuda", dtype=BF):
                     for s in anchors:
                         truth = truth_all[s + 1 :]
-                        chain = run_block(feats[:, :s], x, s)
+                        Lr = block_lg(feats[:, :s], x, s)
+                        chain = Lr.argmax(-1).tolist()
                         e = matched(chain, truth)
                         tau.setdefault("real", []).append(e + 1)
                         if ad:
@@ -589,12 +633,30 @@ def main():
                             if m == M:
                                 top = head((P[:, fin] * ys[fin] + ym[fin]).to(hs[-1].dtype)).argmax(-1)
                                 probe.append((top == logits_real[s - m : s].argmax(-1)).float().cpu())
+                        # one partial pass over the drafted block up to its first error (drafted = true tokens
+                        # there): the reranker's first disagreement with the draft is the fork
+                        last = min(e, len(chain) - 1)
+                        _row, P = inflight(ctx, s, s + last + 1, branch, mlp)
+                        fraw = P[:, fin] * ys[fin] + ym[fin]
+                        sc, cand = rerank(mlp, fraw, Lr[: last + 1], hs[-1].dtype)
+                        pick = cand.gather(1, sc.argmax(1, keepdim=True))[:, 0].tolist()
+                        dis = [i for i in range(last + 1) if pick[i] != chain[i]]
+                        j = dis[0] if dis else -1
+                        if e < len(chain):
+                            fk["err"] += 1
+                            fk["recall"] += truth[e] in cand[e].tolist()
+                            fk["second"] += int(cand[e, 1]) == truth[e]
+                            fk["rr1"] += pick[e] == truth[e]
+                            fk["resolved"] += j == e and pick[e] == truth[e]
+                            fk["fa"] += 0 <= j < e
+                        else:
+                            fk["clean"] += 1
+                            fk["fa"] += j >= 0
                         if e < len(chain):
                             p = s + e
                             pr = torch.softmax(logits_real[p], -1).topk(2).values
                             tie = "near-tie" if (pr[0] - pr[1]).item() < args.tie else "clear"
-                            _row, P = inflight(ctx, s, p + 1, branch, mlp)
-                            top = head((P[-1:, fin] * ys[fin] + ym[fin]).to(hs[-1].dtype)).float()[0].topk(3)
+                            top = head(fraw[-1:].to(hs[-1].dtype)).float()[0].topk(3)
                             top = top.indices.tolist()
                             f = forks.setdefault(tie, [0, 0, 0])
                             f[0] += top[0] == truth_all[p + 1]
@@ -615,6 +677,10 @@ def main():
             r["t+1 top-1"] = torch.cat(probe).mean().item()
             c = forks.get("clear", [0, 0, 0])
             r["fork top-1"], r["fork top-3"], r["forks"] = c[0] / max(c[2], 1), c[1] / max(c[2], 1), c[2]
+            ne = max(fk["err"], 1)
+            r["cand recall"], r["2nd"], r["rr top-1"] = fk["recall"] / ne, fk["second"] / ne, fk["rr1"] / ne
+            r["resolved"], r["false alarm"] = fk["resolved"] / ne, fk["fa"] / max(fk["err"] + fk["clean"], 1)
+            r["alpha"] = float(mlp.alpha)
             rows_out.append(r)
             print_table([r], list(r), f"k={k} {name}")
 
@@ -625,6 +691,7 @@ def main():
             branch = Branch(target, k, name if name in ("lora", "copy") else "read", args.rank,
                             kv_map("own", k, L) if own_map else gmap).to(dev)
             mlp = copy.deepcopy(zero_mlp if name == "ridge" else mlp0)
+            mlp.alpha = nn.Parameter(torch.ones((), device=dev))
             for w in dmods:
                 w.reset()
             if trained:
