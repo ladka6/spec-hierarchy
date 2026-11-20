@@ -36,6 +36,13 @@ Fork columns of the table (one partial pass over the drafted block, first disagr
   rr top-1      reranker's choice is right at the first error (location given)
   resolved      the first disagreement is exactly at the first error AND the choice is right (= c of the cost model)
   false alarm   the reranker disagrees with a correct drafted token before the first error (all anchors)
+Chain of two blocks (second table; no fork head): the drafter drafts block 1 from real features, a cut point j is
+  chosen from the drafter's OWN confidence (first position with max-probability < --cut-thr; "oracle" = the first
+  error), the branch runs over the j kept tokens, and the drafter redrafts from the cut with the branch's features
+  for them. The fork token is the first token of the redraft. Per rule: where the cut falls relative to the first
+  error (late = after it, the redraft is wasted; early = correct tokens redrafted), and the accepted drafted tokens
+  of the two-block chain with the branch's features, with real features at the kept tokens (upper bound) and with
+  no features for them (tokens only). "fix" (oracle rule) = the redraft's first token is right at the first error.
 --draft-rank r > 0: the drafter is no longer frozen for the trained methods: LoRA of rank r on all its linears,
   trained with the same loss (the drafter learns to use the provisional rows). The table then also gives
   "real adapted" = tau of the adapted drafter on REAL features; real / removed / share keep the original drafter
@@ -245,6 +252,7 @@ def main():
     ap.add_argument("--kl-w", type=float, default=0.0)
     ap.add_argument("--rank-w", type=float, default=0.0)
     ap.add_argument("--cands", type=int, default=16)
+    ap.add_argument("--cut-thr", type=float, nargs="+", default=[0.5, 0.7, 0.9])
     ap.add_argument("--fork-w", type=float, default=3.0)
     ap.add_argument("--draft-rank", type=int, default=0)
     ap.add_argument("--lr-draft", type=float, default=1e-4)
@@ -401,7 +409,7 @@ def main():
     def mean(v):
         return sum(v) / max(len(v), 1)
 
-    rows_out, train_log = [], {}
+    rows_out, chain_rows, train_log = [], [], {}
     for k in args.exits:
         sel = torch.tensor([tpos[t] for t in tgts[k]])
         xm, xs = xstat[k]
@@ -604,6 +612,9 @@ def main():
             ad = bool(dmods) and name in TRAINED
             tau, probe, forks = {}, [], {}
             fk = {n: 0 for n in ("err", "clean", "recall", "second", "rr1", "resolved", "fa")}
+            rules = [f"conf<{t:g}" for t in args.cut_thr] + ["oracle"]
+            ch = {r: {n: [] for n in ("late", "exact", "j0", "lost", "one", "branch", "real", "none",
+                                      "fixb", "fixr", "fixn")} for r in rules}
             for n_done, (si, anchors) in enumerate(by_seq.items()):
                 ids, _lo = rest[si]
                 x = ids.to(dev)
@@ -652,6 +663,47 @@ def main():
                         else:
                             fk["clean"] += 1
                             fk["fa"] += j >= 0
+                        if s + 2 * bs < len(ids):
+                            conf = torch.softmax(Lr.float(), -1).max(-1).values.tolist()
+                            done = {}
+
+                            def second(j):
+                                """accepted tokens of the redraft from the cut s + j (j kept tokens, all correct):
+                                branch features / real features / no features for the kept tokens"""
+                                if j not in done:
+                                    a2 = s + j
+                                    tr = truth_all[a2 + 1 :]
+                                    row, _ = inflight(ctx, s, a2, branch, mlp)
+                                    fz = torch.cat([feats[:, :s], row.to(feats.dtype).view(1, j, nT * H)], 1)
+                                    done[j] = (matched(run_block(fz, x, a2, adapted=ad), tr),
+                                               matched(run_block(feats[:, :a2], x, a2), tr),
+                                               matched(run_block(feats[:, :s], x, a2, j), tr))
+                                return done[j]
+
+                            for rule in rules:
+                                if rule == "oracle":
+                                    j = e
+                                else:
+                                    low = [i for i, c in enumerate(conf) if c < float(rule[5:])]
+                                    j = low[0] if low else len(chain)
+                                c = ch[rule]
+                                c["one"].append(e)
+                                c["late"].append(j > e)
+                                c["exact"].append(j == e)
+                                c["j0"].append(j == 0)
+                                if j > e or j == 0:              # redraft wasted / nothing new to condition on
+                                    for n in ("branch", "real", "none"):
+                                        c[n].append(e)
+                                    continue
+                                c["lost"].append(e - j)
+                                b, r_, n_ = second(j)
+                                c["branch"].append(j + b)
+                                c["real"].append(j + r_)
+                                c["none"].append(j + n_)
+                                if rule == "oracle" and e < len(chain):
+                                    c["fixb"].append(b >= 1)
+                                    c["fixr"].append(r_ >= 1)
+                                    c["fixn"].append(n_ >= 1)
                         if e < len(chain):
                             p = s + e
                             pr = torch.softmax(logits_real[p], -1).topk(2).values
@@ -683,6 +735,17 @@ def main():
             r["alpha"] = float(mlp.alpha)
             rows_out.append(r)
             print_table([r], list(r), f"k={k} {name}")
+            crow = []
+            for rule in rules:
+                c = ch[rule]
+                crow.append({"k": k, "method": name, "cut": rule, "anchors": len(c["one"]),
+                             "late": mean(c["late"]), "exact": mean(c["exact"]), "cut at 0": mean(c["j0"]),
+                             "early lost": mean(c["lost"]), "one block": mean(c["one"]),
+                             "2 blocks branch": mean(c["branch"]), "2 blocks real": mean(c["real"]),
+                             "2 blocks no feat": mean(c["none"]), "fix branch": mean(c["fixb"]),
+                             "fix real": mean(c["fixr"]), "fix no feat": mean(c["fixn"])})
+            chain_rows.extend(crow)
+            print_table(crow, list(crow[0]), f"k={k} {name}: chain of two blocks (accepted drafted tokens)")
 
         for name in args.methods:
             torch.cuda.empty_cache()
@@ -704,7 +767,8 @@ def main():
         print(f"[k={k}] done, {time.time() - t0:.0f}s", flush=True)
 
     print_table(rows_out, list(rows_out[0]), "Share of real, probe and forks (frozen drafter, held-out anchors)")
-    save_json(args.save, {"args": vars(args), "rows": rows_out, "train_log": train_log})
+    print_table(chain_rows, list(chain_rows[0]), "Chain of two blocks: cut from the drafter's confidence, redraft")
+    save_json(args.save, {"args": vars(args), "rows": rows_out, "chain": chain_rows, "train_log": train_log})
     print(f"[done] {time.time() - t0:.0f}s", flush=True)
 
 
