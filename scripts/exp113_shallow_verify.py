@@ -43,6 +43,9 @@ Table 2, chain of two blocks in accepted drafted tokens (the redraft starts afte
                "real" = redraft with real features for the in-flight tokens (isolates the decision),
                "none" = redraft without features for them (tokens only)
   ideal        an exact verify between the blocks (f = 1), same two feature settings
+Table 3, operating points of the cand readout: it disagrees with the drafted token only if its best candidate's
+  score is more than --margins above the drafted token's (0 = plain argmax). Trades false alarms against missed
+  errors; f, false alarm, missed and the two-block chain per margin (no selection, the whole curve is reported).
 
   python scripts/exp113_shallow_verify.py --target Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16 \
       --data /scratch-shared/$USER/hspec_lagft/data --shapes first skip sandwich attn --budgets 4 8
@@ -226,6 +229,8 @@ def main():
     ap.add_argument("--rank-w", type=float, default=1.0)
     ap.add_argument("--cands", type=int, default=16)
     ap.add_argument("--fork-w", type=float, default=3.0)
+    ap.add_argument("--margins", type=float, nargs="+", default=[0.0, 0.5, 1.0, 2.0, 3.0, 5.0],
+                    help="cand readout: disagree with the draft only if the best candidate beats it by this much")
     ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--blocks", type=int, default=8, help="anchors per sequence per step")
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -470,6 +475,7 @@ def main():
         st = {r: {n: 0 for n in ("res", "fa", "wrong", "miss")} for r in ("open", "cand")}
         ch = {n: [] for n in ("one", "open_real", "open_none", "cand_real", "cand_none", "ideal_real", "ideal_none")}
         n_err = n_all = recall = second = pick_ok = 0
+        op = {t: {"res": 0, "fa": 0, "miss": 0, "real": [], "none": []} for t in args.margins}
         for n_done, (si, anchors) in enumerate(by_seq.items()):
             ids, _lo = rest[si]
             x = ids.to(dev)
@@ -502,6 +508,18 @@ def main():
                         st[r]["wrong"] += err and j == e and pick[e] != truth[e]
                         st[r]["miss"] += err and j == -1
                         two[r] = (fa, res, j)
+                    gap = (sc.max(1).values - sc[:, 0]).tolist()        # candidate 0 = the drafted token
+                    for t, o in op.items():
+                        dis = [i for i in range(last + 1) if gap[i] > t]
+                        j = dis[0] if dis else -1
+                        fa = 0 <= j < e if err else j >= 0
+                        res = err and j == e and picks["cand"][e] == truth[e]
+                        o["fa"] += fa
+                        o["res"] += res
+                        o["miss"] += err and j == -1
+                        if s + 2 * bs < len(ids):
+                            o["real"].append(j if fa else e + 1 + red[0] if res else e)
+                            o["none"].append(j if fa else e + 1 + red[1] if res else e)
                     if err:
                         n_err += 1
                         recall += truth[e] in cand[e].tolist()
@@ -537,11 +555,15 @@ def main():
                     "ideal real": mean(ch["ideal_real"]),
                     "2 blk open none": mean(ch["open_none"]), "2 blk cand none": mean(ch["cand_none"]),
                     "ideal none": mean(ch["ideal_none"])})
+        ops = [{**row, "margin": t, "f": o["res"] / ne, "false alarm": o["fa"] / max(n_all, 1),
+                "missed": o["miss"] / ne, "one block": mean(ch["one"]), "2 blk real": mean(o["real"]),
+                "2 blk none": mean(o["none"]), "ideal real": mean(ch["ideal_real"])} for t, o in op.items()]
         print_table([dec], list(dec), "decision")
         print_table([chn], list(chn), "chain of two blocks (accepted drafted tokens)")
-        return dec, chn
+        print_table(ops, list(ops[0]), "cand readout by margin")
+        return dec, chn, ops
 
-    dec_rows, chain_rows, train_log = [], [], {}
+    dec_rows, chain_rows, op_rows, train_log = [], [], [], {}
     for n in args.budgets:
         for shape in args.shapes:
             torch.cuda.empty_cache()
@@ -557,21 +579,25 @@ def main():
             fit_affine(sub)
             sub.eval()
             if "fit" in args.methods and shape != "attn":
-                d, c = evaluate({**row, "method": "fit"}, sub)
+                d, c, o = evaluate({**row, "method": "fit"}, sub)
                 dec_rows.append(d)
                 chain_rows.append(c)
+                op_rows.extend(o)
             if "train" in args.methods:
                 tag = f"{shape} n={n}"
                 sub.train()
                 train_log[f"{shape}_n{n}"] = train(tag, sub)
-                d, c = evaluate({**row, "method": "train" + (f"+lora{args.rank}" if args.rank else "")}, sub)
+                d, c, o = evaluate({**row, "method": "train" + (f"+lora{args.rank}" if args.rank else "")}, sub)
                 dec_rows.append(d)
                 chain_rows.append(c)
+                op_rows.extend(o)
             del sub
 
     print_table(dec_rows, list(dec_rows[0]), "Shallow verify: decision at the drafter's first error (held-out anchors)")
     print_table(chain_rows, list(chain_rows[0]), "Shallow verify: chain of two blocks (accepted drafted tokens)")
-    save_json(args.save, {"args": vars(args), "decision": dec_rows, "chain": chain_rows, "train_log": train_log})
+    print_table(op_rows, list(op_rows[0]), "Shallow verify: cand readout by margin (false alarms against missed errors)")
+    save_json(args.save, {"args": vars(args), "decision": dec_rows, "chain": chain_rows, "margins": op_rows,
+                          "train_log": train_log})
     print(f"[done] {time.time() - t0:.0f}s", flush=True)
 
 
