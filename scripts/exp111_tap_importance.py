@@ -72,7 +72,10 @@ def main():
     target = load_target(args.target, dev)
     draft = load_draft(args.draft, dev)
     lids, bs = list(draft.target_layer_ids), draft.block_size
-    H, nT = target.config.hidden_size, len(lids)
+    # width of the residual stream; multimodal configs (Gemma 4) keep it in a nested text config
+    H = next((getattr(c, "hidden_size") for c in (target.config, getattr(target.config, "text_config", None))
+              if c is not None and hasattr(c, "hidden_size")), None) or target.get_input_embeddings().weight.shape[-1]
+    nT = len(lids)
     M = max(args.ms)
     names = [f"L{l}" for l in lids]
 
