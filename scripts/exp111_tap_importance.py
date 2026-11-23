@@ -9,9 +9,10 @@ Ablation = replace by the tap's dataset mean (mean ablation; zeros are off-distr
   m8, m32  only at the last m positions before the anchor: how much it needs the layer for the most recent tokens
            (the in-flight situation between verifications; 8 ~ one block, 32 ~ three)
 Per tap: drop (only this tap ablated) and keep (only this tap real, all others ablated).
-Groups: early1 = only tap L1 real (what a partial pass of k <= 8 layers gives exactly), early2 = taps L1 + L8 real
-(k >= 9), deep = only the three deep taps ablated (= early2). Reference rows: real, and removed (the last m positions
-have tokens but no features at all, the "features off" lower bound).
+Groups: "first j" = only the j shallowest taps real (what a partial pass up to that tap's layer gives exactly: the
+depth curve of an early-exit style pass), "last j" = only the j deepest taps real. Reference rows: real, and removed
+(the last m positions have tokens but no features at all, the "features off" lower bound).
+--ms 1 2 4 8 16 32 gives the recency curve (how many of the most recent positions the drafter needs features for).
 
 Also: each tap's share of the drafter's fused input, ||W_fc[:, tap] x_tap|| / sum over taps, averaged over positions.
 
@@ -103,7 +104,7 @@ def main():
     conds = [("real", None, "all")] + [("removed", None, f"m{m}") for m in args.ms]
     for sc in scopes:
         conds += [("drop", t, sc) for t in range(nT)] + [("keep", t, sc) for t in range(nT)]
-        conds += [("early1", None, sc), ("early2", None, sc)]
+        conds += [(f"first{j}", None, sc) for j in range(2, nT)] + [(f"last{j}", None, sc) for j in range(2, nT)]
     res = {c: [] for c in conds}
 
     def ablated(feats, s, sc, real_taps):
@@ -131,7 +132,14 @@ def main():
                     m = int(sc[1:])
                     L = blocks_logits(draft, target, feats[:, : s - m], x, [(s, m)], bs)[0]
                 else:
-                    real_taps = {"drop": set(range(nT)) - {t}, "keep": {t}, "early1": {0}, "early2": {0, 1}}[kind]
+                    if kind == "drop":
+                        real_taps = set(range(nT)) - {t}
+                    elif kind == "keep":
+                        real_taps = {t}
+                    elif kind.startswith("first"):
+                        real_taps = set(range(int(kind[5:])))
+                    else:
+                        real_taps = set(range(nT - int(kind[4:]), nT))
                     L = blocks_logits(draft, target, ablated(feats, s, sc, real_taps), x, [(s, 0)], bs)[0]
                 res[cd].append(matched(L.argmax(-1).tolist(), truth) + 1)
         if n_done % 20 == 0:
@@ -151,11 +159,12 @@ def main():
             r[f"drop_{sc}"] = mean(res[("drop", t, sc)])
             r[f"keep_{sc}"] = mean(res[("keep", t, sc)])
         rows.append(r)
-    for kind, label in (("early1", "early: L1 only"), ("early2", "early: L1+L8")):
-        r = {"tap": label}
-        for sc in scopes:
-            r[f"keep_{sc}"] = mean(res[(kind, None, sc)])
-        rows.append(r)
+    for j in range(2, nT):
+        for kind, label in ((f"first{j}", "first: " + "+".join(names[:j])), (f"last{j}", "last: " + "+".join(names[-j:]))):
+            r = {"tap": label}
+            for sc in scopes:
+                r[f"keep_{sc}"] = mean(res[(kind, None, sc)])
+            rows.append(r)
     r = {"tap": "removed (no features)"}
     for m in args.ms:
         r[f"keep_m{m}"] = mean(res[("removed", None, f"m{m}")])
