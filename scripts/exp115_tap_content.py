@@ -17,6 +17,12 @@ j = 1 is the usual "which layer knows the next token" (tuned-lens style); j >= 2
 from the anchor. Layers: the embedding (0), the drafter's taps, a grid over the second half of the depth, the last.
 Maps are fitted on --fit-seqs sequences and scored on held-out ones (target-greedy text, response positions only).
 
+--past: the same readout BACKWARDS. The drafter never sees the context tokens, only these features, so a feature
+also has to say what is at the position and just before it. Offsets are then k = 0, 1, 2, ... tokens back: a ridge
+map from the state of layer l at position p to the INPUT EMBEDDING of token p - k, read out as the nearest token
+by cosine over the input embedding matrix (top-1 / top-5), plus the cosine to the true embedding. If the last layers
+drop this while the layers before them still hold it, a tap at 3/4 depth is the one place that has both.
+
   python scripts/exp115_tap_content.py --target Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16 \
       --data /scratch-shared/$USER/hspec_taps/qwen3_8b
 """
@@ -44,7 +50,8 @@ def main():
     ap.add_argument("--target", required=True)
     ap.add_argument("--draft", default="", help="only to mark its tap layers")
     ap.add_argument("--data", required=True, help="directory with shard*.pt (ids, n_prompt), target-greedy")
-    ap.add_argument("--offsets", nargs="+", type=int, default=[1, 2, 3, 4, 8, 12])
+    ap.add_argument("--past", action="store_true", help="read tokens p - k (offsets = k) instead of p + j")
+    ap.add_argument("--offsets", nargs="+", type=int, default=None, help="default 1 2 3 4 8 12, with --past 0 1 2 4 8")
     ap.add_argument("--fracs", nargs="+", type=float, default=[0.5, 0.6, 0.7, 0.8, 0.9])
     ap.add_argument("--fit-seqs", type=int, default=350)
     ap.add_argument("--eval-seqs", type=int, default=120)
@@ -54,13 +61,14 @@ def main():
     ap.add_argument("--save", default="exp115_tap_content")
     args = ap.parse_args()
     dev, t0 = "cuda", time.time()
-    J = sorted(args.offsets)
+    J = sorted(args.offsets or ([0, 1, 2, 4, 8] if args.past else [1, 2, 3, 4, 8, 12]))
+    K = max(J) if args.past else 0                           # rows start K positions into the response
 
     recs = []
     for f in sorted(Path(args.data).expanduser().glob("shard*.pt")):
         recs += torch.load(f)
     seqs = [(d["ids"].long()[: args.max_len], int(d["n_prompt"])) for d in recs]
-    seqs = [(ids, lo) for ids, lo in seqs if len(ids) - lo >= args.min_resp]
+    seqs = [(ids, lo + K) for ids, lo in seqs if len(ids) - lo - K >= args.min_resp]
     assert len(seqs) >= 30, f"only {len(seqs)} usable sequences in {args.data}"
     random.Random(0).shuffle(seqs)
     n_eval = min(args.eval_seqs, len(seqs) // 3)
@@ -75,6 +83,21 @@ def main():
     target = load_target(args.target, dev)
     head = target.get_output_embeddings()
     hdt = head.weight.dtype
+    En = None
+    if args.past:                                            # unit-norm input embeddings, for the nearest token
+        E = target.get_input_embeddings().weight
+        nrm = torch.cat([E[i : i + 65536].float().norm(dim=-1) for i in range(0, E.shape[0], 65536)])
+        En = E / nrm.clamp_min(1e-6)[:, None].to(E.dtype)
+        del nrm
+
+    def target_rows(hs, lo, T, j, n):
+        """regression target for offset j over the first n rows (positions lo .. lo + n - 1)"""
+        if args.past:
+            return hs[0][0, lo - j : lo - j + n].float()     # embedding of token p - j
+        return hs[L][0, lo + j - 1 : lo + j - 1 + n].float() # final state whose output is token p + j
+
+    def n_rows_of(lo, T, j):
+        return T - 1 - lo if args.past else T - j - lo
 
     def states(ids):
         return target(ids[None].to(dev), output_hidden_states=True, use_cache=False).hidden_states
@@ -98,7 +121,6 @@ def main():
     for i, (ids, lo) in enumerate(fit):
         hs = states(ids)
         T = len(ids)
-        fin = hs[L][0].float()
         for l in layers:
             xa = rows(hs[l], lo, T).double()
             w = torch.rsqrt(xa[:, :H].pow(2).mean(-1, keepdim=True) + 1e-6)
@@ -106,9 +128,9 @@ def main():
             xtx[l] += xa.T @ xa
             xa32, w32 = xa.float(), w.float()
             for j in J:
-                n = T - j - lo                               # positions p = lo .. T-1-j
+                n = n_rows_of(lo, T, j)
                 if n > 0:
-                    xty[(l, j)] += xa32[:n].T @ (fin[lo + j - 1 : T - 1] * w32[:n])
+                    xty[(l, j)] += xa32[:n].T @ (target_rows(hs, lo, T, j, n) * w32[:n])
         n_rows += T - 1 - lo
         del hs
         if i % 50 == 0:
@@ -128,24 +150,29 @@ def main():
         hs = states(ids)
         T = len(ids)
         x = ids.to(dev)
-        fin = hs[L][0].float()
         for l in layers:
             xa = rows(hs[l], lo, T).float()
             for j in J:
-                n = T - j - lo
+                n = n_rows_of(lo, T, j)
                 if n <= 0:
                     continue
                 pred = xa[:n] @ W[(l, j)]
-                top = head(pred.to(hdt)).topk(5, -1).indices
-                tgt = x[lo + j : lo + j + n]
+                if args.past:
+                    top = (F.normalize(pred, dim=-1).to(En.dtype) @ En.T).topk(5, -1).indices
+                    tgt = x[lo - j : lo - j + n]
+                else:
+                    top = head(pred.to(hdt)).topk(5, -1).indices
+                    tgt = x[lo + j : lo + j + n]
                 s = st[(l, j)]
                 s[0] += (top[:, 0] == tgt).sum().item()
                 s[1] += (top == tgt[:, None]).any(1).sum().item()
-                s[2] += F.cosine_similarity(pred, fin[lo + j - 1 : T - 1], dim=-1).sum().item()
+                s[2] += F.cosine_similarity(pred, target_rows(hs, lo, T, j, n), dim=-1).sum().item()
                 s[3] += n
         del hs
         if i % 40 == 0:
             print(f"[eval] {i}/{len(ev)} sequences, {time.time() - t0:.0f}s", flush=True)
+
+    sign = "-" if args.past else "+"
 
     def table(k, title):
         out = []
@@ -153,17 +180,19 @@ def main():
             r = {"layer": l, "depth": l / L, "tap": "tap" if l in taps else ""}
             for j in J:
                 s = st[(l, j)]
-                r[f"+{j}"] = s[k] / max(s[3], 1)
+                r[f"{sign}{j}"] = s[k] / max(s[3], 1)
             out.append(r)
         print_table(out, list(out[0]), title)
         return out
 
-    print(f"\n{args.target}: token p + j read from the state of layer l at position p "
-          f"(held-out, {st[(layers[0], J[0])][3]} positions at +{J[0]})")
-    t1 = table(0, "top-1 of the target's token at p + j")
-    t5 = table(1, "top-5 of the target's token at p + j")
-    cs = table(2, "cosine to the true final state at p + j - 1")
-    best = {f"+{j}": max(layers, key=lambda l: st[(l, j)][0] / max(st[(l, j)][3], 1)) for j in J}
+    what = "p - k" if args.past else "p + j"
+    print(f"\n{args.target}: token {what} read from the state of layer l at position p "
+          f"(held-out, {st[(layers[0], J[0])][3]} positions at {sign}{J[0]})")
+    t1 = table(0, f"top-1 of the token at {what}")
+    t5 = table(1, f"top-5 of the token at {what}")
+    cs = table(2, "cosine to the true input embedding of that token" if args.past
+               else "cosine to the true final state at p + j - 1")
+    best = {f"{sign}{j}": max(layers, key=lambda l: st[(l, j)][0] / max(st[(l, j)][3], 1)) for j in J}
     print("\nbest layer per offset (top-1): " + ", ".join(f"{k}: layer {v} ({v / L:.0%})" for k, v in best.items()))
     save_json(args.save, {"args": vars(args), "layers": layers, "taps": taps, "n_layers": L, "top1": t1, "top5": t5,
                           "cos": cs, "best": best})
