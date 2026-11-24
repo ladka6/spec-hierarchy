@@ -23,6 +23,15 @@ cheap method can know its choice; where it is sure, the error is the drafter's a
      draft + lens        first draft's log-probabilities + the lens', wrong token excluded (no redraft needed)
      three looks         first draft + redraft + lens (per feature condition)
 
+5. Look ahead. A wrong token at the cut should make what FOLLOWS it harder to draft. For each of the redraft's
+   first --look-k candidates (wrong token excluded) the drafter drafts the continuation with that candidate as
+   anchor, all candidates in one batched call in deployment; the candidate is scored by the confidence of its own
+   continuation, S = sum_k prod_{i<=k} maxprob_i (the expected accepted length under the drafter's own confidence).
+     look         the candidate with the largest S
+     prior x look the candidate with the largest p(candidate) * S
+   Only ONE chain goes to the verify pass (this is not a tree); the chosen candidate's continuation is already
+   drafted. The chain table has the resulting accepted length.
+
 Feature conditions for the redraft (the cut's anchor is the last kept token, s + e):
   real   real target features for the kept tokens (what an exact feature source would give)
   none   no features for the kept tokens, their tokens only (the lag input)
@@ -62,7 +71,8 @@ from exp107_lift_diag import load_seqs  # noqa: E402
 from hspec.models import load_draft, load_target  # noqa: E402
 from hspec.utils import print_table, save_json  # noqa: E402
 
-KEYS = ("fix", "repeat", "masked", "top-2", "top-3", "top-5", "m top-2", "m top-3", "two looks", "three looks",
+KEYS = ("fix", "repeat", "masked", "look", "prior x look", "top-2", "top-3", "top-5", "m top-2", "m top-3",
+        "two looks", "three looks",
         "draft 2nd", "draft top-3", "draft top-5")
 LKEYS = ("lens", "raw lens", "lens cand", "draft + lens", "draft 2nd")
 BINS = (("sure >= 0.9", 0.9, 1.01), ("0.5 - 0.9", 0.5, 0.9), ("unsure < 0.5", 0.0, 0.5))
@@ -77,6 +87,7 @@ def main():
     ap.add_argument("--cache", default="")
     ap.add_argument("--anchors", type=int, default=2000)
     ap.add_argument("--cands", type=int, default=16)
+    ap.add_argument("--look-k", type=int, default=3)
     ap.add_argument("--lens-depth", type=float, default=0.75, help="the drafter's tap nearest to this depth")
     ap.add_argument("--lens-seqs", type=int, default=150, help="training sequences for the affine map")
     ap.add_argument("--ridge", type=float, default=1e-3)
@@ -143,10 +154,12 @@ def main():
     cnt = {(c, sub): {k: 0 for k in KEYS} for c in conds for sub in ("all errors", "e > 0")}
     n_sub = {"all errors": 0, "e > 0": 0}
     lcnt = {sub: {k: 0 for k in LKEYS} for sub in ("all errors", "e > 0")}
-    binc = {b[0]: {k: 0 for k in ("n", "fix", "masked", "m top-3", "two looks", "three looks", "draft 2nd",
+    binc = {b[0]: {k: 0 for k in ("n", "fix", "masked", "look", "prior x look", "m top-3", "two looks", "three looks",
+                                  "draft 2nd",
                                   "lens cand", "draft + lens")} for b in BINS}
-    ch = {k: [] for k in ("one block", "plain real", "masked real", "two looks real", "any of 3 real", "ideal",
-                          "plain none", "masked none", "two looks none", "any of 3 none")}
+    ch = {k: [] for k in ("one block", "plain real", "masked real", "two looks real", "look real", "prior x look real",
+                          "any of 3 real", "ideal", "plain none", "masked none", "two looks none", "look none",
+                          "prior x look none", "any of 3 none")}
     n_clean = n_used = 0
     for n_done, (si, anchors) in enumerate(by_seq.items()):
         ids, _lo = rest[si]
@@ -199,7 +212,21 @@ def main():
                 lp2m = lp2.clone()
                 lp2m[w] = float("-inf")
                 two = lp1m + lp2m
+                # look ahead: every candidate as the anchor of its own continuation
+                top = lp2m.topk(args.look_k)
+                best, tail_t = {"look": (-1.0, -1), "prior x look": (-1.0, -1)}, 0
+                for lpc, cc in zip(top.values.tolist(), top.indices.tolist()):
+                    xc = x.clone()
+                    xc[a2 + 1] = cc
+                    Lc = blk(feats[:, : a2 + 1], xc, a2 + 1) if c == "real" else blk(feats[:, :s], xc, a2 + 1, e + 1)
+                    S = torch.softmax(Lc, -1).max(-1).values.double().cumprod(0).sum().item()
+                    if cc == t:
+                        tail_t = matched(Lc.argmax(-1).tolist(), truth_all[a2 + 2 :])
+                    for name, sc in (("look", S), ("prior x look", S * float(torch.tensor(lpc).exp()))):
+                        if sc > best[name][0]:
+                            best[name] = (sc, cc)
                 r = {"fix": first[0] == t, "repeat": first[0] == w, "masked": lp2m.argmax().item() == t,
+                     "look": best["look"][1] == t, "prior x look": best["prior x look"][1] == t,
                      "top-2": rank_in(lp2, t, 2), "top-3": rank_in(lp2, t, 3), "top-5": rank_in(lp2, t, 5),
                      "m top-2": rank_in(lp2m, t, 2), "m top-3": rank_in(lp2m, t, 3),
                      "two looks": two.argmax().item() == t, "three looks": (two + lpL).argmax().item() == t,
@@ -211,13 +238,16 @@ def main():
                 ch[f"plain {c}"].append(e + matched(first, tr))
                 ch[f"masked {c}"].append(e + 1 + tail if r["masked"] else e)
                 ch[f"two looks {c}"].append(e + 1 + tail if r["two looks"] else e)
+                ch[f"look {c}"].append(e + 1 + tail_t if r["look"] else e)
+                ch[f"prior x look {c}"].append(e + 1 + tail_t if r["prior x look"] else e)
                 ch[f"any of 3 {c}"].append(e + 1 + tail if r["m top-3"] else e)
                 if c == "real" and e > 0:
                     for name, lo_p, hi_p in BINS:
                         if lo_p <= p_t < hi_p:
                             b = binc[name]
                             b["n"] += 1
-                            for k in ("fix", "masked", "m top-3", "two looks", "three looks", "draft 2nd"):
+                            for k in ("fix", "masked", "look", "prior x look", "m top-3", "two looks", "three looks",
+                                      "draft 2nd"):
                                 b[k] += r[k]
                             for k in ("lens cand", "draft + lens"):
                                 b[k] += lr[k]
@@ -236,7 +266,8 @@ def main():
             r.update({k: cnt[(c, sub)][k] / n for k in KEYS})
             r["repeat|fail"] = cnt[(c, sub)]["repeat"] / max(n - cnt[(c, sub)]["fix"], 1)
             rows.append(r)
-    cols = ["anchors", "features", "n", "fix", "repeat", "repeat|fail", "masked", "two looks", "three looks", "top-2",
+    cols = ["anchors", "features", "n", "fix", "repeat", "repeat|fail", "masked", "look", "prior x look", "two looks",
+            "three looks", "top-2",
             "top-3", "top-5",
             "m top-2", "m top-3", "draft 2nd", "draft top-3", "draft top-5"]
     print(f"\n{n_used} anchors, {n_clean} without an error in the block, {n_sub['all errors']} with one "
@@ -250,7 +281,8 @@ def main():
         b = binc[name]
         n = max(b["n"], 1)
         brow.append({"target's top-1 prob": name, "n": b["n"], "share": b["n"] / max(n_sub["e > 0"], 1),
-                     **{k: b[k] / n for k in ("fix", "masked", "two looks", "three looks", "m top-3", "draft 2nd",
+                     **{k: b[k] / n for k in ("fix", "masked", "look", "prior x look", "two looks", "three looks",
+                                              "m top-3", "draft 2nd",
                                               "lens cand", "draft + lens")}})
     print_table(brow, list(brow[0]), "By how sure the target is at the cut (real features, e > 0)")
     crow = [{k: mean(v) for k, v in ch.items()}]
