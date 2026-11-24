@@ -84,7 +84,7 @@ class Sur(nn.Module):
         return (self.b(self.a(h)) + self.down(F.silu(self.gate(h)) * self.up(h))).to(dt)
 
 
-class Path(BandStack):
+class SparsePath(BandStack):
     """BandStack whose layers in attn_only keep their attention and replace the MLP by a Sur"""
 
     def __init__(self, target, kept, stop, kind, rank, attn_only, sur_rank):
@@ -239,7 +239,7 @@ def main():
     H = target.config.hidden_size
     stack = proj = None
     if mode == "path":
-        stack = Path(target, kept, sl, args.bridge, args.rank, attn_only, args.sur_rank)
+        stack = SparsePath(target, kept, sl, args.bridge, args.rank, attn_only, args.sur_rank)
         print(f"[path] layers {kept}, attention-only {attn_only}, removed spans {stack.spans}, "
               f"stands in for hidden_states[{sl}], "
               f"cost {stack.cost():.2f} layers", flush=True)
