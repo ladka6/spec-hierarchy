@@ -13,9 +13,11 @@ Dual mode. A block at anchor s with lag g gets
   queries   the in-flight tokens x_{s-g} .. x_s and the MASKs, as in lag training (the token path stays)
 Arms (--code):
   0      no code rows: plain lag training (the baseline, same data and steps)
-  r > 0  code of r dimensions
+  r > 0  code of r dimensions; starts as the rank-r PCA projection of the fused real feature (so step 0 is the
+         exp84 point on this drafter), then encoder, decoder and drafter are trained on the block loss
   real   the real fused features at the in-flight positions (the ceiling of this layout)
-Start: the lag-trained drafter. The decoder's last layer starts at zero.
+Start: the lag-trained drafter. (A first version started the code at zero from the raw taps: the drafter learned
+to ignore the rows and all code arms stayed at the baseline, an optimisation failure, not a result.)
 
 Reported on held-out sequences, per lag (4, 8, 16) and for standard blocks (lag 0): loss, first drafted token
 right, tau = accepted drafted tokens + 1; at the start and at the end of training.
@@ -47,18 +49,29 @@ from hspec.utils import print_table, save_json  # noqa: E402
 
 
 class Code(nn.Module):
-    """5 taps of one position -> r numbers -> a vector in the drafter's fused feature space"""
+    """fused real feature of one position -> r numbers -> a vector in the drafter's fused feature space.
+    Linear path initialised to the rank-r PCA projection (the exp84 point: useful from step 0, so the drafter does
+    not learn to ignore the rows), plus zero-initialised nonlinear residuals on both sides."""
 
-    def __init__(self, width, r, out, hid=1024):
+    def __init__(self, dim, r, mu, U, hid=1024):
         super().__init__()
-        self.norm = nn.LayerNorm(width)
-        self.enc = nn.Sequential(nn.Linear(width, hid), nn.GELU(), nn.Linear(hid, r))
-        self.dec = nn.Sequential(nn.Linear(r, hid), nn.GELU(), nn.Linear(hid, out))
-        nn.init.zeros_(self.dec[-1].weight)
-        nn.init.zeros_(self.dec[-1].bias)
+        self.enc = nn.Linear(dim, r)
+        self.dec = nn.Linear(r, dim)
+        self.enc_res = nn.Sequential(nn.Linear(dim, hid), nn.GELU(), nn.Linear(hid, r))
+        self.dec_res = nn.Sequential(nn.Linear(r, hid), nn.GELU(), nn.Linear(hid, dim))
+        with torch.no_grad():
+            self.enc.weight.copy_(U.T)                       # c = U^T (x - mu)
+            self.enc.bias.copy_(-(mu @ U))
+            self.dec.weight.copy_(U)                         # x' = U c + mu
+            self.dec.bias.copy_(mu)
+            for m in (self.enc_res[-1], self.dec_res[-1]):
+                nn.init.zeros_(m.weight)
+                nn.init.zeros_(m.bias)
 
-    def forward(self, feats):
-        return self.dec(self.enc(self.norm(feats.float())))
+    def forward(self, x):
+        x = x.float()
+        c = self.enc(x) + self.enc_res(x)
+        return self.dec(c) + self.dec_res(c)
 
 
 def main():
@@ -74,7 +87,8 @@ def main():
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--epochs", type=float, default=1.0)
     ap.add_argument("--lr", type=float, default=5e-5)
-    ap.add_argument("--lr-code", type=float, default=3e-4)
+    ap.add_argument("--lr-code", type=float, default=1e-4)
+    ap.add_argument("--pca-seqs", type=int, default=200)
     ap.add_argument("--warmup", type=int, default=100)
     ap.add_argument("--gamma", type=float, default=0.9)
     ap.add_argument("--max-len", type=int, default=1024)
@@ -109,7 +123,31 @@ def main():
     fc = draft.fc                                            # trained with the drafter, applied here
     draft.fc = nn.Identity()                                 # the drafter is fed fused features
     width, Hd = fc.in_features, fc.out_features
-    code = Code(width, int(args.code), Hd).to(dev) if mode == "code" else None
+    def feats_of(ids):
+        with torch.no_grad():
+            out = target(ids[None], output_hidden_states=True, logits_to_keep=1)
+            return extract_context_feature(out.hidden_states, lids)
+
+    code = None
+    if mode == "code":                                       # PCA of the fused real features (response positions)
+        r = int(args.code)
+        with torch.no_grad():
+            sm = torch.zeros(Hd, dtype=torch.float64, device=dev)
+            xx = torch.zeros(Hd, Hd, dtype=torch.float64, device=dev)
+            n = 0
+            for d in train[: args.pca_seqs]:
+                ids = d["ids"].long().to(dev)
+                x = fc(feats_of(ids).float())[0, d["n_prompt"] :].double()
+                sm += x.sum(0)
+                xx += x.T @ x
+                n += x.shape[0]
+            mu = sm / n
+            cov = xx / n - torch.outer(mu, mu)
+            ev, evec = torch.linalg.eigh(cov)
+            U = evec[:, -r:].flip(1).float()
+            print(f"[pca] {n} positions, top-{r} directions hold {float(ev[-r:].sum() / ev.sum()):.3f} of the "
+                  f"variance, {time.time() - t0:.0f}s", flush=True)
+        code = Code(Hd, r, mu.float(), U).to(dev)
     dparams = [p for p in list(draft.parameters()) + list(fc.parameters()) if p.requires_grad]
     groups = [{"params": dparams, "lr": args.lr}]
     if code is not None:
@@ -122,11 +160,6 @@ def main():
           + (f", code {sum(p.numel() for p in code.parameters()) / 1e6:.1f} M" if code is not None else "")
           + f", {total} steps, {time.time() - t0:.0f}s", flush=True)
 
-    def feats_of(ids):
-        with torch.no_grad():
-            out = target(ids[None], output_hidden_states=True, logits_to_keep=1)
-            return extract_context_feature(out.hidden_states, lids)
-
     def forward(feats, ids, blocks):
         """hidden states of the packed blocks; the in-flight positions of each block read the arm's features"""
         T = ids.shape[0]
@@ -135,7 +168,7 @@ def main():
         if mode == "none":
             ctx = real
         else:
-            extra = real if mode == "real" else code(feats)
+            extra = real if mode == "real" else code(real.detach())
             ctx = torch.cat([real, extra.to(real.dtype)], 1)  # [1, 2T, Hd]: real rows, then the in-flight rows
             q = noise.shape[1]
             m = torch.zeros((q, 2 * T + q), dtype=torch.bool, device=ids.device)
