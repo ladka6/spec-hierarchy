@@ -14,6 +14,15 @@ frozen original drafter, the cut placed exactly at the first error (oracle locat
 Split by how sure the TARGET is at that position (its top-1 probability): where the target itself is unsure, no
 cheap method can know its choice; where it is sure, the error is the drafter's and should be fixable.
 
+4. The target's own head on an intermediate state. The band pass (exp116) produces the 3/4-depth state of the kept
+   tokens anyway; the state of the last kept token is the one the target's token at the cut is computed from.
+   "lens" = that state (here the REAL one: an upper bound for anything produced) through a closed-form affine map to
+   the final state and the target's lm_head; "raw lens" = final norm + lm_head directly, no map.
+     lens / raw lens     top-1 over the whole vocabulary
+     lens cand           the lens chooses among the first draft's top --cands candidates, wrong token excluded
+     draft + lens        first draft's log-probabilities + the lens', wrong token excluded (no redraft needed)
+     three looks         first draft + redraft + lens (per feature condition)
+
 Feature conditions for the redraft (the cut's anchor is the last kept token, s + e):
   real   real target features for the kept tokens (what an exact feature source would give)
   none   no features for the kept tokens, their tokens only (the lag input)
@@ -53,8 +62,9 @@ from exp107_lift_diag import load_seqs  # noqa: E402
 from hspec.models import load_draft, load_target  # noqa: E402
 from hspec.utils import print_table, save_json  # noqa: E402
 
-KEYS = ("fix", "repeat", "masked", "top-2", "top-3", "top-5", "m top-2", "m top-3", "two looks",
+KEYS = ("fix", "repeat", "masked", "top-2", "top-3", "top-5", "m top-2", "m top-3", "two looks", "three looks",
         "draft 2nd", "draft top-3", "draft top-5")
+LKEYS = ("lens", "raw lens", "lens cand", "draft + lens", "draft 2nd")
 BINS = (("sure >= 0.9", 0.9, 1.01), ("0.5 - 0.9", 0.5, 0.9), ("unsure < 0.5", 0.0, 0.5))
 
 
@@ -66,6 +76,10 @@ def main():
     ap.add_argument("--data", default="")
     ap.add_argument("--cache", default="")
     ap.add_argument("--anchors", type=int, default=2000)
+    ap.add_argument("--cands", type=int, default=16)
+    ap.add_argument("--lens-depth", type=float, default=0.75, help="the drafter's tap nearest to this depth")
+    ap.add_argument("--lens-seqs", type=int, default=150, help="training sequences for the affine map")
+    ap.add_argument("--ridge", type=float, default=1e-3)
     ap.add_argument("--fit-tokens", type=int, default=600_000, help="as exp112: fixes the held-out split")
     ap.add_argument("--val-tokens", type=int, default=15_000)
     ap.add_argument("--max-len", type=int, default=1024)
@@ -79,6 +93,25 @@ def main():
     draft = load_draft(args.draft, dev)
     head = target.lm_head
     lids, bs = list(draft.target_layer_ids), draft.block_size
+    H, L = target.config.hidden_size, len(target.model.layers)
+    li = lids[min(range(len(lids)), key=lambda t: abs((lids[t] + 1) / L - args.lens_depth))] + 1   # hidden_states index
+
+    # ---- lens: affine map from the state of layer li - 1 to the final state (ridge, rows weighted by 1 / rms) ----
+    xtx = torch.zeros(H + 1, H + 1, dtype=torch.float64, device=dev)
+    xty = torch.zeros(H + 1, H, dtype=torch.float64, device=dev)
+    for ids, lo in seqs[: args.lens_seqs]:
+        hs = target(ids[None].to(dev), output_hidden_states=True, use_cache=False, logits_to_keep=1).hidden_states
+        xx = hs[li][0, lo:].double()
+        wr = torch.rsqrt(xx.pow(2).mean(-1, keepdim=True) + 1e-6)
+        xa = torch.cat([xx, torch.ones_like(xx[:, :1])], -1) * wr
+        xtx += xa.T @ xa
+        xty += xa.T @ (hs[-1][0, lo:].double() * wr)
+        del hs
+    Wl = torch.linalg.solve(
+        xtx + args.ridge * xtx.diagonal().mean() * torch.eye(H + 1, dtype=torch.float64, device=dev), xty).float()
+    del xtx, xty
+    print(f"[lens] layer {li - 1} (depth {li / L:.2f}) -> final state fitted on {args.lens_seqs} sequences, "
+          f"{time.time() - t0:.0f}s", flush=True)
 
     # ---- the held-out sequences of exp112 / exp113 (the first 600 anchors are the same) ----
     def take(i, n_tokens, cap):
@@ -109,7 +142,9 @@ def main():
     conds = ("real", "none")
     cnt = {(c, sub): {k: 0 for k in KEYS} for c in conds for sub in ("all errors", "e > 0")}
     n_sub = {"all errors": 0, "e > 0": 0}
-    binc = {b[0]: {k: 0 for k in ("n", "fix", "masked", "m top-3", "two looks", "draft 2nd")} for b in BINS}
+    lcnt = {sub: {k: 0 for k in LKEYS} for sub in ("all errors", "e > 0")}
+    binc = {b[0]: {k: 0 for k in ("n", "fix", "masked", "m top-3", "two looks", "three looks", "draft 2nd",
+                                  "lens cand", "draft + lens")} for b in BINS}
     ch = {k: [] for k in ("one block", "plain real", "masked real", "two looks real", "any of 3 real", "ideal",
                           "plain none", "masked none", "two looks none", "any of 3 none")}
     n_clean = n_used = 0
@@ -142,6 +177,17 @@ def main():
             subs = ["all errors"] + (["e > 0"] if e > 0 else [])
             for sub in subs:
                 n_sub[sub] += 1
+            hk = hs[li][0, s + e]                            # 3/4-depth state of the last kept token (real)
+            pl = torch.cat([hk.float(), hk.new_ones(1).float()]) @ Wl
+            lpL = F.log_softmax(head(pl.to(head.weight.dtype)).float(), -1)
+            lpR = F.log_softmax(head(target.model.norm(hk[None])[0]).float(), -1)
+            c16 = lp1m.topk(args.cands).indices
+            lr = {"lens": lpL.argmax().item() == t, "raw lens": lpR.argmax().item() == t,
+                  "lens cand": c16[lpL[c16].argmax()].item() == t,
+                  "draft + lens": (lp1m + lpL).argmax().item() == t, "draft 2nd": lp1m.argmax().item() == t}
+            for sub in subs:
+                for k in LKEYS:
+                    lcnt[sub][k] += lr[k]
             ch["one block"].append(e)
             ideal = e + 1 + matched(blk(feats[:, : a2 + 1], x, a2 + 1).argmax(-1).tolist(), truth_all[a2 + 2 :])
             ch["ideal"].append(ideal)
@@ -156,7 +202,8 @@ def main():
                 r = {"fix": first[0] == t, "repeat": first[0] == w, "masked": lp2m.argmax().item() == t,
                      "top-2": rank_in(lp2, t, 2), "top-3": rank_in(lp2, t, 3), "top-5": rank_in(lp2, t, 5),
                      "m top-2": rank_in(lp2m, t, 2), "m top-3": rank_in(lp2m, t, 3),
-                     "two looks": two.argmax().item() == t, "draft 2nd": lp1m.argmax().item() == t,
+                     "two looks": two.argmax().item() == t, "three looks": (two + lpL).argmax().item() == t,
+                     "draft 2nd": lp1m.argmax().item() == t,
                      "draft top-3": rank_in(lp1, t, 3), "draft top-5": rank_in(lp1, t, 5)}
                 for sub in subs:
                     for k in KEYS:
@@ -170,8 +217,10 @@ def main():
                         if lo_p <= p_t < hi_p:
                             b = binc[name]
                             b["n"] += 1
-                            for k in ("fix", "masked", "m top-3", "two looks", "draft 2nd"):
+                            for k in ("fix", "masked", "m top-3", "two looks", "three looks", "draft 2nd"):
                                 b[k] += r[k]
+                            for k in ("lens cand", "draft + lens"):
+                                b[k] += lr[k]
         del hs, feats
         if n_done % 200 == 0:
             print(f"[run] {n_done}/{len(by_seq)} sequences, {n_used} anchors, {time.time() - t0:.0f}s", flush=True)
@@ -187,21 +236,26 @@ def main():
             r.update({k: cnt[(c, sub)][k] / n for k in KEYS})
             r["repeat|fail"] = cnt[(c, sub)]["repeat"] / max(n - cnt[(c, sub)]["fix"], 1)
             rows.append(r)
-    cols = ["anchors", "features", "n", "fix", "repeat", "repeat|fail", "masked", "two looks", "top-2", "top-3", "top-5",
+    cols = ["anchors", "features", "n", "fix", "repeat", "repeat|fail", "masked", "two looks", "three looks", "top-2",
+            "top-3", "top-5",
             "m top-2", "m top-3", "draft 2nd", "draft top-3", "draft top-5"]
     print(f"\n{n_used} anchors, {n_clean} without an error in the block, {n_sub['all errors']} with one "
           f"({n_sub['all errors'] - n_sub['e > 0']} of them at the first drafted token)")
     print_table(rows, cols, "The token at the cut (cut exactly at the drafter's first error)")
+    lrow = [{"anchors": sub, "n": n_sub[sub], **{k: lcnt[sub][k] / max(n_sub[sub], 1) for k in LKEYS}}
+            for sub in ("all errors", "e > 0")]
+    print_table(lrow, list(lrow[0]), f"The target's head on the real state of layer {li - 1} at the last kept token")
     brow = []
     for name, _, _ in BINS:
         b = binc[name]
         n = max(b["n"], 1)
         brow.append({"target's top-1 prob": name, "n": b["n"], "share": b["n"] / max(n_sub["e > 0"], 1),
-                     **{k: b[k] / n for k in ("fix", "masked", "two looks", "m top-3", "draft 2nd")}})
+                     **{k: b[k] / n for k in ("fix", "masked", "two looks", "three looks", "m top-3", "draft 2nd",
+                                              "lens cand", "draft + lens")}})
     print_table(brow, list(brow[0]), "By how sure the target is at the cut (real features, e > 0)")
     crow = [{k: mean(v) for k, v in ch.items()}]
     print_table(crow, list(crow[0]), "Chain of two blocks, accepted drafted tokens (all anchors)")
-    save_json(args.save, {"args": vars(args), "rows": rows, "bins": brow, "chain": crow[0],
+    save_json(args.save, {"args": vars(args), "rows": rows, "lens": lrow, "bins": brow, "chain": crow[0],
                           "n": {"used": n_used, "clean": n_clean, **n_sub}})
     print(f"[done] {time.time() - t0:.0f}s", flush=True)
 
