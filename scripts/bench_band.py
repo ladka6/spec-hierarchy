@@ -54,6 +54,14 @@ def graph_time(step, reps):
         return eager, float("nan")
 
 
+def _reindex(layers, idx):
+    """every attention module writes its keys to cache slot layer_idx: point it at the layer's place in the stack"""
+    for layer, i in zip(layers, idx):
+        for m in layer.modules():
+            if hasattr(m, "layer_idx"):
+                m.layer_idx = i
+
+
 @torch.inference_mode()
 def bench_pass(name, model, ctx, qs, reps, head):
     """new tokens on a ctx-token dynamic cache, cropped back after every call (as bench_graph.bench_model)"""
@@ -111,12 +119,14 @@ def main():
         a = 2 if n > 2 else 0
         kept = list(range(a)) + list(range(c - (n - a) + 1, c + 1))
         model.model.layers = torch.nn.ModuleList([layers[i] for i in kept])
+        _reindex(model.model.layers, range(n))               # the cache has n layers: slot j for the j-th kept layer
         cfg.num_hidden_layers = n
         if types is not None:
             cfg.layer_types = [types[i] for i in kept]
         rows.append(bench_pass(f"body {n}", model, args.ctx, args.qs, args.reps, False))
         rows.append(bench_pass(f"body {n} + head", model, args.ctx, args.qs, args.reps, True))
     model.model.layers, cfg.num_hidden_layers = layers, L
+    _reindex(layers, range(L))
     if types is not None:
         cfg.layer_types = types
 
