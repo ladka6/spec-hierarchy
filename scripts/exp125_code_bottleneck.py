@@ -24,6 +24,10 @@ Arms (--code):
                  and goes through the same projection. Bridges, projection and drafter are trained on the block
                  loss only: nothing asks the state to match the real one. Cost = number of listed layers
                  (0.54 ms each on Qwen3-8B) + bridges. Examples: path:0,1,28   path:0,9,19,28   path:0,1,21-28
+                 A part ending in "a" runs ATTENTION-ONLY: path:0,1,21-28a keeps the attention of layers 21..28
+                 (which reads the real prefix KV) and replaces each MLP, about 3/4 of a layer's weights, by a
+                 rank --sur-rank stand-in (linear part = truncated closed-form fit of the MLP, nonlinear part from
+                 zero). An attention-only layer costs about a quarter of a layer.
 --freeze-draft: the drafter is not trained (what joint training adds).
 Start: the lag-trained drafter. (A first version started the code at zero from the raw taps: the drafter learned
 to ignore the rows and all code arms stayed at the baseline, an optimisation failure, not a result.)
@@ -53,9 +57,84 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dflash.model import _output_head, extract_context_feature  # noqa: E402
 
+from exp116_band_bridge import BF, BandStack, CtxBridge, rot  # noqa: E402
+
 from hspec.lagtrain import pack, sample_blocks  # noqa: E402
 from hspec.models import load_draft, load_target  # noqa: E402
 from hspec.utils import print_table, save_json  # noqa: E402
+
+
+class Sur(nn.Module):
+    """rank-r stand-in for one MLP sublayer (input: the layer's own post-attention norm)"""
+
+    def __init__(self, H, r):
+        super().__init__()
+        self.a = nn.Linear(H, r, bias=False)                 # linear part, set from the closed-form fit
+        self.b = nn.Linear(r, H, bias=True)
+        self.gate = nn.Linear(H, r, bias=False)
+        self.up = nn.Linear(H, r, bias=False)
+        self.down = nn.Linear(r, H, bias=False)
+        for m in (self.a, self.b, self.down):
+            nn.init.zeros_(m.weight)
+        nn.init.zeros_(self.b.bias)
+
+    def forward(self, h):
+        dt = h.dtype
+        h = h.float()
+        return (self.b(self.a(h)) + self.down(F.silu(self.gate(h)) * self.up(h))).to(dt)
+
+
+class Path(BandStack):
+    """BandStack whose layers in attn_only keep their attention and replace the MLP by a Sur"""
+
+    def __init__(self, target, kept, stop, kind, rank, attn_only, sur_rank):
+        super().__init__(target, kept, stop, kind, rank, 16)
+        self.attn_only = set(attn_only)
+        H, dev = target.config.hidden_size, target.lm_head.weight.device
+        self.sur = nn.ModuleDict({str(g): Sur(H, sur_rank) for g in sorted(self.attn_only)}).to(dev)
+
+    def cost(self):
+        full = sum(p.numel() for p in self._orig[0].parameters())
+        att = sum(p.numel() for p in self._orig[0].self_attn.parameters())
+        own = sum(p.numel() for p in self.parameters())
+        n_att = len(self.attn_only)
+        return ((len(self.kept) - n_att) * full + n_att * att + own) / full
+
+    def forward(self, x0, a, kvp, cos, sin, hs):
+        m = x0.shape[1]
+        mask = torch.ones(m, a + m, dtype=torch.bool, device=x0.device)
+        mask[:, a:] = torch.tril(mask[:, a:])
+        rep = self.nh // self.nkv
+        x, outs = x0, {}
+        for g in range(self.stop):
+            if g not in self.kset:
+                if str(g) in self.bridges:
+                    br = self.bridges[str(g)]
+                    with torch.autocast("cuda", enabled=False):
+                        x = br(x, hs[g + 1][:, max(0, a - br.win) : a]) if isinstance(br, CtxBridge) else br(x)
+                    outs[g] = x
+                continue
+            lay = self._orig[g]
+            attn = lay.self_attn
+            hn = lay.input_layernorm(x)
+            q = attn.q_proj(hn).view(1, m, -1, self.hd)
+            if hasattr(attn, "q_norm"):
+                q = attn.q_norm(q)
+            q = rot(q.transpose(1, 2).to(BF), cos, sin)
+            kn, vn = self._kv(attn, hn, cos, sin)
+            Kp, Vp = kvp[g]
+            K = torch.cat([Kp[:, :, :a], kn], 2).repeat_interleave(rep, 1)
+            V = torch.cat([Vp[:, :, :a], vn], 2).repeat_interleave(rep, 1)
+            o = F.scaled_dot_product_attention(q, K, V, attn_mask=mask)
+            x = x + attn.o_proj(o.transpose(1, 2).reshape(1, m, -1))
+            h2 = lay.post_attention_layernorm(x)
+            if g in self.attn_only:
+                with torch.autocast("cuda", enabled=False):
+                    x = x + self.sur[str(g)](h2)
+            else:
+                mlp = lay.mlp
+                x = x + mlp.down_proj(mlp.act_fn(mlp.gate_proj(h2)) * mlp.up_proj(h2))
+        return x, outs
 
 
 class Code(nn.Module):
@@ -111,17 +190,21 @@ def main():
     ap.add_argument("--bridge", default="mlp", choices=["lin", "mlp", "attn"])
     ap.add_argument("--rank", type=int, default=1024)
     ap.add_argument("--ridge", type=float, default=1e-3)
+    ap.add_argument("--sur-rank", type=int, default=256)
     ap.add_argument("--save", default="exp125_code")
     args = ap.parse_args()
     dev, t0 = "cuda", time.time()
-    kept, sl = [], 0
+    kept, attn_only, sl = [], [], 0
     if args.code == "real":
         mode = "real"
     elif args.code.startswith("path:"):
         mode = "path"
         for part in args.code[5:].split(","):
-            lo, _, hi = part.partition("-")
-            kept += list(range(int(lo), int(hi or lo) + 1))
+            ao = part.endswith("a")
+            lo, _, hi = part.rstrip("a").partition("-")
+            layers = list(range(int(lo.rstrip("a")), int(hi or lo.rstrip("a")) + 1))
+            kept += layers
+            attn_only += layers if ao else []
         sl = max(kept) + 1
     elif args.code.startswith("state:"):
         mode, sl = "state", int(args.code[6:])
@@ -156,9 +239,9 @@ def main():
     H = target.config.hidden_size
     stack = proj = None
     if mode == "path":
-        from exp116_band_bridge import BandStack
-        stack = BandStack(target, kept, sl, args.bridge, args.rank, 16)
-        print(f"[path] layers {kept}, removed spans {stack.spans}, stands in for hidden_states[{sl}], "
+        stack = Path(target, kept, sl, args.bridge, args.rank, attn_only, args.sur_rank)
+        print(f"[path] layers {kept}, attention-only {attn_only}, removed spans {stack.spans}, "
+              f"stands in for hidden_states[{sl}], "
               f"cost {stack.cost():.2f} layers", flush=True)
 
     def feats_of(ids):
@@ -190,6 +273,12 @@ def main():
                 A += xa.T @ xa
                 B += xa.T @ (y * w)
 
+            mlp_io, hooks = {}, []                           # input / output of the MLPs to be replaced
+            macc = {g: [torch.zeros(H + 1, H + 1, dtype=torch.float64, device=dev),
+                        torch.zeros(H + 1, H, dtype=torch.float64, device=dev)] for g in attn_only}
+            for g in attn_only:
+                hooks.append(target.model.layers[g].mlp.register_forward_hook(
+                    lambda mod, inp, out, g=g: mlp_io.__setitem__(g, (inp[0], out))))
             for d in train[: args.pca_seqs]:
                 ids = d["ids"].long().to(dev)
                 hs = target(ids[None], output_hidden_states=True, logits_to_keep=1).hidden_states
@@ -199,7 +288,12 @@ def main():
                 for a, b in spans:
                     x = hs[a][0, lo:].double()
                     add(x, hs[b + 1][0, lo:].double() - x, *acc[b])
+                for g in attn_only:
+                    add(mlp_io[g][0][0, lo:].double(), mlp_io[g][1][0, lo:].double(), *macc[g])
                 del hs
+                mlp_io.clear()
+            for h in hooks:
+                h.remove()
 
             def solve(A, B):
                 eye = torch.eye(H + 1, dtype=torch.float64, device=dev)
@@ -213,7 +307,17 @@ def main():
                 sol = solve(*acc[b])
                 stack.bridges[str(b)].lin.weight.copy_(sol[:H].T)
                 stack.bridges[str(b)].lin.bias.copy_(sol[H])
-            del xtx, xty, acc
+            for g in attn_only:                              # rank-r part of the closed-form linear fit of the MLP
+                sol = solve(*macc[g])
+                U, S, Vh = torch.linalg.svd(sol[:H].T, full_matrices=False)
+                r = args.sur_rank
+                sur = stack.sur[str(g)]
+                sur.a.weight.copy_(Vh[:r])
+                sur.b.weight.copy_(U[:, :r] * S[:r])
+                sur.b.bias.copy_(sol[H])
+                print(f"[fit] MLP of layer {g}: rank {r} keeps {float(S[:r].pow(2).sum() / S.pow(2).sum()):.3f} "
+                      f"of the linear fit", flush=True)
+            del xtx, xty, acc, macc
         print(f"[fit] projection from hidden_states[{sl}]" + (f", {len(spans)} bridges" if spans else "")
               + f", {time.time() - t0:.0f}s", flush=True)
 
@@ -412,6 +516,7 @@ def main():
                     "code": code.state_dict() if code is not None else None,
                     "proj": proj.state_dict() if proj is not None else None,
                     "bridges": stack.bridges.state_dict() if stack is not None else None,
+                    "sur": stack.sur.state_dict() if stack is not None else None,
                     "args": vars(args)}, out / "state.pt")
         print(f"saved {out / 'state.pt'}", flush=True)
     print(f"[done] {time.time() - t0:.0f}s", flush=True)

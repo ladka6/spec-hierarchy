@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=18
-#SBATCH --time=05:00:00
+#SBATCH --time=10:00:00
 #SBATCH --output=exp125-%j.out
 # exp125: learned r-dim code of the real features at the in-flight positions, drafter + code trained on the block
 # loss only (one arm per job). CODE = 0 (lag baseline) | r | real.
