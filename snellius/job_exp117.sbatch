@@ -10,6 +10,7 @@
 # exp117: the token at the cut (no training). Does the redraft repeat the wrong token, what does excluding it give,
 # how often is the target's token among the first 2 / 3 / 5 choices, split by how sure the target is.
 #   sbatch snellius/job_exp117.sbatch
+#   another drafter (e.g. the lag-trained one): sbatch --export=ALL,DRAFT=/path/to/drafter,TAG=lag snellius/job_exp117.sbatch
 set -uo pipefail
 cd "$SLURM_SUBMIT_DIR"
 module purge
@@ -22,6 +23,6 @@ F="grep --line-buffered -v -i warn"
 export HSPEC_RESULTS="$SLURM_SUBMIT_DIR/results/exp117_$SLURM_JOB_ID"
 QWEN_DATA=${QWEN_DATA:-/scratch-shared/$USER/hspec_lagft/data}
 if [ -d "$QWEN_DATA" ]; then QSRC="--data $QWEN_DATA"; else QSRC="--cache $HOME/seqs.pt"; fi
-python scripts/exp117_cut_token.py --target Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16 $QSRC \
-  --anchors ${ANCHORS:-2000} ${EXTRA:-} --save exp117_qwen3 2>&1 | $F
+python scripts/exp117_cut_token.py --target Qwen/Qwen3-8B --draft "${DRAFT:-z-lab/Qwen3-8B-DFlash-b16}" $QSRC \
+  --anchors ${ANCHORS:-2000} ${EXTRA:-} --save exp117_${TAG:-orig}_qwen3 2>&1 | $F
 cp -r "$HSPEC_RESULTS" $HOME/
