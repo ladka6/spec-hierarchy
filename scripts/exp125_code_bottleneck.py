@@ -191,6 +191,7 @@ def main():
     ap.add_argument("--rank", type=int, default=1024)
     ap.add_argument("--ridge", type=float, default=1e-3)
     ap.add_argument("--sur-rank", type=int, default=256)
+    ap.add_argument("--block-chunk", type=int, default=0, help="backward over at most this many blocks at a time")
     ap.add_argument("--save", default="exp125_code")
     args = ap.parse_args()
     dev, t0 = "cuda", time.time()
@@ -482,10 +483,16 @@ def main():
                 blocks = sample_blocks(d["n_prompt"], len(ids), args.blocks, bs, args.max_lag, args.p_zero, rng)
                 if not blocks:
                     continue
-                loss, acc = loss_fn(feats_of(ids), ids, blocks)
-                (loss / args.batch).backward()
-                tot_l += float(loss.detach())
-                tot_a += float(acc)
+                seq = feats_of(ids)
+                ch = args.block_chunk or len(blocks)         # same gradient, less activation memory
+                for c0 in range(0, len(blocks), ch):
+                    sub = blocks[c0 : c0 + ch]
+                    frac = len(sub) / len(blocks)
+                    loss, acc = loss_fn(seq, ids, sub)
+                    (loss * frac / args.batch).backward()
+                    tot_l += float(loss.detach()) * frac
+                    tot_a += float(acc) * frac
+                del seq
                 n += 1
             torch.nn.utils.clip_grad_norm_([p for g in groups for p in g["params"]], 1.0)
             opt.step()
