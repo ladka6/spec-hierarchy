@@ -13,7 +13,10 @@ Variants (cut rule / token at the cut):
   conf<t / plain, soft  cut at the first position whose max-probability is below t; from the second stage on the
                         first token of a block is committed (it was just chosen), so every stage advances
 Feature conditions for the hypothesised (in-flight) tokens: real (target features), none (features only up to the
-anchor of stage 1; the lag grows with every stage and is reported).
+anchor of stage 1; the lag grows with every stage and is reported), and L<k> for k in --shallow: the REAL state of
+target layer k (the first k layers run over the in-flight tokens, the early-exit shape) through a projection fitted
+in closed form to the drafter's fused feature (exp118: with the interface refitted, shallow states are usable).
+These sit between the two ends at a known price, k layers per stage, which the speed table charges.
 
 Tables per condition: A(B); tokens added by stage B and the ratio to the stage before (the f of the chain formula);
 share of chains still correct and the mean lag at the start of each stage; speed against one block per verify,
@@ -33,6 +36,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -62,6 +66,10 @@ def main():
     ap.add_argument("--F", type=float, default=20.4, help="ms of a full verify of 16 tokens")
     ap.add_argument("--F-slope", type=float, default=0.04, help="ms per further verified token")
     ap.add_argument("--E", nargs="+", type=float, default=[0.0, 1.46, 3.61], help="ms of a feature / cut pass per stage")
+    ap.add_argument("--shallow", nargs="*", type=int, default=[2, 4, 8, 16, 33], help="layers for the L<k> conditions")
+    ap.add_argument("--layer-ms", type=float, default=0.54, help="ms per target layer over the in-flight tokens")
+    ap.add_argument("--fit-seqs", type=int, default=150)
+    ap.add_argument("--ridge", type=float, default=1e-3)
     ap.add_argument("--fit-tokens", type=int, default=600_000, help="as exp112: fixes the held-out split")
     ap.add_argument("--val-tokens", type=int, default=15_000)
     ap.add_argument("--max-len", type=int, default=1024)
@@ -75,6 +83,10 @@ def main():
     draft = load_draft(args.draft, dev)
     lids, bs = list(draft.target_layer_ids), draft.block_size
     nb, B = bs - 1, args.depth
+    H = target.config.hidden_size
+    fc0 = draft.fc                                           # the drafter's fusion: taps -> drafter width
+    draft.fc = nn.Identity()                                 # from here on the drafter is fed FUSED features
+    conds = list(CONDS) + [f"L{k}" for k in args.shallow]
     need = B * nb + bs + 2                                   # room for B full blocks after the anchor
 
     def take(i, n_tokens, cap):
@@ -96,6 +108,35 @@ def main():
     print(f"[setup] {len(rest)} held-out sequences, {n_anchor} anchors with {need} tokens after them, block {bs}, "
           f"depth {B}, {time.time() - t0:.0f}s", flush=True)
 
+    def fused(hs):
+        return fc0(extract_context_feature(hs, lids))
+
+    # closed-form projections: state of layer k -> the fused feature (as exp118)
+    proj = {}
+    if args.shallow:
+        Hd = fc0.out_features
+        xtx = {k: torch.zeros(H + 1, H + 1, dtype=torch.float64, device=dev) for k in args.shallow}
+        xty = {k: torch.zeros(H + 1, Hd, dtype=torch.float64, device=dev) for k in args.shallow}
+        for ids, lo in seqs[: args.fit_seqs]:
+            hs = target(ids[None].to(dev), output_hidden_states=True, use_cache=False, logits_to_keep=1).hidden_states
+            y = fused(hs)[0, lo:].double()
+            for k in args.shallow:
+                h = hs[k][0, lo:].double()
+                w = torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-6)
+                ha = torch.cat([h, torch.ones_like(h[:, :1])], -1) * w
+                xtx[k] += ha.T @ ha
+                xty[k] += ha.T @ (y * w)
+            del hs
+        for k in args.shallow:
+            A = xtx[k] + args.ridge * xtx[k].diagonal().mean() * torch.eye(H + 1, dtype=torch.float64, device=dev)
+            sol = torch.linalg.solve(A, xty[k]).float()
+            proj[k] = nn.Linear(H, Hd, bias=True).to(dev)
+            proj[k].weight.copy_(sol[:H].T)
+            proj[k].bias.copy_(sol[H])
+        del xtx, xty
+        print(f"[fit] projections for layers {args.shallow} on {args.fit_seqs} sequences, {time.time() - t0:.0f}s",
+              flush=True)
+
     def blk(feats, x, s, lag=0):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             return blocks_logits(draft, target, feats, x, [(s, lag)], bs)[0].float()
@@ -103,13 +144,22 @@ def main():
     variants = [("oracle", "plain"), ("oracle", "mask"), ("oracle", "mask retry")]
     for t in args.thrs:
         variants += [(f"conf<{t:g}", "plain"), (f"conf<{t:g}", "soft")]
-    keys = [(c, v) for c in CONDS for v in variants]
+    keys = [(c, v) for c in conds for v in variants]
     acc = {k: [[] for _ in range(B)] for k in keys}          # A after stage b
     length = {k: [[] for _ in range(B)] for k in keys}       # tokens handed to the verify after stage b
     alive = {k: [0] * B for k in keys}                       # chains correct up to the anchor of stage b
     lags = {k: [[] for _ in range(B)] for k in keys}         # in-flight tokens before the anchor of stage b
 
-    def run(cond, rule, sup, x, feats, s, truth, first):
+    def ctx(cond, hs, feats, s, a):
+        """fused features of positions < a for a stage anchored at a (stage 1 was anchored at s)"""
+        if cond == "real":
+            return feats[:, :a]
+        k = int(cond[1:])
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            new = proj[k](hs[k][:, s:a])
+        return torch.cat([feats[:, :s], new.to(feats.dtype)], 1)
+
+    def run(cond, rule, sup, x, hs, feats, s, truth, first):
         """one chain; first = (logits of stage 1); returns per stage (A, verified length, alive, lag)"""
         thr = float(rule.split("<")[1]) if rule.startswith("conf") else None
         kept, a, out = [], s, []                             # kept drafted tokens, anchor of the current stage
@@ -122,7 +172,7 @@ def main():
             if b == 0:
                 R = first
             else:
-                R = blk(feats[:, :a], xk, a) if cond == "real" else blk(feats[:, :s], xk, a, a - s)
+                R = blk(feats[:, :s], xk, a, a - s) if cond == "none" else blk(ctx(cond, hs, feats, s, a), xk, a)
             p = torch.softmax(R, -1)
             tok, conf = R.argmax(-1).tolist(), p.max(-1).values.tolist()
             if pending is not None:                          # the token at the cut of the stage before
@@ -163,14 +213,14 @@ def main():
         ids, _lo = rest[si]
         x = ids.to(dev)
         hs = target(x[None], output_hidden_states=True, use_cache=False, logits_to_keep=1).hidden_states
-        feats = extract_context_feature(hs, lids)
+        feats = fused(hs)
         truth_all = x.tolist()
         for s in anchors:
             n_used += 1
             truth = truth_all[s + 1 :]
             first = blk(feats[:, :s], x, s)
             for cond, (rule, sup) in keys:
-                for b, (a_b, n_b, al, lag) in enumerate(run(cond, rule, sup, x, feats, s, truth, first)):
+                for b, (a_b, n_b, al, lag) in enumerate(run(cond, rule, sup, x, hs, feats, s, truth, first)):
                     k = (cond, (rule, sup))
                     acc[k][b].append(a_b)
                     length[k][b].append(n_b)
@@ -187,7 +237,8 @@ def main():
     out = {"args": vars(args), "n": n_used, "tables": {}}
     cols = [f"B={b + 1}" for b in range(B)]
     print(f"\n{n_used} anchors")
-    for cond in CONDS:
+    for cond in conds:
+        own = [args.layer_ms * int(cond[1:])] if cond.startswith("L") else args.E
         rows_a, rows_d, rows_f, rows_al, rows_lag, rows_s = [], [], [], [], [], []
         for v in variants:
             k, name = (cond, v), f"{v[0]} / {v[1]}"
@@ -200,7 +251,7 @@ def main():
             rows_al.append({"variant": name, **{cols[b]: alive[k][b] / max(n_used, 1) for b in range(B)}})
             rows_lag.append({"variant": name, **{cols[b]: mean(lags[k][b]) for b in range(B)}})
             base = (A[0] + 1) / (args.F + args.D)
-            for e_ms in args.E:
+            for e_ms in own:
                 row = {"variant": name, "E ms": e_ms}
                 for b in range(B):
                     t = args.F + args.F_slope * max(mean(length[k][b]) - 16, 0) + (b + 1) * args.D + b * e_ms
@@ -217,6 +268,25 @@ def main():
                     f"E = feature or cut pass per stage, ms)")
         out["tables"][cond] = {"A": rows_a, "added": rows_d, "ratio": rows_f, "alive": rows_al, "lag": rows_lag,
                                "speed": rows_s}
+    summ = []
+    for cond in conds:
+        t = out["tables"][cond]
+        row = {"in-flight features": cond,
+               "ms per stage": args.layer_ms * int(cond[1:]) if cond.startswith("L") else 0.0}
+        for name in ("oracle / mask", "oracle / mask retry", f"conf<{args.thrs[0]:g} / plain"):
+            ra = next(r for r in t["A"] if r["variant"] == name)
+            rs = next(r for r in t["speed"] if r["variant"] == name)        # the first cost row of this variant
+            al = next(r for r in t["alive"] if r["variant"] == name)
+            if name == "oracle / mask":
+                row["survive cut 1"] = al["B=3"] if B >= 3 else float("nan")
+                row["A(2)"] = ra["B=2"] if B >= 2 else float("nan")
+                row[f"A({B})"] = ra[f"B={B}"]
+            row[f"speed {name}"] = max(rs[c] for c in cols)
+            row[f"B {name}"] = rs["best B"]
+        summ.append(row)
+    print_table(summ, list(summ[0]), "Summary: in-flight features by source, each charged its own cost per stage "
+                                     "(real and none: free)")
+    out["summary"] = summ
     save_json(args.save, out)
     print(f"[done] {time.time() - t0:.0f}s", flush=True)
 
