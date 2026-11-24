@@ -16,6 +16,15 @@ Arms (--code):
   r > 0  code of r dimensions; starts as the rank-r PCA projection of the fused real feature (so step 0 is the
          exp84 point on this drafter), then encoder, decoder and drafter are trained on the block loss
   real   the real fused features at the in-flight positions (the ceiling of this layout)
+  state:L        the REAL state after target layer L - 1 (hidden_states[L]) through one projection (closed-form
+                 start, exp118): the ceiling of any producer that aims at that single state
+  path:LAYERS    a SPECULATIVE state: only the listed target layers run over the in-flight tokens (frozen, each
+                 reading the verify's real prefix KV at its own depth), the removed spans are bridged (affine
+                 closed-form start + MLP, exp116), the output stands in for the state after the last listed layer
+                 and goes through the same projection. Bridges, projection and drafter are trained on the block
+                 loss only: nothing asks the state to match the real one. Cost = number of listed layers
+                 (0.54 ms each on Qwen3-8B) + bridges. Examples: path:0,1,28   path:0,9,19,28   path:0,1,21-28
+--freeze-draft: the drafter is not trained (what joint training adds).
 Start: the lag-trained drafter. (A first version started the code at zero from the raw taps: the drafter learned
 to ignore the rows and all code arms stayed at the baseline, an optimisation failure, not a result.)
 
@@ -40,6 +49,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dflash.model import _output_head, extract_context_feature  # noqa: E402
 
@@ -97,10 +107,26 @@ def main():
     ap.add_argument("--max-train", type=int, default=0)
     ap.add_argument("--eval-every", type=int, default=500)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--freeze-draft", action="store_true")
+    ap.add_argument("--bridge", default="mlp", choices=["lin", "mlp", "attn"])
+    ap.add_argument("--rank", type=int, default=1024)
+    ap.add_argument("--ridge", type=float, default=1e-3)
     ap.add_argument("--save", default="exp125_code")
     args = ap.parse_args()
     dev, t0 = "cuda", time.time()
-    mode = "real" if args.code == "real" else ("none" if int(args.code) == 0 else "code")
+    kept, sl = [], 0
+    if args.code == "real":
+        mode = "real"
+    elif args.code.startswith("path:"):
+        mode = "path"
+        for part in args.code[5:].split(","):
+            lo, _, hi = part.partition("-")
+            kept += list(range(int(lo), int(hi or lo) + 1))
+        sl = max(kept) + 1
+    elif args.code.startswith("state:"):
+        mode, sl = "state", int(args.code[6:])
+    else:
+        mode = "none" if int(args.code) == 0 else "code"
 
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
@@ -118,15 +144,78 @@ def main():
     for p in target.parameters():
         p.requires_grad_(False)
     draft = load_draft(args.draft, dev).float()
-    draft.train()
+    if args.freeze_draft:
+        for p in draft.parameters():
+            p.requires_grad_(False)
+    else:
+        draft.train()
     lids, bs = list(draft.target_layer_ids), draft.block_size
     fc = draft.fc                                            # trained with the drafter, applied here
     draft.fc = nn.Identity()                                 # the drafter is fed fused features
     width, Hd = fc.in_features, fc.out_features
+    H = target.config.hidden_size
+    stack = proj = None
+    if mode == "path":
+        from exp116_band_bridge import BandStack
+        stack = BandStack(target, kept, sl, args.bridge, args.rank, 16)
+        print(f"[path] layers {kept}, removed spans {stack.spans}, stands in for hidden_states[{sl}], "
+              f"cost {stack.cost():.2f} layers", flush=True)
+
     def feats_of(ids):
+        """the sequence's real features; for state / path arms also the hidden states and the verify's prefix KV"""
         with torch.no_grad():
-            out = target(ids[None], output_hidden_states=True, logits_to_keep=1)
-            return extract_context_feature(out.hidden_states, lids)
+            hs = target(ids[None], output_hidden_states=True, logits_to_keep=1).hidden_states
+            seq = {"feats": extract_context_feature(hs, lids)}
+            if mode == "state":
+                seq["state"] = hs[sl]
+            if mode == "path":
+                pos = torch.arange(len(ids), device=dev)[None]
+                cos, sin = target.model.rotary_emb(hs[0], pos)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    kvp = stack.prefix_kv(hs, cos, sin)
+                seq.update(hs=hs, cos=cos, sin=sin, kvp=kvp)
+            return seq
+
+    if mode in ("state", "path"):                            # closed-form starts (exp118 projection, exp116 bridges)
+        with torch.no_grad():
+            xtx = torch.zeros(H + 1, H + 1, dtype=torch.float64, device=dev)
+            xty = torch.zeros(H + 1, Hd, dtype=torch.float64, device=dev)
+            spans = stack.spans if stack is not None and stack.bridges else []
+            acc = {b: [torch.zeros(H + 1, H + 1, dtype=torch.float64, device=dev),
+                       torch.zeros(H + 1, H, dtype=torch.float64, device=dev)] for _, b in spans}
+
+            def add(x, y, A, B):
+                w = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
+                xa = torch.cat([x, torch.ones_like(x[:, :1])], -1) * w
+                A += xa.T @ xa
+                B += xa.T @ (y * w)
+
+            for d in train[: args.pca_seqs]:
+                ids = d["ids"].long().to(dev)
+                hs = target(ids[None], output_hidden_states=True, logits_to_keep=1).hidden_states
+                lo = d["n_prompt"]
+                y = fc(extract_context_feature(hs, lids).float())[0, lo:].double()
+                add(hs[sl][0, lo:].double(), y, xtx, xty)
+                for a, b in spans:
+                    x = hs[a][0, lo:].double()
+                    add(x, hs[b + 1][0, lo:].double() - x, *acc[b])
+                del hs
+
+            def solve(A, B):
+                eye = torch.eye(H + 1, dtype=torch.float64, device=dev)
+                return torch.linalg.solve(A + args.ridge * A.diagonal().mean() * eye, B).float()
+
+            sol = solve(xtx, xty)
+            proj = nn.Linear(H, Hd, bias=True).to(dev)
+            proj.weight.copy_(sol[:H].T)
+            proj.bias.copy_(sol[H])
+            for _, b in spans:
+                sol = solve(*acc[b])
+                stack.bridges[str(b)].lin.weight.copy_(sol[:H].T)
+                stack.bridges[str(b)].lin.bias.copy_(sol[H])
+            del xtx, xty, acc
+        print(f"[fit] projection from hidden_states[{sl}]" + (f", {len(spans)} bridges" if spans else "")
+              + f", {time.time() - t0:.0f}s", flush=True)
 
     code = None
     if mode == "code":                                       # PCA of the fused real features (response positions)
@@ -137,7 +226,7 @@ def main():
             n = 0
             for d in train[: args.pca_seqs]:
                 ids = d["ids"].long().to(dev)
-                x = fc(feats_of(ids).float())[0, d["n_prompt"] :].double()
+                x = fc(feats_of(ids)["feats"].float())[0, d["n_prompt"] :].double()
                 sm += x.sum(0)
                 xx += x.T @ x
                 n += x.shape[0]
@@ -148,27 +237,55 @@ def main():
             print(f"[pca] {n} positions, top-{r} directions hold {float(ev[-r:].sum() / ev.sum()):.3f} of the "
                   f"variance, {time.time() - t0:.0f}s", flush=True)
         code = Code(Hd, r, mu.float(), U).to(dev)
-    dparams = [p for p in list(draft.parameters()) + list(fc.parameters()) if p.requires_grad]
-    groups = [{"params": dparams, "lr": args.lr}]
-    if code is not None:
-        groups.append({"params": list(code.parameters()), "lr": args.lr_code})
+    dparams = [] if args.freeze_draft else [p for p in list(draft.parameters()) + list(fc.parameters())
+                                             if p.requires_grad]
+    extra_mods = [m for m in (code, proj, stack) if m is not None]
+    eparams = [p for m in extra_mods for p in m.parameters()]
+    groups = ([{"params": dparams, "lr": args.lr}] if dparams else []) \
+        + ([{"params": eparams, "lr": args.lr_code}] if eparams else [])
+    assert groups, "nothing to train"
     opt = torch.optim.AdamW(groups, weight_decay=0.0, betas=(0.9, 0.95))
     total = max(1, int(len(train) * args.epochs / args.batch))
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / args.warmup) * 0.5 * (1 + math.cos(math.pi * min(s, total) / total)))
     print(f"trainable: drafter {sum(p.numel() for p in dparams) / 1e6:.0f} M"
-          + (f", code {sum(p.numel() for p in code.parameters()) / 1e6:.1f} M" if code is not None else "")
+          + (f", feature side {sum(p.numel() for p in eparams) / 1e6:.1f} M" if eparams else "")
           + f", {total} steps, {time.time() - t0:.0f}s", flush=True)
 
-    def forward(feats, ids, blocks):
+    def forward(seq, ids, blocks):
         """hidden states of the packed blocks; the in-flight positions of each block read the arm's features"""
         T = ids.shape[0]
-        real = fc(feats.float())                             # [1, T, Hd]
+        real = fc(seq["feats"].float())                      # [1, T, Hd]
         noise, pos, mask, starts = pack(draft, target, real, ids, blocks, bs)
         if mode == "none":
             ctx = real
+        elif mode == "path":                                 # every block has its own speculative rows
+            rows, rpos, spans_b = [], [], []
+            c = T
+            for blk in blocks:
+                s, g = blk[0], blk[1]
+                if g:
+                    a = s - g
+                    st = stack(seq["hs"][0][:, a:s], a, seq["kvp"], seq["cos"][:, a:s], seq["sin"][:, a:s],
+                               seq["hs"])[0]
+                    rows.append(proj(st.float()).to(real.dtype))
+                    rpos.append(torch.arange(a, s, device=ids.device))
+                spans_b.append((c, c + g))
+                c += g
+            ctx = torch.cat([real] + rows, 1)
+            q = noise.shape[1]
+            m = torch.zeros((q, c + q), dtype=torch.bool, device=ids.device)
+            m[:, :T] = mask[0, 0, :, :T]
+            m[:, c:] = mask[0, 0, :, T:]
+            a = 0
+            for blk, (ra, rb) in zip(blocks, spans_b):
+                m[a : a + blk[1] + bs, ra:rb] = True
+                a += blk[1] + bs
+            mask = m[None, None]
+            pos = torch.cat([pos[:, :T]] + [r[None] for r in rpos] + [pos[:, T:]], 1)
         else:
-            extra = real if mode == "real" else code(real.detach())
+            extra = (real if mode == "real" else proj(seq["state"].float()) if mode == "state"
+                     else code(real.detach()))
             ctx = torch.cat([real, extra.to(real.dtype)], 1)  # [1, 2T, Hd]: real rows, then the in-flight rows
             q = noise.shape[1]
             m = torch.zeros((q, 2 * T + q), dtype=torch.bool, device=ids.device)
@@ -185,9 +302,9 @@ def main():
                     past_key_values=None, use_cache=False)[0]
         return hid, starts
 
-    def loss_fn(feats, ids, blocks, stats=False):
+    def loss_fn(seq, ids, blocks, stats=False):
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            hid, starts = forward(feats, ids, blocks)
+            hid, starts = forward(seq, ids, blocks)
             T = ids.shape[0]
             rows, labels, weights, first = [], [], [], []
             for blk, st in zip(blocks, starts):
@@ -237,7 +354,8 @@ def main():
                     taus += t
                 rows.append({"lag": lag, "loss": sum(ls) / len(ls), "first token": sum(a1) / len(a1),
                              "tau": sum(taus) / len(taus), "blocks": len(taus)})
-        draft.train()
+        if not args.freeze_draft:
+            draft.train()
         return rows
 
     def show(tag, rows):
@@ -291,7 +409,10 @@ def main():
         out.mkdir(parents=True, exist_ok=True)
         torch.save({"draft": {k: v.detach().to(torch.bfloat16) for k, v in draft.state_dict().items()},
                     "fc": {k: v.detach().to(torch.bfloat16) for k, v in fc.state_dict().items()},
-                    "code": code.state_dict() if code is not None else None, "args": vars(args)}, out / "state.pt")
+                    "code": code.state_dict() if code is not None else None,
+                    "proj": proj.state_dict() if proj is not None else None,
+                    "bridges": stack.bridges.state_dict() if stack is not None else None,
+                    "args": vars(args)}, out / "state.pt")
         print(f"saved {out / 'state.pt'}", flush=True)
     print(f"[done] {time.time() - t0:.0f}s", flush=True)
 
