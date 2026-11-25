@@ -28,6 +28,12 @@ Arms (--code):
                  (which reads the real prefix KV) and replaces each MLP, about 3/4 of a layer's weights, by a
                  rank --sur-rank stand-in (linear part = truncated closed-form fit of the MLP, nonlinear part from
                  zero). An attention-only layer costs about a quarter of a layer.
+--lora-rank r: the path's layers are ADAPTED, not only bridged: LoRA of rank r on q / o (attention) and gate / up /
+down (MLP) of every listed layer, active only in this pass over the in-flight tokens (the verify keeps the original
+weights, so the output stays lossless; k / v projections stay frozen so the in-flight keys and values live in the
+same space as the verify's prefix cache). Trained with everything else on the block loss. This is the cell exp81
+(adapted layers, frozen drafter, imitation loss) and the frozen-layer paths (trained drafter) leave empty: an exit
+that is trained to emit what the drafter needs instead of tokens. path:0-3 is the plain early-exit shape.
 --freeze-draft: the drafter is not trained (what joint training adds).
 Start: the lag-trained drafter. (A first version started the code at zero from the raw taps: the drafter learned
 to ignore the rows and all code arms stayed at the baseline, an optimisation failure, not a result.)
@@ -84,14 +90,43 @@ class Sur(nn.Module):
         return (self.b(self.a(h)) + self.down(F.silu(self.gate(h)) * self.up(h))).to(dt)
 
 
-class SparsePath(BandStack):
-    """BandStack whose layers in attn_only keep their attention and replace the MLP by a Sur"""
+class LoRA(nn.Module):
+    """low-rank update added to the output of a frozen linear map; starts at zero"""
 
-    def __init__(self, target, kept, stop, kind, rank, attn_only, sur_rank):
+    def __init__(self, lin, r):
+        super().__init__()
+        self.a = nn.Linear(lin.in_features, r, bias=False)
+        self.b = nn.Linear(r, lin.out_features, bias=False)
+        nn.init.normal_(self.a.weight, std=1.0 / r)
+        nn.init.zeros_(self.b.weight)
+
+    def forward(self, x):
+        return self.b(self.a(x))
+
+
+class SparsePath(BandStack):
+    """BandStack whose layers in attn_only keep their attention and replace the MLP by a Sur; optional LoRA on the
+    kept layers (q, o, gate, up, down), used only in this pass"""
+
+    def __init__(self, target, kept, stop, kind, rank, attn_only, sur_rank, lora_rank=0):
         super().__init__(target, kept, stop, kind, rank, 16)
         self.attn_only = set(attn_only)
         H, dev = target.config.hidden_size, target.lm_head.weight.device
         self.sur = nn.ModuleDict({str(g): Sur(H, sur_rank) for g in sorted(self.attn_only)}).to(dev)
+        lo = {}
+        if lora_rank:
+            for g in self.kept:
+                lay = self._orig[g]
+                lo[f"{g}q"] = LoRA(lay.self_attn.q_proj, lora_rank)
+                lo[f"{g}o"] = LoRA(lay.self_attn.o_proj, lora_rank)
+                if g not in self.attn_only:
+                    lo[f"{g}g"] = LoRA(lay.mlp.gate_proj, lora_rank)
+                    lo[f"{g}u"] = LoRA(lay.mlp.up_proj, lora_rank)
+                    lo[f"{g}d"] = LoRA(lay.mlp.down_proj, lora_rank)
+        self.lora = nn.ModuleDict(lo).to(dev)
+
+    def _lo(self, key, x):
+        return self.lora[key](x) if key in self.lora else 0
 
     def cost(self):
         full = sum(p.numel() for p in self._orig[0].parameters())
@@ -117,7 +152,7 @@ class SparsePath(BandStack):
             lay = self._orig[g]
             attn = lay.self_attn
             hn = lay.input_layernorm(x)
-            q = attn.q_proj(hn).view(1, m, -1, self.hd)
+            q = (attn.q_proj(hn) + self._lo(f"{g}q", hn)).view(1, m, -1, self.hd)
             if hasattr(attn, "q_norm"):
                 q = attn.q_norm(q)
             q = rot(q.transpose(1, 2).to(BF), cos, sin)
@@ -126,14 +161,17 @@ class SparsePath(BandStack):
             K = torch.cat([Kp[:, :, :a], kn], 2).repeat_interleave(rep, 1)
             V = torch.cat([Vp[:, :, :a], vn], 2).repeat_interleave(rep, 1)
             o = F.scaled_dot_product_attention(q, K, V, attn_mask=mask)
-            x = x + attn.o_proj(o.transpose(1, 2).reshape(1, m, -1))
+            o = o.transpose(1, 2).reshape(1, m, -1)
+            x = x + attn.o_proj(o) + self._lo(f"{g}o", o)
             h2 = lay.post_attention_layernorm(x)
             if g in self.attn_only:
                 with torch.autocast("cuda", enabled=False):
                     x = x + self.sur[str(g)](h2)
             else:
                 mlp = lay.mlp
-                x = x + mlp.down_proj(mlp.act_fn(mlp.gate_proj(h2)) * mlp.up_proj(h2))
+                mid = (mlp.act_fn(mlp.gate_proj(h2) + self._lo(f"{g}g", h2))
+                       * (mlp.up_proj(h2) + self._lo(f"{g}u", h2)))
+                x = x + mlp.down_proj(mid) + self._lo(f"{g}d", mid)
         return x, outs
 
 
@@ -191,6 +229,7 @@ def main():
     ap.add_argument("--rank", type=int, default=1024)
     ap.add_argument("--ridge", type=float, default=1e-3)
     ap.add_argument("--sur-rank", type=int, default=256)
+    ap.add_argument("--lora-rank", type=int, default=0, help="LoRA on the path's layers (0 = frozen layers)")
     ap.add_argument("--block-chunk", type=int, default=0, help="backward over at most this many blocks at a time")
     ap.add_argument("--save", default="exp125_code")
     args = ap.parse_args()
@@ -240,8 +279,9 @@ def main():
     H = target.config.hidden_size
     stack = proj = None
     if mode == "path":
-        stack = SparsePath(target, kept, sl, args.bridge, args.rank, attn_only, args.sur_rank)
-        print(f"[path] layers {kept}, attention-only {attn_only}, removed spans {stack.spans}, "
+        stack = SparsePath(target, kept, sl, args.bridge, args.rank, attn_only, args.sur_rank, args.lora_rank)
+        print(f"[path] layers {kept}, attention-only {attn_only}, LoRA rank {args.lora_rank} "
+              f"({sum(p.numel() for p in stack.lora.parameters()) / 1e6:.1f} M), removed spans {stack.spans}, "
               f"stands in for hidden_states[{sl}], "
               f"cost {stack.cost():.2f} layers", flush=True)
 
@@ -524,6 +564,7 @@ def main():
                     "proj": proj.state_dict() if proj is not None else None,
                     "bridges": stack.bridges.state_dict() if stack is not None else None,
                     "sur": stack.sur.state_dict() if stack is not None else None,
+                    "lora": stack.lora.state_dict() if stack is not None else None,
                     "args": vars(args)}, out / "state.pt")
         print(f"saved {out / 'state.pt'}", flush=True)
     print(f"[done] {time.time() - t0:.0f}s", flush=True)
