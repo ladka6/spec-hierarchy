@@ -35,6 +35,19 @@ same space as the verify's prefix cache). Trained with everything else on the bl
 (adapted layers, frozen drafter, imitation loss) and the frozen-layer paths (trained drafter) leave empty: an exit
 that is trained to emit what the drafter needs instead of tokens. path:0-3 is the plain early-exit shape.
 --freeze-draft: the drafter is not trained (what joint training adds).
+
+Two producers that run NO target layer over the in-flight tokens:
+  self      (with --from-ckpt DIR of a trained code arm, e.g. r64) the drafter produces its own in-flight code. The
+            block that drafted the in-flight tokens (anchor s - g, standard block) leaves a final hidden state for
+            each of them; a predictor maps [that state, the token's embedding] to the r numbers of the trained code,
+            and the trained decoder turns them into the row the drafter reads. The predictor starts as the
+            closed-form ridge map to the oracle code (so step 0 is the exp126 probe), then predictor and drafter
+            train on the block loss plus --distill x the distance to the oracle code. DLoop also feeds the
+            drafter's own states back; here they are pulled to a target-derived code the drafter was trained to
+            read. Extra cost per stage: none (the states exist already).
+  xattn:L   one new layer (self-attention over the in-flight tokens, cross-attention into the REAL states of
+            layer L - 1 of the verified prefix, which the last verify left behind, MLP) over the in-flight token
+            embeddings; trained with the drafter on the block loss. About 1.4 layers of weights per stage.
 Start: the lag-trained drafter. (A first version started the code at zero from the raw taps: the drafter learned
 to ignore the rows and all code arms stayed at the baseline, an optimisation failure, not a result.)
 
@@ -175,6 +188,68 @@ class SparsePath(BandStack):
         return x, outs
 
 
+class Pred(nn.Module):
+    """[drafter state, token embedding] of an in-flight position -> the r numbers of the trained code"""
+
+    def __init__(self, H, r, hid=1024):
+        super().__init__()
+        self.lin = nn.Linear(2 * H, r)
+        self.res = nn.Sequential(nn.Linear(2 * H, hid), nn.GELU(), nn.Linear(hid, r))
+        nn.init.zeros_(self.lin.weight)
+        nn.init.zeros_(self.lin.bias)
+        nn.init.zeros_(self.res[-1].weight)
+        nn.init.zeros_(self.res[-1].bias)
+
+    def forward(self, x):
+        x = x.float()
+        return self.lin(x) + self.res(x)
+
+
+class Reader(nn.Module):
+    """one layer over the in-flight token embeddings: self-attention, cross-attention into real prefix states of
+    one target layer (the last `win` positions), gated MLP; output added to a linear map of the embeddings"""
+
+    def __init__(self, H, Hd, heads=16, win=64, span=16):
+        super().__init__()
+        self.h, self.win = heads, win
+        self.ne, self.nm = nn.LayerNorm(H), nn.LayerNorm(H)
+        self.pe, self.pm = nn.Embedding(span, H), nn.Embedding(win, H)
+        self.n1, self.qkv = nn.LayerNorm(H), nn.Linear(H, 3 * H, bias=False)
+        self.o1 = nn.Linear(H, H, bias=False)
+        self.n2, self.q2, self.kv2 = nn.LayerNorm(H), nn.Linear(H, H, bias=False), nn.Linear(H, 2 * H, bias=False)
+        self.o2 = nn.Linear(H, H, bias=False)
+        self.n3 = nn.LayerNorm(H)
+        self.gate, self.up = nn.Linear(H, 2 * H, bias=False), nn.Linear(H, 2 * H, bias=False)
+        self.down = nn.Linear(2 * H, H, bias=False)
+        self.base = nn.Linear(H, Hd)                         # closed-form start: embedding -> fused feature
+        self.out = nn.Linear(H, Hd, bias=False)
+        nn.init.normal_(self.pe.weight, std=0.02)
+        nn.init.normal_(self.pm.weight, std=0.02)
+        nn.init.zeros_(self.out.weight)
+
+    def _heads(self, x):
+        B, T, _ = x.shape
+        return x.view(B, T, self.h, -1).transpose(1, 2)
+
+    def forward(self, e, mem):                               # e [1, g, H] embeddings, mem [1, w, H] real states
+        e, mem = e.float(), mem.float()
+        g, w = e.shape[1], mem.shape[1]
+        x = self.ne(e) + self.pe(torch.arange(g, device=e.device))[None]
+        m = self.nm(mem) + self.pm(torch.arange(w - 1, -1, -1, device=e.device))[None]   # 0 = nearest to the span
+        q, k, v = (self._heads(t) for t in self.qkv(self.n1(x)).chunk(3, -1))
+        x = x + self.o1(F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(1, g, -1))
+        k2, v2 = (self._heads(t) for t in self.kv2(m).chunk(2, -1))
+        a = F.scaled_dot_product_attention(self._heads(self.q2(self.n2(x))), k2, v2)
+        x = x + self.o2(a.transpose(1, 2).reshape(1, g, -1))
+        h = self.n3(x)
+        x = x + self.down(F.silu(self.gate(h)) * self.up(h))
+        return self.base(unit(e)) + self.out(x)
+
+
+def unit(x):
+    return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-6)
+
+
 class Code(nn.Module):
     """fused real feature of one position -> r numbers -> a vector in the drafter's fused feature space.
     Linear path initialised to the rank-r PCA projection (the exp84 point: useful from step 0, so the drafter does
@@ -231,6 +306,10 @@ def main():
     ap.add_argument("--sur-rank", type=int, default=256)
     ap.add_argument("--lora-rank", type=int, default=0, help="LoRA on the path's layers (0 = frozen layers)")
     ap.add_argument("--block-chunk", type=int, default=0, help="backward over at most this many blocks at a time")
+    ap.add_argument("--from-ckpt", default="", help="start drafter / fusion (and, for self, the code) from this "
+                                                    "exp125 output directory")
+    ap.add_argument("--distill", type=float, default=1.0, help="self: weight of the distance to the oracle code")
+    ap.add_argument("--mem-win", type=int, default=64, help="xattn: prefix positions the reader may attend to")
     ap.add_argument("--save", default="exp125_code")
     args = ap.parse_args()
     dev, t0 = "cuda", time.time()
@@ -248,6 +327,11 @@ def main():
         sl = max(kept) + 1
     elif args.code.startswith("state:"):
         mode, sl = "state", int(args.code[6:])
+    elif args.code.startswith("xattn:"):
+        mode, sl = "xattn", int(args.code[6:])
+    elif args.code == "self":
+        mode = "self"
+        assert args.from_ckpt, "self needs --from-ckpt of a trained code arm"
     else:
         mode = "none" if int(args.code) == 0 else "code"
 
@@ -277,7 +361,13 @@ def main():
     draft.fc = nn.Identity()                                 # the drafter is fed fused features
     width, Hd = fc.in_features, fc.out_features
     H = target.config.hidden_size
-    stack = proj = None
+    stack = proj = pred = reader = None
+    st0 = None
+    if args.from_ckpt:
+        st0 = torch.load(Path(args.from_ckpt) / "state.pt", weights_only=False)
+        draft.load_state_dict(st0["draft"])
+        fc.load_state_dict(st0["fc"])
+        print(f"[start] drafter and fusion from {args.from_ckpt} (arm {st0['args']['code']})", flush=True)
     if mode == "path":
         stack = SparsePath(target, kept, sl, args.bridge, args.rank, attn_only, args.sur_rank, args.lora_rank)
         print(f"[path] layers {kept}, attention-only {attn_only}, LoRA rank {args.lora_rank} "
@@ -290,8 +380,10 @@ def main():
         with torch.no_grad():
             hs = target(ids[None], output_hidden_states=True, logits_to_keep=1).hidden_states
             seq = {"feats": extract_context_feature(hs, lids)}
-            if mode == "state":
+            if mode in ("state", "xattn"):
                 seq["state"] = hs[sl]
+            if mode in ("self", "xattn"):
+                seq["emb"] = hs[0]
             if mode == "path":
                 pos = torch.arange(len(ids), device=dev)[None]
                 cos, sin = target.model.rotary_emb(hs[0], pos)
@@ -382,10 +474,81 @@ def main():
             print(f"[pca] {n} positions, top-{r} directions hold {float(ev[-r:].sum() / ev.sum()):.3f} of the "
                   f"variance, {time.time() - t0:.0f}s", flush=True)
         code = Code(Hd, r, mu.float(), U).to(dev)
+    zstd = 1.0
+
+    def own_states(real, ids, blocks):
+        """final drafter states of the in-flight positions of every lagged block, from the standard block that
+        drafted them (anchor s - g, real features before it): one packed drafter pass"""
+        b1 = [(blk[0] - blk[1], 0) for blk in blocks if blk[1]]
+        if not b1:
+            return []
+        noise, pos, mask, starts = pack(draft, target, real, ids, b1, bs)
+        hid = draft(target_hidden=real, noise_embedding=noise, position_ids=pos, attention_mask=mask,
+                    past_key_values=None, use_cache=False)[0]
+        return [hid[st - 1 : st - 1 + bs] for st in starts]
+
+    def oracle_code(x):
+        return code.enc(x.float()) + code.enc_res(x.float())
+
+    if mode == "self":
+        assert st0.get("code") is not None, "--from-ckpt must be a code arm"
+        r = st0["code"]["enc.weight"].shape[0]
+        code = Code(Hd, r, torch.zeros(Hd), torch.zeros(Hd, r)).to(dev)
+        code.load_state_dict(st0["code"])
+        for p in code.parameters():
+            p.requires_grad_(False)
+        pred = Pred(H, r).to(dev)
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            xtx = torch.zeros(2 * H + 1, 2 * H + 1, dtype=torch.float64, device=dev)
+            xty = torch.zeros(2 * H + 1, r, dtype=torch.float64, device=dev)
+            frng, zs, zq, n = random.Random(1), 0.0, 0.0, 0
+            for d in train[: args.pca_seqs]:
+                ids = d["ids"].long().to(dev)
+                seq = feats_of(ids)
+                real = fc(seq["feats"].float())
+                z = oracle_code(real[0]).float()
+                blocks = [(s, min(16, s - 1)) for s, _ in
+                          sample_blocks(d["n_prompt"], len(ids), 16, bs, 0, 1.0, frng)]
+                blocks = [b for b in blocks if b[1] == 16]
+                for (s, g), h1 in zip(blocks, own_states(real, ids, blocks)):
+                    a = s - g
+                    x = torch.cat([unit(h1[:g]), unit(seq["emb"][0, a:s]), torch.ones(g, 1, device=dev)], -1).double()
+                    y = z[a:s].double()
+                    xtx += x.T @ x
+                    xty += x.T @ y
+                    zs, zq, n = zs + float(y.sum()), zq + float(y.pow(2).sum()), n + y.numel()
+            A = xtx + args.ridge * xtx.diagonal().mean() * torch.eye(2 * H + 1, dtype=torch.float64, device=dev)
+            sol = torch.linalg.solve(A, xty).float()
+            pred.lin.weight.copy_(sol[: 2 * H].T)
+            pred.lin.bias.copy_(sol[2 * H])
+            zstd = max((zq / n - (zs / n) ** 2) ** 0.5, 1e-6)
+            del xtx, xty, A
+        print(f"[fit] predictor of the {r}-number code from the drafter's own states, code std {zstd:.3f}, "
+              f"{time.time() - t0:.0f}s", flush=True)
+    if mode == "xattn":
+        reader = Reader(H, Hd, win=args.mem_win).to(dev)
+        with torch.no_grad():
+            xtx = torch.zeros(H + 1, H + 1, dtype=torch.float64, device=dev)
+            xty = torch.zeros(H + 1, Hd, dtype=torch.float64, device=dev)
+            for d in train[: args.pca_seqs]:
+                ids = d["ids"].long().to(dev)
+                seq = feats_of(ids)
+                lo = d["n_prompt"]
+                x = torch.cat([unit(seq["emb"][0, lo:]), torch.ones(len(ids) - lo, 1, device=dev)], -1).double()
+                xtx += x.T @ x
+                xty += x.T @ fc(seq["feats"].float())[0, lo:].double()
+            A = xtx + args.ridge * xtx.diagonal().mean() * torch.eye(H + 1, dtype=torch.float64, device=dev)
+            sol = torch.linalg.solve(A, xty).float()
+            reader.base.weight.copy_(sol[:H].T)
+            reader.base.bias.copy_(sol[H])
+            del xtx, xty, A
+        print(f"[fit] reader over real states of hidden_states[{sl}], window {args.mem_win}, "
+              f"{sum(p.numel() for p in reader.parameters()) / 1e6:.0f} M, {time.time() - t0:.0f}s", flush=True)
     dparams = [] if args.freeze_draft else [p for p in list(draft.parameters()) + list(fc.parameters())
                                              if p.requires_grad]
-    extra_mods = [m for m in (code, proj, stack) if m is not None]
-    eparams = [p for m in extra_mods for p in m.parameters()]
+    extra_mods = [m for m in (code, proj, stack, pred, reader) if m is not None]
+    eparams = [p for m in extra_mods for p in m.parameters() if p.requires_grad]
+    aux = []
     groups = ([{"params": dparams, "lr": args.lr}] if dparams else []) \
         + ([{"params": eparams, "lr": args.lr_code}] if eparams else [])
     assert groups, "nothing to train"
@@ -404,16 +567,26 @@ def main():
         noise, pos, mask, starts = pack(draft, target, real, ids, blocks, bs)
         if mode == "none":
             ctx = real
-        elif mode == "path":                                 # every block has its own speculative rows
+        elif mode in ("path", "self", "xattn"):              # every block has its own speculative rows
             rows, rpos, spans_b = [], [], []
             c = T
+            own = iter(own_states(real, ids, blocks)) if mode == "self" else None
             for blk in blocks:
                 s, g = blk[0], blk[1]
                 if g:
                     a = s - g
-                    st = stack(seq["hs"][0][:, a:s], a, seq["kvp"], seq["cos"][:, a:s], seq["sin"][:, a:s],
-                               seq["hs"])[0]
-                    rows.append(proj(st.float()).to(real.dtype))
+                    if mode == "path":
+                        st = stack(seq["hs"][0][:, a:s], a, seq["kvp"], seq["cos"][:, a:s], seq["sin"][:, a:s],
+                                   seq["hs"])[0]
+                        row = proj(st.float())
+                    elif mode == "self":
+                        x = torch.cat([unit(next(own)[:g]), unit(seq["emb"][0, a:s])], -1)[None]
+                        z = pred(x)
+                        row = code.dec(z) + code.dec_res(z)
+                        aux.append(((z - oracle_code(real[:, a:s]).detach()) / zstd).pow(2).mean())
+                    else:
+                        row = reader(seq["emb"][:, a:s], seq["state"][:, max(0, a - args.mem_win) : a])
+                    rows.append(row.to(real.dtype))
                     rpos.append(torch.arange(a, s, device=ids.device))
                 spans_b.append((c, c + g))
                 c += g
@@ -468,6 +641,10 @@ def main():
             logits = draft.compute_logits(hid[rows_t], _output_head(target)).float()
         ce = F.cross_entropy(logits, labels_t, reduction="none")
         loss = (ce * w).sum() / w.sum()
+        if aux:                                              # training only: reported eval loss stays the block loss
+            if torch.is_grad_enabled():
+                loss = loss + args.distill * torch.stack([a.float() for a in aux]).mean()
+            aux.clear()
         ok = logits.argmax(-1) == labels_t
         acc1 = ok[first].float().mean()
         if not stats:
@@ -565,6 +742,8 @@ def main():
                     "bridges": stack.bridges.state_dict() if stack is not None else None,
                     "sur": stack.sur.state_dict() if stack is not None else None,
                     "lora": stack.lora.state_dict() if stack is not None else None,
+                    "pred": pred.state_dict() if pred is not None else None,
+                    "reader": reader.state_dict() if reader is not None else None,
                     "args": vars(args)}, out / "state.pt")
         print(f"saved {out / 'state.pt'}", flush=True)
     print(f"[done] {time.time() - t0:.0f}s", flush=True)

@@ -17,6 +17,12 @@ B. Use (interventions on the trained drafter, lag 8 and 16). tau when the in-fli
    repair the first drafted token (the fork) or the tokens after it?
 C. Geometry. Overlap of the trained encoder's linear subspace with the PCA subspace it started from; effective
    dimension of the code (participation ratio).
+D. Can the drafter produce the code itself? (the zero-cost producer) A real second stage: block 1 from anchor a0 with
+   real features, cut at its first error e (oracle), block 2 from the last kept token; the e kept tokens are
+   in-flight. They read: nothing (tokens only), the trained code of their real features, or that code PREDICTED in
+   closed form (ridge, no training) from the token embedding, from the final hidden state the drafter left at that
+   position in block 1, or from both. tau of block 2, and the share of the code's variance each predictor explains.
+   A ridge map is a lower bound for what a trained predictor inside the drafter could do.
 
   python scripts/exp126_code_content.py --data /scratch-shared/$USER/hspec_lagft/data \
       --ckpts /scratch-shared/$USER/hspec_code/r0 .../r16 .../r64 .../r256 .../rreal
@@ -92,8 +98,9 @@ def main():
     def head(state):                                         # hidden_states[-1] (already normed, as exp115) -> logits
         return lm(state.to(lm.weight.dtype)).float()
 
-    def block_logits(draft, real, extra, ids, s, g, bs, rows):
-        """one block at anchor s, lag g; rows = positions of `extra` it may read (None: all of s-g .. s-1)"""
+    def block_logits(draft, real, extra, ids, s, g, bs, rows, want_hid=False):
+        """one block at anchor s, lag g; rows = positions of `extra` it may read (None: all of s-g .. s-1).
+        want_hid: also the drafter's final states of the anchor and the 15 drafted slots (positions s .. s+15)"""
         T = ids.shape[0]
         noise, pos, mask, starts = pack(draft, target, real, ids, [(s, g)], bs)
         ctx = real
@@ -111,7 +118,8 @@ def main():
         with torch.autocast("cuda", dtype=BF):
             hid = draft(target_hidden=ctx, noise_embedding=noise, position_ids=pos, attention_mask=mask,
                         past_key_values=None, use_cache=False)[0]
-            return draft.compute_logits(hid[starts[0] : starts[0] + bs - 1], _output_head(target)).float()
+            lg = draft.compute_logits(hid[starts[0] : starts[0] + bs - 1], _output_head(target)).float()
+        return (lg, hid[starts[0] - 1 : starts[0] - 1 + bs].float()) if want_hid else lg
 
     for ck in args.ckpts:
         st = torch.load(Path(ck) / "state.pt", weights_only=False)
@@ -324,6 +332,93 @@ def main():
         print_table(hrows, list(hrows[0]), f"B. Accuracy at block position k given a correct prefix, arm {arm} "
                                            f"(the in-flight positions show: {conds[0]})")
         out["use"][arm], out["hazard"][arm] = rows, hrows
+
+        # ---------------- D. second stage at the natural lag; the code from the drafter's own states ----------------
+        def first_stage(ids, real, a0):
+            lg, h1 = block_logits(draft, real, None, ids, a0, 0, bs, [], want_hid=True)
+            tru = ids[a0 + 1 : a0 + bs]
+            ok = (lg.argmax(-1)[: len(tru)] == tru).tolist()
+            return (ok.index(False) if False in ok else len(ok)), h1
+
+        preds, zvar = {}, None
+        if mode == "code":
+            names = {"token": lambda h, e: e, "drafter state": lambda h, e: h,
+                     "drafter state + token": lambda h, e: torch.cat([h, e], -1)}
+            accp = {}
+            frng = random.Random(7)
+            for d in fit:
+                ids, hs, feats = seq_of(d, lids)
+                real = fused(feats)
+                z = code.enc(real[0]) + code.enc_res(real[0])
+                for a0, _ in sample_blocks(d["n_prompt"], len(ids), 8, bs, 0, 1.0, frng):
+                    e, h1 = first_stage(ids, real, a0)
+                    if e == 0:
+                        continue
+                    p = torch.arange(a0, a0 + e, device=dev)
+                    hu, eu = unit(h1[:e]), unit(emb(ids[p]).float())
+                    for k, f in names.items():
+                        x = torch.cat([f(hu, eu), torch.ones(e, 1, device=dev)], -1).double()
+                        if k not in accp:
+                            accp[k] = [torch.zeros(x.shape[1], x.shape[1], dtype=torch.float64, device=dev),
+                                       torch.zeros(x.shape[1], r, dtype=torch.float64, device=dev)]
+                        accp[k][0] += x.T @ x
+                        accp[k][1] += x.T @ z[p].double()
+                del hs
+            for k, (xx_, xy_) in accp.items():
+                A = xx_ + args.ridge * xx_.diagonal().mean() * torch.eye(xx_.shape[0], dtype=torch.float64, device=dev)
+                preds[k] = (names[k], torch.linalg.solve(A, xy_).float())
+            del accp
+            print(f"[self] code predictors fitted, {time.time() - t0:.0f}s", flush=True)
+        dconds = ["tokens only"] + (["real features"] if mode == "real" else []) \
+            + (["trained code (real)"] + [f"code from {k}" for k in preds] if mode == "code" else [])
+        t2 = {c: [] for c in dconds}
+        es, sse, zsum, zsq, zn = [], {k: 0.0 for k in preds}, 0.0, 0.0, 0
+        drng = random.Random(321)
+        for d in val:
+            ids, hs, feats = seq_of(d, lids)
+            real = fused(feats)
+            base = real if mode == "real" else (code(real) if mode == "code" else None)
+            z = (code.enc(real[0]) + code.enc_res(real[0])) if mode == "code" else None
+            for a0, _ in sample_blocks(d["n_prompt"], len(ids), args.val_blocks, bs, 0, 1.0, drng):
+                e, h1 = first_stage(ids, real, a0)
+                es.append(e)
+                s2 = a0 + e
+                if e == 0 or s2 + 2 >= len(ids):
+                    continue
+                span = list(range(a0, s2))
+                tru = ids[s2 + 1 : s2 + bs]
+                p = torch.arange(a0, s2, device=dev)
+                hu, eu = unit(h1[:e]), unit(emb(ids[p]).float())
+                for c in dconds:
+                    extra, rows = base, None
+                    if c == "tokens only":
+                        rows = []
+                    elif c.startswith("code from "):
+                        f, Wp = preds[c[10:]]
+                        zp = torch.cat([f(hu, eu), torch.ones(e, 1, device=dev)], -1) @ Wp
+                        sse[c[10:]] += float((zp - z[p]).pow(2).sum())
+                        extra = base.clone()
+                        extra[0, span] = (code.dec(zp) + code.dec_res(zp)).to(base.dtype)
+                    lg = block_logits(draft, real, extra if mode != "none" else None, ids, s2, e, bs, rows)
+                    ok = (lg.argmax(-1)[: len(tru)] == tru).tolist()
+                    t2[c].append(1 + (ok.index(False) if False in ok else len(ok)))
+                if mode == "code":
+                    zsum, zsq, zn = zsum + float(z[p].sum()), zsq + float(z[p].pow(2).sum()), zn + z[p].numel()
+            del hs
+        if mode == "code" and zn:
+            zvar = zsq / zn - (zsum / zn) ** 2
+        drows = []
+        for c in dconds:
+            row = {"kept (in-flight) tokens read": c, "tau of block 2": sum(t2[c]) / max(len(t2[c]), 1),
+                   "blocks": len(t2[c])}
+            if c.startswith("code from ") and zvar:
+                row["code variance explained"] = 1 - sse[c[10:]] / zn / zvar
+            drows.append(row)
+        print_table(drows, ["kept (in-flight) tokens read", "tau of block 2", "blocks", "code variance explained"],
+                    f"D. Second stage after an oracle cut, arm {arm}: mean kept tokens "
+                    f"{sum(es) / max(len(es), 1):.2f}, blocks with a first-token error skipped "
+                    f"({sum(1 for x in es if x == 0)} of {len(es)})")
+        out.setdefault("second_stage", {})[arm] = drows
         del draft, fc, code
         torch.cuda.empty_cache()
 

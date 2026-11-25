@@ -20,6 +20,10 @@ wrong token (A = e, the one-block value); an early cut with a wrong token at c L
 
 Rules: fixed c; conf < thr (first position whose max-probability is below thr, else 15); oracle (c = e, the first
 error; 15 on a clean block); best = the best c in hindsight per chain variant (upper bound for any cut rule).
+fork top-k: no cut is chosen. The k positions where the first draft is least confident each get a branch (kept
+tokens, the token there by the variant's rule, the continuation), all branches drafted in one batched drafter call
+and verified together with the plain block as a tree; the verify picks the branch, so the score is the best of the
+plain block and the k branches. Cost: the same drafter calls, 16 k more tokens in the verify.
 Feature conditions for the kept tokens: real (target features), none (tokens only).
 
 Tables: A per rule and variant; cut statistics of the conf rules; estimated speed against one block per verify,
@@ -65,8 +69,10 @@ def main():
     ap.add_argument("--anchors", type=int, default=1000)
     ap.add_argument("--fixed", nargs="+", type=int, default=[1, 2, 4, 8])
     ap.add_argument("--thrs", nargs="+", type=float, default=[0.5, 0.7, 0.9])
-    ap.add_argument("--D", type=float, default=3.3, help="ms per drafter call (cost model)")
-    ap.add_argument("--F", type=float, default=19.0, help="ms per full verify (cost model)")
+    ap.add_argument("--D", type=float, default=3.55, help="ms per drafter call (measured, bench_band)")
+    ap.add_argument("--F", type=float, default=20.4, help="ms per full verify of 16 tokens (measured)")
+    ap.add_argument("--F-slope", type=float, default=0.04, help="ms per further verified token (measured)")
+    ap.add_argument("--forks", nargs="+", type=int, default=[2, 3])
     ap.add_argument("--E", nargs="+", type=float, default=[0.0, 2.6, 5.3], help="ms of the feature pass per chain")
     ap.add_argument("--fit-tokens", type=int, default=600_000, help="as exp112: fixes the held-out split")
     ap.add_argument("--val-tokens", type=int, default=15_000)
@@ -104,7 +110,9 @@ def main():
         with torch.autocast("cuda", dtype=torch.bfloat16):
             return blocks_logits(draft, target, feats, x, [(s, lag)], bs)[0].float()
 
-    rules = [f"fixed {k}" for k in args.fixed] + [f"conf<{t:g}" for t in args.thrs] + ["oracle", "best"]
+    rules = [f"fixed {k}" for k in args.fixed] + [f"conf<{t:g}" for t in args.thrs] \
+        + [f"fork top-{k}" for k in args.forks] + ["oracle", "best"]
+    cover = {k: 0 for k in args.forks}                       # first error among the k least confident positions
     variants = [(c, sp, ct) for c in CONDS for sp in SUPS for ct in CONTS]
     acc = {(r, v): [] for r in rules for v in variants}
     cut = {f"conf<{t:g}": {"late": 0, "exact": 0, "early": 0, "lost": 0, "none": 0} for t in args.thrs}
@@ -169,10 +177,15 @@ def main():
                 st["early"] += c < e
                 st["lost"] += max(e - c, 0)
             cs["oracle"] = e
+            order = sorted(range(nb), key=lambda i: conf[i])
+            for k in args.forks:
+                cover[k] += e >= nb or e in order[:k]
             for v in variants:
                 cond, sp, ct = v
                 for r, c in cs.items():
                     acc[(r, v)].append(A[(cond, c, sp, ct)])
+                for k in args.forks:
+                    acc[(f"fork top-{k}", v)].append(max([e] + [A[(cond, c, sp, ct)] for c in order[:k]]))
                 acc[("best", v)].append(max(A[(cond, c, sp, ct)] for c in range(nb + 1)))
         del hs, feats
         if n_done % 100 == 0:
@@ -207,15 +220,20 @@ def main():
                     a = mean(acc[(r, (cond, sp, ct))])
                     calls = 2 if ct == "tail" else 3
                     row = {"features": cond, "rule": r, "token": sp, "continuation": ct, "A": a}
+                    more = 16 * (int(r.split("-")[1]) if r.startswith("fork") else 1)   # verified tokens beyond 16
                     for e_ms in args.E:
-                        row[f"speed E={e_ms:g}"] = ((a + 1) / (args.F + calls * args.D + e_ms)) / ((a1 + 1) / (args.F + args.D))
+                        row[f"speed E={e_ms:g}"] = ((a + 1) / (args.F + args.F_slope * more + calls * args.D + e_ms)) \
+                            / ((a1 + 1) / (args.F + args.D))
                     srows.append(row)
     for cond in CONDS:
         top = sorted([r for r in srows if r["features"] == cond and r["rule"] != "best"],
                      key=lambda r: -r[f"speed E={args.E[0]:g}"])[:10]
         print_table(top, list(top[0]), f"Estimated speed against one block per verify, ten best rule / variant pairs, "
                                        f"{cond} features (D = {args.D} ms, F = {args.F} ms; E = feature pass, ms)")
-    out["speed"], out["cuts"] = srows, crow
+    frow = [{"k": k, "first error among the k least confident positions (or a clean block)": cover[k] / n_used}
+            for k in args.forks]
+    print_table(frow, list(frow[0]), "Coverage of the fork positions")
+    out["speed"], out["cuts"], out["forks"] = srows, crow, frow
     save_json(args.save, out)
     print(f"[done] {time.time() - t0:.0f}s", flush=True)
 
