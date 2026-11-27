@@ -60,6 +60,7 @@ right, tau = accepted drafted tokens + 1; at the start and at the end of trainin
 
 from __future__ import annotations
 
+import gc
 import argparse
 import math
 import random
@@ -552,7 +553,11 @@ def main():
     groups = ([{"params": dparams, "lr": args.lr}] if dparams else []) \
         + ([{"params": eparams, "lr": args.lr_code}] if eparams else [])
     assert groups, "nothing to train"
-    opt = torch.optim.AdamW(groups, weight_decay=0.0, betas=(0.9, 0.95))
+    gc.collect()
+    torch.cuda.empty_cache()
+    # foreach=False: the multi-tensor step makes a temporary copy of all second moments (4 GB for the fp32
+    # drafter), which is what ran out of memory in the self and xattn arms
+    opt = torch.optim.AdamW(groups, weight_decay=0.0, betas=(0.9, 0.95), foreach=False)
     total = max(1, int(len(train) * args.epochs / args.batch))
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / args.warmup) * 0.5 * (1 + math.cos(math.pi * min(s, total) / total)))
