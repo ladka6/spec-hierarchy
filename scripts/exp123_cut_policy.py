@@ -77,6 +77,10 @@ def main():
     ap.add_argument("--fit-tokens", type=int, default=600_000, help="as exp112: fixes the held-out split")
     ap.add_argument("--val-tokens", type=int, default=15_000)
     ap.add_argument("--max-len", type=int, default=1024)
+    ap.add_argument("--lag-val", action="store_true",
+                    help="anchors from the 48 validation sequences of train_lag.py: the only sequences a "
+                         "lag-trained drafter has not been trained on (the default held-out part is held out "
+                         "from the fits of this script, not from that training)")
     ap.add_argument("--save", default="exp123_cut_policy")
     args = ap.parse_args()
     assert args.data or args.cache, "--data or --cache"
@@ -98,6 +102,9 @@ def main():
     max_fit = int(0.6 * len(seqs))
     fit_end = take(take(0, args.fit_tokens, max_fit), args.val_tokens, max_fit + (len(seqs) - max_fit) // 4)
     rest = seqs[fit_end:]
+    if args.lag_val:
+        from exp111_tap_importance import val_split
+        rest = [(d["ids"].long(), int(d["n_prompt"])) for d in val_split(args.data, 48, 1024, 0)]
     cand_a = [(si, s) for si, (ids, lo) in enumerate(rest) for s in range(max(lo, 18), len(ids) - bs)]
     random.Random(1).shuffle(cand_a)
     by_seq = {}

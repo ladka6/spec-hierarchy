@@ -312,6 +312,8 @@ def main():
     ap.add_argument("--distill", type=float, default=1.0, help="self: weight of the distance to the oracle code")
     ap.add_argument("--mem-win", type=int, default=64, help="xattn: prefix positions the reader may attend to")
     ap.add_argument("--save", default="exp125_code")
+    ap.add_argument("--audit", action="store_true",
+                    help="no training: perturbation checks of what a block can see in this arm, then exit")
     args = ap.parse_args()
     dev, t0 = "cuda", time.time()
     kept, attn_only, sl = [], [], 0
@@ -662,13 +664,79 @@ def main():
             i += n
         return loss, acc1, taus
 
+    if args.audit:
+        # What may a block at anchor s with g in-flight tokens depend on? Everything the target computed at or after
+        # the anchor: nothing. The tokens after the anchor: nothing. What the target computed AT the in-flight
+        # positions: only the oracle arms (real / code / state); a producer arm (none / path / self / xattn) must
+        # not change. The last position before the in-flight span: every arm must change (the check can fail).
+        draft.eval()
+        with torch.no_grad():                                # zero-initialised outputs would hide a leak: open them
+            for m_ in extra_mods:
+                for p_ in m_.parameters():
+                    if float(p_.abs().max()) == 0:
+                        nn.init.normal_(p_, std=0.02)
+
+        def rnd(t, dim, lo, hi):
+            t = t.clone()
+            ix = [slice(None)] * t.dim()
+            ix[dim] = slice(lo, hi)
+            t[tuple(ix)] = (torch.randn_like(t[tuple(ix)].float()) * t.float().std()).to(t.dtype)
+            return t
+
+        def perturbed(seq, lo, hi):
+            out = dict(seq)
+            out["feats"] = rnd(seq["feats"], 1, lo, hi)
+            if "state" in seq:
+                out["state"] = rnd(seq["state"], 1, lo, hi)
+            if "hs" in seq:                                  # the embeddings stay: the tokens are known
+                out["hs"] = tuple([seq["hs"][0]] + [rnd(h, 1, lo, hi) for h in seq["hs"][1:]])
+                out["kvp"] = {g_: (rnd(K_, 2, lo, hi), rnd(V_, 2, lo, hi)) for g_, (K_, V_) in seq["kvp"].items()}
+            return out
+
+        def states(seq, x, blocks):
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                hid, starts = forward(seq, x, blocks)
+            aux.clear()
+            return hid[starts[0] : starts[0] + bs - 1].float()
+
+        bad, oracle = 0, mode in ("real", "code", "state")
+        for d in val[:4]:
+            ids = d["ids"].long().to(dev)
+            T = len(ids)
+            s = min(d["n_prompt"] + 40, T - bs - 4)
+            seq = feats_of(ids)
+            for g in (0, 4, 16):
+                blocks = [(s, g), (s - 7, min(g, 3))]        # the block under test, packed with another one
+                base = states(seq, ids, blocks)
+                tol = 1e-3 * float(base.abs().max())
+
+                def diff(sq, x):
+                    return float((states(sq, x, blocks) - base).abs().max())
+
+                x2 = ids.clone()
+                x2[s + 1 :] = torch.randint(0, 1000, (T - s - 1,), device=dev)
+                checks = [("target outputs at / after the anchor", diff(perturbed(seq, s, T), ids), False),
+                          ("tokens after the anchor", diff(seq, x2), False),
+                          ("target output just before the in-flight span", diff(perturbed(seq, s - g - 1, s - g), ids),
+                           True)]
+                if g:
+                    checks.append(("target outputs at the in-flight positions", diff(perturbed(seq, s - g, s), ids),
+                                   oracle))
+                for name, dv, should in checks:
+                    ok = (dv > tol) == should
+                    bad += not ok
+                    print(f"[audit] {'ok  ' if ok else 'FAIL'} lag {g:2d}: {name}: change {dv:.2e} "
+                          f"({'must change' if should else 'must not change'}, tolerance {tol:.1e})", flush=True)
+        print(f"[audit] arm {args.code}: {'all checks passed' if not bad else f'{bad} checks FAILED'}", flush=True)
+        return
+
     def evaluate():
         draft.eval()
         vrng = random.Random(123)
         rows = []
         with torch.no_grad():
             for lag in (0, 4, 8, 16):
-                ls, a1, taus = [], [], []
+                ls, a1, taus, per_seq = [], [], [], []
                 for d in val:
                     ids = d["ids"].long().to(dev)
                     blocks = [(s, min(lag, s - 1)) for s, _ in
@@ -679,8 +747,9 @@ def main():
                     ls.append(float(l))
                     a1.append(float(a))
                     taus += t
+                    per_seq.append(list(t))
                 rows.append({"lag": lag, "loss": sum(ls) / len(ls), "first token": sum(a1) / len(a1),
-                             "tau": sum(taus) / len(taus), "blocks": len(taus)})
+                             "tau": sum(taus) / len(taus), "blocks": len(taus), "taus": per_seq})
         if not args.freeze_draft:
             draft.train()
         return rows
